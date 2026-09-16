@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Qt QML tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qml-tools libqt6qml6 qml6-module-qtquick qml6-module-qtquick-controls
+
+      - name: Run Model tests
+        run: node test/model.test.js
+
+      - name: Run Wiring checks
+        run: node test/wiring.test.js

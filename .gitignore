@@ -1,0 +1,11 @@
+# OS & Editor files
+.DS_Store
+*.swp
+*~
+*.bak
+*.log
+
+# Dependencies & Build artifacts
+node_modules/
+dist/
+build/

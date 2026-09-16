@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 1,
+  "id": "drives",
+  "name": "Drives",
+  "version": "2.1.0",
+  "author": "Charles Gameti",
+  "license": "MIT",
+  "description": "View and manage all storage drives on the machine, monitor stats, format, auto-repair NTFS, and eject removable media safely.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Drives",
+    "description": "View all drives and storage on the machine, monitor stats, format, auto-repair NTFS, and safely eject removable media.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "alwaysShow": false,
+      "openOnMount": true,
+      "autoMountOnConnect": true,
+      "autoCleanTrashOnEject": false,
+      "notifications": true,
+      "unmountOnSuspend": true,
+      "showSystemDrives": true,
+      "fileManager": "",
+      "refreshIntervalSec": 8,
+      "barLabel": "none"
+    },
+    "schema": [
+      {
+        "key": "autoMountOnConnect",
+        "type": "boolean",
+        "label": "Auto-mount drives on connect",
+        "defaultValue": true,
+        "description": "Automatically mount removable volumes and recover dirty NTFS partitions when plugged in."
+      },
+      {
+        "key": "autoCleanTrashOnEject",
+        "type": "boolean",
+        "label": "Empty drive trash on eject",
+        "defaultValue": false,
+        "description": "Automatically purge deleted files inside .Trash on the drive before unmounting."
+      },
+      {
+        "key": "showSystemDrives",
+        "type": "boolean",
+        "label": "Show All Machine Drives (including OS & Swap)",
+        "defaultValue": true,
+        "description": "Display internal NVMe/SSD, swap, and root filesystems alongside removable media."
+      },
+      {
+        "key": "notifications",
+        "type": "boolean",
+        "label": "Notify on connect and remove",
+        "defaultValue": true,
+        "description": "Announce drives as they are plugged in, and warn when one is unplugged while still mounted."
+      },
+      {
+        "key": "unmountOnSuspend",
+        "type": "boolean",
+        "label": "Unmount drives before sleep",
+        "defaultValue": true,
+        "description": "Unmount every removable volume when the machine suspends, so a drive unplugged while it sleeps is not left half-written."
+      },
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Text beside the icon",
+        "options": [
+          "none",
+          "free",
+          "name",
+          "count"
+        ],
+        "defaultValue": "none",
+        "description": "Show free space, the drive's name, or how many are attached. Vertical bars stay icon-only."
+      },
+      {
+        "key": "alwaysShow",
+        "type": "boolean",
+        "label": "Always show the icon",
+        "defaultValue": false,
+        "description": "Keep the icon in the bar even when no removable drive is attached."
+      },
+      {
+        "key": "openOnMount",
+        "type": "boolean",
+        "label": "Open after mounting",
+        "defaultValue": true,
+        "description": "Open the file manager once a volume finishes mounting."
+      },
+      {
+        "key": "fileManager",
+        "type": "string",
+        "label": "File manager command",
+        "defaultValue": "",
+        "description": "Command used to open a mount point. Leave empty to use xdg-open."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Free-space refresh (seconds)",
+        "min": 2,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 8,
+        "description": "How often free space is re-read while the panel is open. Drives are detected instantly through udev either way."
+      }
+    ]
+  }
+}

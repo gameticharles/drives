@@ -1,0 +1,332 @@
+# Advanced Storage & Drives (`drives`)
+
+USB sticks, SD cards, phones, external HDDs/SSDs, and internal system storage in the Omarchy bar: mount, open, inspect, format, auto-repair NTFS dirty bits, and safely eject without leaving the desktop.
+
+## Advanced Features in Drives
+
+- **Whole-Disk & Partition Formatter**: Format an entire physical drive (e.g. `/dev/sda`) or single partitions directly from the UI. Automatically cleans old signatures (`wipefs`), re-creates a clean GPT partition table via `parted`, provisions filesystems (`exfat`, `ntfs`, `ext4`, `btrfs`, `vfat`), fixes ownership/permissions, and mounts via `udisksctl`. Features built-in safeguards to strictly block system NVMe/root drives from accidental destruction.
+- **NTFS Dirty-Bit Auto-Fix**: Automatically detects NTFS volumes unmountable due to Windows hibernation or dirty flags. One click runs targeted repair via `omarchy-ntfs-fix` in a presentation terminal and re-mounts the drive.
+- **Disk Usage Inspector (`dua`)**: Click the pie chart icon (or press `d`) on any mounted volume to inspect space utilization interactively via `dua i` in a floating terminal.
+- **Terminal at Mountpoint**: Click the terminal icon (or press `t`) on any mounted volume to immediately launch a terminal in that volume's directory.
+- **System Storage Visibility Toggle**: Click the disk icon in the header (or press `s`) to toggle display of internal NVMe storage, Btrfs subvolumes, and root partitions alongside external drives.
+- **Sleep / Suspend Auto-Unmount Hook**: Safely unmounts removable drives before system suspend to eliminate NTFS dirty bit corruption and ext4 journal desynchronization.
+
+## Core Capabilities
+
+- **Mount, open, and eject** any removable volume without a password, because
+  udisks2 already lets the logged-in session do it. Ejecting unmounts every
+  volume on the drive, re-locks anything encrypted, then powers it down.
+- **Knows when the drive is still being written to.** The icon turns urgent
+  while the kernel has I/O in flight and the panel shows the live rate, because
+  a copy dialog reaching 100% is not the moment a stick is safe to pull. An
+  eject asked for mid-copy is held, then fires once the drive goes quiet.
+- **Names who is holding a busy mount**, instead of stopping at `target is
+  busy`, and offers a lazy unmount as an explicit second choice.
+- **Phones and cameras** get their own section: Android over MTP, iPhone over
+  AFC and PTP, with their access labelled `Files` or `Photos`.
+- **Unlocks an encrypted volume in place**, mounts it as the container opens,
+  and closes it again from the same row without ejecting the drive.
+- **Renames the volume label.** It travels with the stick to every machine
+  that reads it, unlike a nickname, which never leaves this shell. The field
+  counts down against that filesystem's own limit as you type.
+- **Checks a filesystem, and repairs it only if you ask twice.** Repair is the
+  one thing here that rewrites a filesystem, so it appears only after a check
+  has found something, never one stray click from the mount button. A suspect
+  drive mounts read-only first, so files come off without a byte going back.
+- **Formats a volume, once you have said so twice.** Erasing is the only thing
+  here that destroys data on purpose, so the button is on unmounted volumes
+  only and the volume's own kernel name has to be typed out before anything
+  runs. Pick exFAT, FAT32, NTFS, ext4 or Btrfs, name it on the way, and zero
+  the drive first when you want the old contents actually gone.
+- **A single drive can set its own terms.** One drive can mount read-only while
+  the rest mount normally, and one drive can open — or refuse to open — after
+  mounting whatever the global setting says. Both stick to the hardware, the
+  same way a nickname does.
+- **Reads a drive's own health**, for the drives that report any. udisks does
+  that read over D-Bus and hands the answer over, so no extra package is
+  needed and nothing runs as root. Most USB sticks report nothing at all, and
+  a drive that reports nothing shows nothing — see below before expecting a
+  number.
+- **Unmounts before the machine sleeps**, optionally, so a drive pulled from a
+  sleeping laptop is not left half-written, and says which one refused when
+  one does.
+- **Nicknames stick to the hardware**, keyed to the drive's serial rather than
+  whichever `/dev/sdb` it landed on today. A drive can also run a command of
+  your choosing when it appears, and that command can report its progress
+  back, so a stick running a backup looks like one instead of looking idle.
+- **Empties the trash you cannot see**: the `.Trash-1000` that quietly fills a
+  stick with files you thought were deleted.
+- **Never offers to eject the disk you booted from.** A USB-booted system disk
+  reports itself as removable just like a thumb drive; anything holding `/`,
+  `/boot` or `/home` is left out entirely.
+- Plus: connect and remove notifications, a warning when a drive is pulled
+  while still mounted, free-space bars, eject-all, and optional text beside the
+  bar icon.
+
+## Install
+
+```bash
+omarchy plugin add https://github.com/Wian47/omarchy-removable-drives.git --enable
+```
+
+Needs Omarchy 4 (Quattro) and `udisks2`, both standard. It calls `lsblk`,
+`udevadm`, `udisksctl`, `busctl`, `gio`, `fuser`, `du`, `wl-copy` and Omarchy's
+own `omarchy-*` helpers. Nothing runs as root.
+
+To remove it:
+
+```bash
+omarchy plugin remove wian47.removable-drives
+rm ~/.local/state/omarchy/removable-drives.json   # optional: forget nicknames
+```
+
+It never writes to `shell.json` or your Hyprland config; the bar entry belongs
+to Omarchy's plugin commands and nicknames live in the file above.
+
+### Phones
+
+Omarchy ships `gvfs-mtp`, so **Android works out of the box**. Apple devices
+speak AFC and need three packages Omarchy does not ship: `usbmuxd`, `gvfs-afc`
+and `gvfs-gphoto2`.
+
+A plugin may not install packages itself, so when something is plugged in that
+gvfs cannot reach, the panel names what is missing and offers to open Omarchy's
+own installer.
+
+A trusted iPhone appears as **two** entries: app documents over AFC, and the
+camera roll over PTP. With iCloud Photos set to "Optimize iPhone Storage" the
+camera roll can read as empty, because the originals are not on the device.
+
+## Using it
+
+| Where | Action |
+|---|---|
+| Bar icon | left = open · right = rescan · middle = open first mounted volume |
+| Volume row | click = mount and open, or open if mounted · middle-click = copy its path |
+| Phone row | click = browse (mounting on demand) |
+| Mount / open / unmount icons | mount · open · unmount that volume |
+| Rename / check icons | rename the volume · check it for errors |
+| Eraser icon | format an unmounted volume: erase it and create a filesystem |
+| Read-only / repair icons | after a failed check: mount read-only · repair |
+| Lock icon | locked: type the passphrase to unlock · open: lock it again |
+| Health icon | on drives that report health: hover for the reading, click to re-read |
+| Drive row icons | open after mounting · mount read-only · nickname · eject |
+| Eject icon in the header | eject every attached drive |
+
+Keyboard, while the panel is open:
+
+| Key | | Key | |
+|---|---|---|---|
+| `j` `k` ↑ ↓ | move | `e` `x` | eject the drive |
+| `Enter` `Space` | mount and open, or eject | `E` | eject every drive |
+| `m` | mount or unmount | `t` | terminal at this volume |
+| `o` | open | `y` | copy its path |
+| `n` | nickname the drive | `r` `Esc` | rescan · close |
+| `l` | rename the volume | `c` | check it for errors |
+| `f` | format the volume | | |
+
+## Settings
+
+Set on the widget's entry in `~/.config/omarchy/shell.json`, or through
+Setup > Plugins.
+
+| Key | Default | What it does |
+|---|---|---|
+| `alwaysShow` | `false` | Keep the icon in the bar with nothing attached |
+| `openOnMount` | `true` | Open the file manager once a volume mounts |
+| `autoMountOnConnect` | `true` | Automatically mount removable volumes on plug-in |
+| `autoCleanTrashOnEject` | `false` | Empty drive trash folder before ejecting |
+| `showSystemDrives` | `true` | Display internal storage drives alongside removable media |
+| `notifications` | `true` | Announce drives, warn when one is pulled while mounted |
+| `unmountOnSuspend` | `true` | Unmount every removable volume when the machine suspends |
+| `fileManager` | `""` | Command used to open a mount point; empty means `xdg-open` |
+| `barLabel` | `"none"` | Text beside the icon: `none`, `free`, `name`, `count` |
+| `refreshIntervalSec` | `8` | How often free space is re-read while the panel is open |
+
+Per-drive settings live in `~/.local/state/omarchy/removable-drives.json`, keyed
+by serial and watched for changes, which is also how you attach a command to a
+drive:
+
+```json
+{
+  "version": 1,
+  "drives": {
+    "serial:0901f8ef1ed9c144": {
+      "nickname": "Work backup",
+      "onConnect": "rsync -a ~/Documents/ \"$2\"/documents/",
+      "autoOpen": false,
+      "readOnly": true
+    }
+  }
+}
+```
+
+`onConnect` runs through `bash -c` when that drive appears, with `$1` as its
+device path, `$2` as its first mount point, and `$3` as a file it may write
+progress to. Nothing writes it for you.
+
+### Reporting progress from a hook
+
+Write `key=value` lines to `$3`, which means one `echo` is enough:
+
+```
+percent=42
+status=Copying documents
+```
+
+Both keys are optional; `done=1` says the hook has finished, and a bare number
+on its own line is read as a percent. The panel draws a bar on the drive row
+while the hook runs and shows the status beside it. A hook that reports
+nothing still counts, it just has no bar.
+
+The drive counts as busy for as long as the hook runs, so an eject asked for
+mid-copy is held and fires once the hook is done — the same as for a copy the
+kernel can see. That matters because the kernel cannot see this one: an rsync
+goes quiet between file batches, and the busy icon goes out with it.
+
+The file lives under `$XDG_RUNTIME_DIR`, so it never reaches your disk and
+never outlives the session. The panel watches the hook's process rather than
+the file, so a hook that dies mid-copy ends the bar instead of leaving it
+stuck at 42% forever.
+
+A hook that says what it is doing, in one line:
+
+```json
+"onConnect": "echo 'status=Backing up' > \"$3\"; rsync -a ~/Documents/ \"$2\"/docs/; echo done=1 > \"$3\""
+```
+
+A hook written before `$3` existed is unaffected: it is a new argument, not a
+changed one.
+
+### Drive health
+
+A drive that reports SMART gets a health icon on its row, with its temperature
+and hours powered on in the tooltip and any concern written out in the row
+itself. It comes from udisks over D-Bus, which does the privileged read for
+us — no `smartctl`, no `smartmontools`, nothing running as root.
+
+The reading is taken when the drive appears and when you rescan, not
+continuously, so the temperature is a snapshot from that moment rather than a
+live thermometer. Clicking the health icon takes a fresh one.
+
+**Most USB sticks report nothing at all**, and that is the ordinary case rather
+than a fault: a thumb drive carries neither SMART interface, so the icon simply
+does not appear. External SSDs and hard drives behind a SAT-capable bridge are
+the ones that answer. Do not read a missing icon as a problem.
+
+No temperature threshold is invented here. The number is shown as udisks gives
+it, because a figure you can read and look up beats a line drawn on a guess.
+
+`autoOpen` overrides `openOnMount` for this drive alone: `true` always opens,
+`false` never does, and leaving it out follows the global setting. `readOnly`
+mounts every volume on the drive read-only, which is what an archive disk you
+never want written to wants. The panel writes both from the drive row, and
+reads them strictly on the way back in: a `readOnly` that is neither `true` nor
+`false` is taken as `true`, because a typo in this file must not be the reason
+an archive drive came up writable.
+
+## Scripting
+
+```bash
+omarchy-shell drives toggle
+omarchy-shell drives refresh                       # re-read what is attached
+omarchy-shell drives list                          # drives, as JSON
+omarchy-shell drives phones                        # phones, as JSON
+omarchy-shell drives network                       # network & cloud mounts, as JSON
+omarchy-shell drives status                        # {"busy":false,…}
+omarchy-shell drives eject /dev/sdb                # or ejectAll
+omarchy-shell drives rename /dev/sdb "Work backup" # "" clears it
+omarchy-shell drives label /dev/sdb1 "Photos"      # the label on the drive
+omarchy-shell drives check /dev/sdb1               # verdict lands in status
+omarchy-shell drives smart /dev/sdb                # health, as JSON
+omarchy-shell drives mountReadOnly /dev/sdb1       # rescue without writing
+omarchy-shell drives lock /dev/mapper/luks-…       # close an open container
+omarchy-shell drives format /dev/sdb1 exfat Photos # erases the volume
+omarchy-shell drives expandDevice /dev/sdb         # expand drive settings
+omarchy-shell drives expandVolume /dev/sdb1        # expand volume drawer
+omarchy-shell drives toggleTelemetry /dev/sdb      # toggle telemetry row
+omarchy-shell drives setTab network                # switch to "local" or "network"
+```
+
+`format` destroys what is on the volume. It takes the same refusals the panel
+does — a mounted volume, a drive still being written to, or a filesystem udisks
+will not create are all turned away with the reason — but naming the node, the
+type and the label in one line is the whole confirmation, so there is no second
+question the way there is in the panel.
+
+`status` reports `busy: true` while the kernel still has I/O in flight **or a
+connect hook is still running**, so a backup script can wait for the drive to
+settle; both eject calls wait by themselves. `hooks` says which drive is at
+what percent, and `health` carries each drive's verdict — `unsupported`,
+`healthy`, `warning` or `failing`. `check` returns straight away and leaves its
+own verdict in `status` as `healthy`: `true`, `false`, or `null` when the
+answer could not be read.
+
+`smart` returns the whole record, and answers `supported: false` with every
+other field `null` for the many drives that report no health at all.
+
+Anything other than `ok` back from these is the reason they did not run, so a
+script never has to guess whether a refusal happened.
+
+## How it works
+
+`Panel.qml` draws the bar icon and popup, `Service.qml` owns everything that
+touches the system, and `Model.js` is pure parsing and formatting with no QML
+or processes, which is what makes it testable without a compositor.
+
+Device-supplied strings (labels, vendor names, phone names) are hostile
+input: whoever formatted a stick chooses its label. Every `Text` is pinned to
+`Text.PlainText` so Qt cannot promote one to rich text and fetch a remote
+`<img>`, and strings handed to components whose `Text` this plugin does not own
+are stripped of angle brackets first. Paths stay byte-exact, since commands are
+built from them.
+
+Renaming a filesystem, running its fsck, and creating a new one are things
+udisks exposes on D-Bus that `udisksctl` has no verb for, so they go over the
+bus through `busctl`. It is still `allow_active: yes`, the same no-password
+path mounting takes. The object path is asked for rather than built, since
+udisks escapes the kernel name into it and an unlocked LUKS volume lands at
+`dm_2d3`. The rename and the fsck unmount the filesystem first and mount it
+back afterwards, whether or not the middle step worked; the format does
+neither, because a mounted volume is refused outright rather than taken offline
+on the way to being erased.
+
+A format is checked as one plan — which volume, which type, which label,
+whether to zero the drive first — rather than as four arguments each looked at
+somewhere along the way, and the plan names the `/dev` node it was made for, so
+swapping the stick between planning it and confirming it retracts the format
+instead of pointing it at the replacement.
+
+Health comes the same way, off `org.freedesktop.UDisks2.Drive.Ata` or
+`org.freedesktop.UDisks2.NVMe.Controller` on the drive object — one further
+lookup, since health belongs to the drive rather than to a block device.
+
+Reading those properties does not refresh them: udisks hands back whatever its
+own last poll cached, which measured ten minutes stale here — the bus said
+308 K while every sensor on the same drive said 36.85 °C. So `SmartUpdate` is
+called first, which is `allow_active: yes` in the udisks policy like everything
+else here. It is still read rarely — once when the attached set changes and
+again on a rescan, never on the free-space timer — because it is now a round
+trip to the drive itself, and because every answer but the temperature changes
+over hours rather than seconds. The update is best-effort: a drive that refuses
+one is still read, since a stale number beats no number. `nowakeup` goes to
+ATA, so a parked external disk is not spun up merely to draw a temperature.
+
+A LUKS passphrase reaches udisks on stdin, never as an argument, because
+`/proc/<pid>/cmdline` is readable by every other process you run. udisksctl
+takes a key only from a file, so it is staged under `umask 077` in the
+RAM-backed runtime directory and a trap removes it however the unlock ends.
+
+Emptying a drive's trash is the only recursive delete here, so the path is
+re-derived from the live mount list and must exactly match a `.Trash-<uid>`
+candidate of a mounted removable volume. The tests assert it refuses `/`,
+`$HOME`, the mount root, and drives it is not tracking.
+
+```bash
+node test/model.test.js       # 237 tests, no compositor required
+omarchy plugin validate .     # the same check the shell applies
+```
+
+## License
+
+MIT

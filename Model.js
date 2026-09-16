@@ -1,0 +1,2153 @@
+.pragma library
+
+// Pure data layer for the Removable Drives widget. Everything here is a
+// function of the `lsblk -J -b` tree — no processes, no QML types — so the
+// parsing rules that decide "is this safe to eject?" can be read (and
+// changed) in one place, apart from the UI that draws them.
+
+// ---------------------------------------------------------------- glyphs
+//
+// Every codepoint below was verified against JetBrainsMono Nerd Font's cmap
+// and post tables, so the names in the comments are the real glyph names
+// rather than a guess at what the codepoint draws. They are written as
+// codepoints rather than literals because these live in the Unicode private
+// use area, where a stray editor or a copy-paste truncates them silently.
+function codepoint(code) {
+  if (String.fromCodePoint) return String.fromCodePoint(code)
+  var offset = code - 0x10000
+  return String.fromCharCode(0xD800 + (offset >> 10), 0xDC00 + (offset & 0x3FF))
+}
+
+var GLYPH_USB = codepoint(0xF129E)      // md-usb_flash_drive
+var GLYPH_SD = codepoint(0xF0479)       // md-sd
+var GLYPH_DISK = codepoint(0xF02CA)     // md-harddisk
+var GLYPH_EJECT = codepoint(0xF01EA)    // md-eject
+var GLYPH_FOLDER = codepoint(0xF0770)   // md-folder_open
+var GLYPH_MOUNT = codepoint(0xF0120)    // md-tray_arrow_down
+var GLYPH_UNMOUNT = codepoint(0xF011D)  // md-tray_arrow_up
+var GLYPH_LOCKED = codepoint(0xF033E)   // md-lock
+var GLYPH_UNLOCKED = codepoint(0xF033F) // md-lock_open
+var GLYPH_ALERT = codepoint(0xF0028)    // md-alert_circle
+var GLYPH_REFRESH = codepoint(0xF0450)  // md-refresh
+var GLYPH_PHONE = codepoint(0xF011C)     // md-cellphone
+var GLYPH_CAMERA = codepoint(0xF0100)    // md-camera
+var GLYPH_TRASH = codepoint(0xF0A7A)     // md-trash_can_outline
+var GLYPH_PENCIL = codepoint(0xF03EB)    // md-pencil
+var GLYPH_TERMINAL = codepoint(0xF018D)  // md-console
+var GLYPH_PIE = codepoint(0xF0127)       // md-chart_pie
+var GLYPH_COPY = codepoint(0xF018F)      // md-content_copy
+var GLYPH_TAG = codepoint(0xF04F9)       // md-tag
+var GLYPH_STETHOSCOPE = codepoint(0xF04D9) // md-stethoscope
+var GLYPH_WRENCH = codepoint(0xF05B7)    // md-wrench
+var GLYPH_HEALTHY = codepoint(0xF05E0)   // md-check_circle
+var GLYPH_READONLY = codepoint(0xF0250)  // md-folder_lock
+var GLYPH_ERASER = codepoint(0xF01FE)    // md-eraser
+var GLYPH_FOLDER_OFF = codepoint(0xF19F8) // md-folder_off
+var GLYPH_DOTS = codepoint(0xF01D8)       // md-dots_horizontal
+var GLYPH_CHEVRON_DOWN = codepoint(0xF0140) // md-chevron_down
+var GLYPH_CHEVRON_UP = codepoint(0xF0143)   // md-chevron_up
+var GLYPH_COG = codepoint(0xF0493)        // md-cog
+var GLYPH_SEARCH = codepoint(0xF0349)     // md-magnify
+var GLYPH_SPEEDOMETER = codepoint(0xF04C5) // md-speedometer
+var GLYPH_SHIELD = codepoint(0xF0498)     // md-shield
+var GLYPH_SERVER = codepoint(0xF048B)      // md-server
+var GLYPH_CLOUD = codepoint(0xF015F)       // md-cloud
+var GLYPH_NETWORK = codepoint(0xF0318)     // md-lan
+var GLYPH_THERMOMETER = codepoint(0xF050F) // md-thermometer
+
+// ------------------------------------------------------------ formatting
+
+// A QML Text defaults to Text.AutoText, which promotes anything that looks
+// like markup to rich text — and Qt's rich text fetches <img src="http://...">.
+// Drive labels, vendor strings and phone names are all chosen by the device
+// rather than by the user, so they are hostile input.
+//
+// Every Text this plugin owns is pinned to Text.PlainText. This is for the
+// strings handed to components whose Text belongs to qs.Ui — the bar button
+// and its tooltip — where the format cannot be set from outside. Display only:
+// paths and mount points must stay byte-exact for the commands built from them.
+function plain(value) {
+  return clean(value).replace(/[<>]/g, "")
+}
+
+// A mount point contains the filesystem label — /run/media/<user>/<LABEL> —
+// so it is device-controlled, and it is concatenated into the shell commands
+// that unmount and open it. POSIX single-quoting, with an embedded quote
+// closed and reopened, is what keeps a crafted label from breaking out.
+function shellQuote(value) {
+  return "'" + String(value === undefined || value === null ? "" : value).replace(/'/g, "'\\''") + "'"
+}
+
+function clean(value) {
+  return String(value === undefined || value === null ? "" : value).replace(/\s+/g, " ").replace(/^ | $/g, "")
+}
+
+// Anything compared against the filesystem or handed to a command has to
+// survive byte for byte. clean() collapses runs of whitespace, which silently
+// turns a mount point containing two spaces into a different path — and the
+// trash guard then approved it, because it was validating the same mangled
+// string it went on to delete. Paths, mount points and identifiers use this;
+// only text meant for a human goes through clean().
+function exact(value) {
+  return String(value === undefined || value === null ? "" : value)
+}
+
+// 1024-based with short suffixes, matching what `lsblk` prints in its human
+// column so the panel never disagrees with the terminal the user checks it
+// against.
+function formatBytes(bytes) {
+  var n = Number(bytes)
+  if (!isFinite(n) || n <= 0) return ""
+  var units = ["B", "KB", "MB", "GB", "TB", "PB"]
+  var i = 0
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024
+    i++
+  }
+  if (i === 0) return Math.round(n) + " B"
+  return (n >= 100 ? n.toFixed(0) : n.toFixed(1)) + " " + units[i]
+}
+
+function formatFsType(fstype) {
+  var fs = clean(fstype)
+  if (fs === "") return ""
+  if (fs === "vfat") return "FAT32"
+  if (fs === "exfat") return "exFAT"
+  if (fs === "ntfs" || fs === "ntfs3") return "NTFS"
+  if (fs === "crypto_LUKS") return "LUKS"
+  if (fs === "hfsplus") return "HFS+"
+  if (fs === "apfs") return "APFS"
+  return fs.toUpperCase()
+}
+
+// --------------------------------------------------------------- parsing
+
+// Filesystem types that exist on a partition but can never be handed to
+// `udisksctl mount`. Listing them keeps the row visible (so the partition
+// still accounts for the space on the stick) while the mount action stays
+// correctly disabled.
+var UNMOUNTABLE = ["swap", "LVM2_member", "linux_raid_member", "zfs_member", "ddf_raid_member", "isw_raid_member"]
+
+// Mount points that mean "this disk is running the machine". A USB-booted or
+// Thunderbolt-attached system disk reports itself as hotplug/removable just
+// like a thumb drive does, and offering to power it off is not a mistake
+// worth making, so any disk holding one of these is dropped entirely.
+var SYSTEM_MOUNTS = ["/", "/boot", "/boot/efi", "/efi", "/home", "/var", "/usr", "/nix", "/nix/store", "[SWAP]"]
+
+function isVirtual(name, node) {
+  if (node && (clean(node.fstype) === "swap" || exact(node.mountpoint) === "[SWAP]")) return false
+  return /^(zram|loop|ram|dm-|md|sr|fd)/.test(String(name || ""))
+}
+
+function isCandidateDisk(node) {
+  if (!node || node.type !== "disk") return false
+  if (isVirtual(node.name, node)) return false
+  return node.rm === true || node.hotplug === true
+}
+
+function isSystemMountPath(mp) {
+  if (!mp || mp === "") return false
+  if (mp === "/" || mp === "[SWAP]") return true
+  if (mp.indexOf("/boot") === 0) return true
+  if (mp.indexOf("/home") === 0) return true
+  if (mp.indexOf("/var") === 0) return true
+  if (mp.indexOf("/usr") === 0) return true
+  if (mp.indexOf("/etc") === 0) return true
+  if (mp.indexOf("/nix") === 0) return true
+  return false
+}
+
+// Takes an lsblk node or a built device: the children of the one and the
+// volumes of the other are the same partitions under different names, and the
+// question is asked on both sides of parsing — once to drop the disk the
+// machine is running from, and again before anything destructive is offered.
+function holdsSystemMount(node) {
+  if (!node) return false
+  if (clean(node.fstype) === "swap") return true
+  var mp = exact(node.mountpoint)
+  if (mp !== "" && (SYSTEM_MOUNTS.indexOf(mp) !== -1 || isSystemMountPath(mp))) return true
+  var mounts = node.mountpoints || []
+  for (var m = 0; m < mounts.length; m++) {
+    if (mounts[m] && (SYSTEM_MOUNTS.indexOf(exact(mounts[m])) !== -1 || isSystemMountPath(exact(mounts[m])))) return true
+  }
+  var kids = node.children || []
+  for (var i = 0; i < kids.length; i++) {
+    if (holdsSystemMount(kids[i])) return true
+  }
+  var volumes = node.volumes || []
+  for (var v = 0; v < volumes.length; v++) {
+    if (holdsSystemMount(volumes[v])) return true
+  }
+  return false
+}
+
+function deviceGlyph(device) {
+  if (/^mmcblk/.test(String(device.name || ""))) return GLYPH_SD
+  if (clean(device.tran) === "usb") return GLYPH_USB
+  return GLYPH_DISK
+}
+
+// Vendor and model both come padded and often overlapping ("SanDisk" +
+// "SanDisk Ultra"), so join them only when the model doesn't already say it.
+function deviceTitle(node) {
+  if (node.name && node.name.indexOf("zram") === 0) {
+    return "Compressed Swap (" + clean(node.name) + ")"
+  }
+  var vendor = clean(node.vendor)
+  var model = clean(node.model)
+  var title = model
+  if (vendor !== "" && model.toLowerCase().indexOf(vendor.toLowerCase()) === -1) {
+    title = clean(vendor + " " + model)
+  }
+  if (title === "") title = clean(node.name)
+  return title
+}
+
+function buildVolume(part, index, isSystem) {
+  // An unlocked LUKS partition carries its filesystem on a `crypt` child;
+  // everything the user cares about (label, free space, mount point) lives
+  // there, while unlock/lock still act on the partition itself.
+  var holder = null
+  var kids = part.children || []
+  for (var i = 0; i < kids.length; i++) {
+    if (kids[i] && (kids[i].type === "crypt" || kids[i].type === "lvm")) {
+      holder = kids[i]
+      break
+    }
+  }
+  var fsNode = holder || part
+  var partFs = clean(part.fstype)
+  var encrypted = partFs === "crypto_LUKS"
+  var fstype = clean(fsNode.fstype)
+  var mountpoint = exact(fsNode.mountpoint)
+  var mounts = fsNode.mountpoints || []
+  if (mounts.indexOf("/") !== -1) {
+    mountpoint = "/"
+  } else if (mountpoint === "" && mounts.length > 0) {
+    mountpoint = exact(mounts[0])
+  }
+  var label = clean(fsNode.label) || clean(part.label) || clean(part.partlabel)
+  var sysVol = isSystem === true || holdsSystemMount(part) || holdsSystemMount(fsNode)
+
+  var title = label !== "" ? label : clean(part.name)
+  if (label === "") {
+    if (mountpoint === "/") title = "Root (/)"
+    else if (mountpoint === "/boot" || mountpoint === "/efi") title = "Boot (" + mountpoint + ")"
+    else if (fstype === "swap" || mountpoint === "[SWAP]") title = "Swap (" + clean(part.name) + ")"
+    else if (holder && clean(holder.name) !== "") title = clean(holder.name)
+  }
+
+  return {
+    path: exact(part.path),
+    fsPath: exact(fsNode.path),
+    name: exact(part.name),
+    uuid: exact(fsNode.uuid) || exact(part.uuid),
+    index: index,
+    label: label,
+    title: title,
+    fstype: fstype,
+    fstypeLabel: formatFsType(fstype),
+    sizeBytes: Number(part.size || 0),
+    mountpoint: mountpoint,
+    mounted: mountpoint !== "",
+    encrypted: encrypted,
+    unlocked: encrypted && holder !== null,
+    isSystem: sysVol,
+    fsavail: Number(fsNode.fsavail || 0),
+    fssize: Number(fsNode.fssize || 0),
+    fsused: Number(fsNode.fsused || 0)
+  }
+}
+
+function isMountable(volume) {
+  if (!volume) return false
+  if (volume.mounted) return false
+  if (volume.encrypted && !volume.unlocked) return false
+  if (volume.fstype === "") return false
+  return UNMOUNTABLE.indexOf(volume.fstype) === -1
+}
+
+function buildDevice(node, isSystem) {
+  var sysDisk = isSystem === true || holdsSystemMount(node)
+  var volumes = []
+  var kids = node.children || []
+  var parts = []
+  for (var i = 0; i < kids.length; i++) {
+    if (kids[i] && (kids[i].type === "part" || kids[i].type === "crypt")) parts.push(kids[i])
+  }
+
+  if (parts.length === 0) {
+    // A stick formatted without a partition table: the disk *is* the volume.
+    if (clean(node.fstype) !== "" || exact(node.mountpoint) !== "") volumes.push(buildVolume(node, 1, sysDisk))
+  } else {
+    for (var p = 0; p < parts.length; p++) volumes.push(buildVolume(parts[p], p + 1, sysDisk))
+  }
+
+  var mounted = 0
+  for (var v = 0; v < volumes.length; v++) {
+    if (volumes[v].mounted) mounted++
+  }
+
+  return {
+    path: exact(node.path),
+    name: exact(node.name),
+    serial: exact(node.serial),
+    removable: isCandidateDisk(node),
+    isSystem: sysDisk,
+    title: deviceTitle(node),
+    nickname: "",
+    key: "",
+    glyph: !isCandidateDisk(node) || sysDisk ? GLYPH_DISK : deviceGlyph(node),
+    tran: clean(node.tran),
+    sizeBytes: Number(node.size || 0),
+    sizeText: formatBytes(node.size),
+    volumes: volumes,
+    mountedCount: mounted
+  }
+}
+
+function parse(raw, showSystemDrives) {
+  var devices = []
+  var json = JSON.parse(String(raw || "{}"))
+  var nodes = json.blockdevices || []
+  for (var i = 0; i < nodes.length; i++) {
+    var node = nodes[i]
+    if (isVirtual(node.name, node)) continue
+    var isCandidate = isCandidateDisk(node)
+    var isSystem = holdsSystemMount(node)
+    if (!isCandidate && !showSystemDrives) continue
+    if (isSystem && !showSystemDrives) continue
+    devices.push(buildDevice(node, isSystem))
+  }
+  return devices
+}
+
+// ---------------------------------------------------------- presentation
+
+// readOnly is passed rather than read off the volume, because it comes from
+// /proc/mounts rather than from the lsblk tree the volume was built from.
+function volumeMeta(volume, readOnly) {
+  if (!volume) return ""
+  if (volume.encrypted && !volume.unlocked) return "Encrypted · " + formatBytes(volume.sizeBytes)
+
+  var parts = []
+  if (volume.fstypeLabel !== "") parts.push(volume.fstypeLabel)
+
+  if (volume.mounted) {
+    // Ahead of the free space, because it changes what the drive is for: a
+    // read-only mount has room on it that cannot be used.
+    if (readOnly === true) parts.push("Read-only")
+    if (volume.fsavail > 0) parts.push(formatBytes(volume.fsavail) + " free")
+    else parts.push(formatBytes(volume.sizeBytes))
+    if (volume.mountpoint !== "") parts.push(volume.mountpoint)
+  } else {
+    parts.push(formatBytes(volume.sizeBytes))
+    if (isMountable(volume)) parts.push("Not mounted")
+    else if (volume.fstype !== "") parts.push("Not mountable")
+  }
+  return parts.join(" · ")
+}
+
+// ------------------------------------------------------- mount options
+//
+// Whether a filesystem is mounted read-only is not in the lsblk tree — its RO
+// column is the block device's own flag, not the mount's — so it is read from
+// /proc/mounts, the kernel's own answer.
+
+// /proc/mounts escapes space, tab, newline and backslash as three-digit octal.
+// A mount point is built from a device-chosen label and routinely contains a
+// space, so `/run/media/wian47/MY RESCUE` arrives as `MY\040RESCUE`. Comparing
+// the two without undoing that misses every drive whose label has a space in
+// it — which is most of the ones people name themselves.
+function unescapeMountPath(value) {
+  return String(value === undefined || value === null ? "" : value)
+    .replace(/\\([0-7]{3})/g, function(match, octal) {
+      return String.fromCharCode(parseInt(octal, 8))
+    })
+}
+
+function parseMountFlags(raw) {
+  var flags = {}
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var fields = lines[i].split(" ")
+    if (fields.length < 4) continue
+    var options = fields[3].split(",")
+    // A later mount on the same point shadows an earlier one, so last wins.
+    flags[unescapeMountPath(fields[1])] = { readOnly: options.indexOf("ro") !== -1 }
+  }
+  return flags
+}
+
+function isReadOnly(flags, volume) {
+  if (!volume || !volume.mounted) return false
+  var entry = flags ? flags[exact(volume.mountpoint)] : null
+  return !!(entry && entry.readOnly)
+}
+
+function usedFraction(volume) {
+  if (!volume || !volume.mounted) return 0
+  if (volume.fssize > 0 && volume.fsused >= 0) return Math.max(0, Math.min(1, volume.fsused / volume.fssize))
+  return 0
+}
+
+function summary(devices) {
+  var deviceCount = devices.length
+  if (deviceCount === 0) return "No removable drives"
+  var mounted = 0
+  for (var i = 0; i < devices.length; i++) mounted += devices[i].mountedCount
+  var text = deviceCount + (deviceCount === 1 ? " drive" : " drives")
+  return text + " · " + mounted + " mounted"
+}
+
+function barGlyph(devices) {
+  if (!devices || devices.length === 0) return GLYPH_DISK
+  for (var i = 0; i < devices.length; i++) {
+    if (devices[i].removable && !devices[i].isSystem) {
+      return devices[i].glyph
+    }
+  }
+  return GLYPH_DISK
+}
+
+function mountedVolumes(devices) {
+  var out = []
+  for (var d = 0; d < devices.length; d++) {
+    var vols = devices[d].volumes
+    for (var v = 0; v < vols.length; v++) {
+      if (vols[v].mounted) out.push(vols[v])
+    }
+  }
+  return out
+}
+
+// Flat list the panel walks with j/k. Device headers are cursor targets too,
+// because ejecting is the one action that belongs to the whole device rather
+// than to any single partition on it.
+function navRows(devices, portables) {
+  var rows = []
+  for (var d = 0; d < (devices || []).length; d++) {
+    rows.push({ kind: "device", device: d, volume: -1 })
+    for (var v = 0; v < devices[d].volumes.length; v++) {
+      rows.push({ kind: "volume", device: d, volume: v })
+    }
+  }
+  for (var p = 0; p < (portables || []).length; p++) {
+    rows.push({ kind: "portable", device: -1, volume: -1, portable: p })
+  }
+  return rows
+}
+
+// udisksctl reports failures as a full D-Bus error name followed by the part
+// a person can act on ("target is busy"). Keep the readable tail.
+//
+// busctl, which is what carries the calls udisksctl has no verb for, drops the
+// error name and prefixes the message with "Call failed:" instead — so strip
+// that too, and the remainder is already the sentence udisks meant to say.
+function formatError(text) {
+  var t = clean(text)
+  t = t.replace(/^Call failed:\s*/, "")
+  var match = t.match(/Error\.[A-Za-z]+:\s*(.*)$/)
+  if (match) t = clean(match[1])
+  if (t === "") return ""
+  return t.length > 160 ? t.substring(0, 157) + "…" : t
+}
+
+// ---------------------------------------------------------------- activity
+//
+// A drive is only safe to pull once the kernel has finished writing to it,
+// and the file manager's progress bar reaching 100% is not that moment —
+// pages can still be in flight after the copy dialog closes. The kernel
+// publishes the truth in /sys/block/<name>/stat, so read it rather than
+// guess.
+
+var SECTOR_BYTES = 512
+
+// Parses `head -v -n1 /sys/block/<name>/stat ...`:
+//
+//   ==> /sys/block/sda/stat <==
+//   79 4 7904 89 0 0 0 0 0 60 89
+//
+// Fields, 1-indexed: 1 read_ios, 2 read_merges, 3 read_sectors, 4 read_ticks,
+// 5 write_ios, 6 write_merges, 7 write_sectors, 8 write_ticks, 9 in_flight.
+function parseBlockStats(raw) {
+  var out = {}
+  var lines = String(raw || "").split("\n")
+  var name = ""
+  for (var i = 0; i < lines.length; i++) {
+    var header = lines[i].match(/^==>\s*\/sys\/block\/([^\/]+)\/stat\s*<==/)
+    if (header) {
+      name = header[1]
+      continue
+    }
+    if (name === "") continue
+    var fields = clean(lines[i]).split(" ")
+    if (fields.length >= 9) {
+      out[name] = {
+        readSectors: Number(fields[2]),
+        writeSectors: Number(fields[6]),
+        inFlight: Number(fields[8])
+      }
+    }
+    name = ""
+  }
+  return out
+}
+
+// Counters restart at zero when a device is unplugged and comes back, so a
+// negative delta means "this is a different device now", not "negative
+// throughput".
+function rateBetween(previousSectors, currentSectors, elapsedMs) {
+  if (previousSectors === null || previousSectors === undefined) return 0
+  if (!(elapsedMs > 0)) return 0
+  var delta = Number(currentSectors) - Number(previousSectors)
+  if (!isFinite(delta) || delta <= 0) return 0
+  return (delta * SECTOR_BYTES) / (elapsedMs / 1000)
+}
+
+function buildActivity(previousSamples, stats, now) {
+  var activity = {}
+  var samples = {}
+  for (var name in stats) {
+    var current = stats[name]
+    var previous = previousSamples ? previousSamples[name] : null
+    var elapsed = previous ? now - previous.at : 0
+    var writeRate = rateBetween(previous ? previous.writeSectors : null, current.writeSectors, elapsed)
+    var readRate = rateBetween(previous ? previous.readSectors : null, current.readSectors, elapsed)
+    activity[name] = {
+      writeRate: writeRate,
+      readRate: readRate,
+      inFlight: current.inFlight,
+      writing: writeRate > 0,
+      busy: writeRate > 0 || current.inFlight > 0
+    }
+    samples[name] = { writeSectors: current.writeSectors, readSectors: current.readSectors, at: now }
+  }
+  return { activity: activity, samples: samples }
+}
+
+// Below a kilobyte a second there is nothing worth showing; the number would
+// flicker between "0 B/s" and "512 B/s" on an idle drive.
+function formatRate(bytesPerSecond) {
+  var n = Number(bytesPerSecond)
+  if (!isFinite(n) || n < 1024) return ""
+  return formatBytes(n) + "/s"
+}
+
+function activityLabel(entry) {
+  if (!entry) return ""
+  var write = formatRate(entry.writeRate)
+  if (write !== "") return "Writing " + write
+  var read = formatRate(entry.readRate)
+  if (read !== "") return "Reading " + read
+  if (entry.busy) return "Busy"
+  return ""
+}
+
+// --------------------------------------------------------------- blockers
+
+// `ps -o pid=,comm= -p <pids>` prints "  4821 nautilus" per line.
+function parseBlockers(raw) {
+  var out = []
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var match = clean(lines[i]).match(/^(\d+)\s+(.+)$/)
+    if (match) out.push({ pid: Number(match[1]), name: match[2] })
+  }
+  return out
+}
+
+// Names, not pids, and deduplicated: five nautilus threads holding a mount is
+// one thing to close, not five.
+function describeBlockers(blockers) {
+  if (!blockers || blockers.length === 0) return ""
+  var names = []
+  for (var i = 0; i < blockers.length; i++) {
+    if (names.indexOf(blockers[i].name) === -1) names.push(blockers[i].name)
+  }
+  if (names.length <= 3) return names.join(", ")
+  return names.slice(0, 3).join(", ") + " and " + (names.length - 3) + " more"
+}
+
+// ---------------------------------------------------------------- arrivals
+
+function deviceDiff(previous, current) {
+  var previousPaths = {}
+  var currentPaths = {}
+  var added = []
+  var removed = []
+  var i
+  for (i = 0; i < (previous || []).length; i++) previousPaths[previous[i].path] = true
+  for (i = 0; i < (current || []).length; i++) currentPaths[current[i].path] = true
+  for (i = 0; i < (current || []).length; i++) {
+    if (!previousPaths[current[i].path]) added.push(current[i])
+  }
+  for (i = 0; i < (previous || []).length; i++) {
+    if (!currentPaths[previous[i].path]) removed.push(previous[i])
+  }
+  return { added: added, removed: removed }
+}
+
+function connectedSummary(device) {
+  if (!device) return ""
+  var count = device.volumes.length
+  var volumes = count === 1 ? "1 volume" : count + " volumes"
+  return device.sizeText + " · " + volumes
+}
+
+// The quiet-streak rule behind a deferred eject. Throughput dips to zero
+// between bursts of a copy, so a single idle sample does not mean the drive is
+// finished; only a run of them does.
+// The mirror of advanceQuiet, for the actions that refuse rather than defer.
+//
+// Every rename and check unmounts the filesystem and mounts it back, and that
+// metadata write lands as a single sample of I/O — measured at eight sectors,
+// gone by the next second. Refusing on one sample means the second of two
+// renames is turned away for writes that were the first rename's own, with a
+// message saying the drive is still being written to when nothing is writing.
+//
+// So: one quiet sample is not enough to call a copy finished, and one busy
+// sample is not enough to call one started. A copy stays busy for as long as
+// it runs.
+//
+// This is a courtesy check, not the safety net. udisks refuses to unmount a
+// filesystem that has open files, and the blockers strip names who is holding
+// it, so letting a marginal case through costs a clear error rather than an
+// interrupted copy.
+var BUSY_TICKS_BEFORE_REFUSING = 2
+
+function advanceBusy(previousTicks, busy) {
+  if (!busy) return 0
+  var n = Number(previousTicks)
+  return (isFinite(n) && n > 0 ? n : 0) + 1
+}
+
+function sustainedBusy(ticks) {
+  return (Number(ticks) || 0) >= BUSY_TICKS_BEFORE_REFUSING
+}
+
+function advanceQuiet(stillBusy, quietTicks, requiredTicks) {
+  if (stillBusy) return { quietTicks: 0, run: false }
+  var next = Number(quietTicks || 0) + 1
+  return { quietTicks: next, run: next >= requiredTicks }
+}
+
+// -------------------------------------------------------------- bar label
+
+// Optional text beside the bar icon. One drive is the common case, so the
+// label describes that one and only counts the rest.
+function barLabelText(devices, mode) {
+  if (!devices || devices.length === 0) return ""
+  if (mode === "count") return String(devices.length)
+
+  var extra = devices.length > 1 ? " +" + (devices.length - 1) : ""
+  if (mode === "name") return plain(devices[0].title) + extra
+  if (mode === "free") {
+    for (var d = 0; d < devices.length; d++) {
+      var volumes = devices[d].volumes
+      for (var v = 0; v < volumes.length; v++) {
+        if (volumes[v].mounted && volumes[v].fsavail > 0) return formatBytes(volumes[v].fsavail) + extra
+      }
+    }
+    return ""
+  }
+  return ""
+}
+
+// ------------------------------------------------------------------ trash
+//
+// Removable media collects a .Trash-<uid> that nothing surfaces, so a stick
+// can be "full" of files the user believes they deleted. Both layouts in the
+// freedesktop spec are checked.
+
+function trashCandidates(mountpoint, uid) {
+  var mount = exact(mountpoint)
+  if (mount === "" || uid === undefined || uid === null) return []
+  return [mount + "/.Trash-" + uid, mount + "/.Trash/" + uid]
+}
+
+// The guard in front of a recursive delete. A path qualifies only by being
+// exactly one of the candidates of a mount point we are currently tracking —
+// never by pattern-matching, so a crafted label or a stale path cannot widen
+// what gets removed.
+function isSafeTrashPath(path, mountpoints, uid) {
+  var target = exact(path)
+  if (target === "") return false
+  for (var i = 0; i < (mountpoints || []).length; i++) {
+    var candidates = trashCandidates(mountpoints[i], uid)
+    for (var c = 0; c < candidates.length; c++) {
+      if (candidates[c] === target) return true
+    }
+  }
+  return false
+}
+
+// `du -sb` prints "<bytes>\t<path>" per line, and complains to stderr about
+// the candidates that do not exist — which is most of them.
+function parseSizes(raw) {
+  var out = {}
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var match = lines[i].match(/^(\d+)[ \t]+(.+?)\r?$/)
+    if (match) out[match[2]] = Number(match[1])
+  }
+  return out
+}
+
+// ------------------------------------------------------------- unlocking
+
+// udisksctl answers an unlock with "Unlocked /dev/sdb1 as /dev/dm-0." and the
+// cleartext device is the half that matters: udisks refuses the backing
+// partition for mount and unmount alike — "is not a mountable filesystem" —
+// so every filesystem operation after an unlock has to name the mapper.
+//
+// The trailing period is part of the sentence, not the path, and a mapper name
+// can itself contain one, so it is stripped from the end rather than used as a
+// delimiter.
+function parseUnlockedMapper(raw) {
+  var lines = String(raw === undefined || raw === null ? "" : raw).split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var match = lines[i].match(/\bas\s+(\/dev\/.+?)\.?\s*$/)
+    if (match) return match[1]
+  }
+  return ""
+}
+
+function canUnlock(volume) {
+  return !!(volume && volume.encrypted && !volume.unlocked)
+}
+
+function canLock(volume) {
+  return !!(volume && volume.encrypted && volume.unlocked)
+}
+
+// --------------------------------------------------------- sleep guard
+
+// What the sleep guard unmounts: mounted volumes only, by fsPath, because that
+// is what udisksctl takes.
+//
+// A /dev path can be reused, so this list is rewritten whenever the mounted
+// set changes and is never older than the last udev event. Unlike a repair,
+// an unmount aimed at a path that has moved on is harmless — it either finds
+// nothing mounted there, or finds a filesystem udisks refuses to unmount
+// without asking, which --no-user-interaction turns into a failure rather
+// than a surprise.
+function suspendTargets(devices) {
+  var out = []
+  for (var d = 0; d < (devices || []).length; d++) {
+    var volumes = devices[d].volumes || []
+    for (var v = 0; v < volumes.length; v++) {
+      if (volumes[v].mounted && exact(volumes[v].fsPath) !== "") out.push(exact(volumes[v].fsPath))
+    }
+  }
+  return out
+}
+
+// ------------------------------------------------------- per-drive memory
+
+// A key that survives replugging, so a nickname sticks to the drive rather
+// than to whichever /dev node it lands on. Serial is best; a partition UUID
+// is the fallback for drives that report none, and the last resort merely
+// distinguishes two different models rather than two identical sticks.
+function driveKey(device) {
+  if (!device) return ""
+  var serial = exact(device.serial)
+  if (serial !== "") return "serial:" + serial
+  for (var i = 0; i < device.volumes.length; i++) {
+    var uuid = exact(device.volumes[i].uuid)
+    if (uuid !== "") return "uuid:" + uuid
+  }
+  return "model:" + clean(device.title) + ":" + device.sizeBytes
+}
+
+function driveSettings(store, device) {
+  var key = driveKey(device)
+  if (key === "" || !store || !store.drives) return {}
+  return store.drives[key] || {}
+}
+
+// Two of the saved fields decide how a drive mounts rather than what it is
+// called, so an unreadable value has to answer for itself. The file is
+// hand-edited, and the two fail in opposite directions: a drive whose owner
+// asked for read-only must not be mounted writable because of a typo, while a
+// broken autoOpen only ever decides whether a window opens and can safely fall
+// back to what every other drive does.
+function readOnlyPolicy(value) {
+  if (value === undefined || value === null) return false
+  return value !== false
+}
+
+// null is "follow the global openOnMount". Tri-state rather than boolean,
+// because a per-drive false as the default would override a global true for
+// every drive that has ever been given a nickname.
+function autoOpenPolicy(value) {
+  if (value === true || value === false) return value
+  return null
+}
+
+function shouldMountReadOnly(store, device) {
+  return readOnlyPolicy(driveSettings(store, device).readOnly)
+}
+
+function shouldOpenOnMount(store, device, globalDefault) {
+  var saved = autoOpenPolicy(driveSettings(store, device).autoOpen)
+  return saved === null ? globalDefault === true : saved
+}
+
+// Where the drive row's open-after-mount button lands next: follow the global
+// setting, always open, never open, and back round.
+function nextAutoOpen(value) {
+  if (autoOpenPolicy(value) === null) return true
+  return value === true ? false : null
+}
+
+// Nicknames are applied after parsing so everything downstream — the panel,
+// the bar label, notifications — says the name the user chose without each
+// caller having to remember to look it up.
+function applyStore(devices, store) {
+  for (var i = 0; i < devices.length; i++) {
+    var saved = driveSettings(store, devices[i])
+    var nickname = clean(saved.nickname)
+    devices[i].key = driveKey(devices[i])
+    devices[i].nickname = nickname
+    devices[i].deviceName = devices[i].title
+    if (nickname !== "") devices[i].title = nickname
+  }
+  return devices
+}
+
+function withDriveSetting(store, device, name, value) {
+  var next = { version: 1, drives: {} }
+  if (store && store.drives) {
+    for (var k in store.drives) next.drives[k] = store.drives[k]
+  }
+  var key = driveKey(device)
+  if (key === "") return next
+  var entry = {}
+  var existing = next.drives[key] || {}
+  for (var f in existing) entry[f] = existing[f]
+  if (value === null || value === "" || value === undefined) delete entry[name]
+  else entry[name] = value
+  if (Object.keys(entry).length === 0) delete next.drives[key]
+  else next.drives[key] = entry
+  return next
+}
+
+// One saved drive, as it is allowed to exist in memory. Fields this plugin
+// does not know about are carried through untouched — the file belongs to the
+// user — but the two that decide how the drive mounts are read through their
+// own policy rather than believed, so a typo cannot reach a mount command.
+function driveRecord(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null
+  var out = {}
+  for (var name in entry) {
+    if (name !== "readOnly" && name !== "autoOpen") out[name] = entry[name]
+  }
+  if (entry.readOnly !== undefined && entry.readOnly !== null) {
+    out.readOnly = readOnlyPolicy(entry.readOnly)
+  }
+  var autoOpen = autoOpenPolicy(entry.autoOpen)
+  if (autoOpen !== null) out.autoOpen = autoOpen
+  return out
+}
+
+function parseStore(raw) {
+  try {
+    var parsed = JSON.parse(String(raw || "").replace(/^\s+|\s+$/g, "") || "{}")
+    if (!parsed || typeof parsed !== "object") return { version: 1, drives: {} }
+    var saved = parsed.drives
+    var drives = {}
+    if (saved && typeof saved === "object" && !Array.isArray(saved)) {
+      for (var key in saved) {
+        var record = driveRecord(saved[key])
+        if (record !== null && Object.keys(record).length > 0) drives[key] = record
+      }
+    }
+    return { version: 1, drives: drives }
+  } catch (e) {
+    return { version: 1, drives: {} }
+  }
+}
+
+// --------------------------------------------------------- connect hooks
+//
+// A drive can already run a command of the user's choosing when it appears,
+// and the panel had no way of knowing that command was running: an rsync to a
+// backup stick looked exactly like an idle drive, and the busy icon is no
+// substitute because kernel I/O goes quiet between an rsync's file batches.
+//
+// So the hook is handed a third argument, a file it may write progress to.
+// The format is key=value lines because a shell script has to be able to write
+// it with one echo and a person has to be able to read it:
+//
+//   percent=42
+//   status=Copying documents
+
+// The file is named after the drive key, and that key falls back to a
+// device-supplied model string — so it can carry a slash or a "..". It names a
+// path this plugin then creates and writes to, so it is reduced to characters
+// that cannot leave the directory it belongs in.
+function hookProgressName(key) {
+  var name = exact(key).replace(/[^A-Za-z0-9._-]/g, "_")
+  if (/^\.+$/.test(name)) return ""
+  return name.length > 120 ? name.substring(0, 120) : name
+}
+
+// A hook's status line routinely contains a filename, and a filename contains
+// anything — so it is hostile input for the same reason a drive label is, and
+// it is capped because a row has a width.
+var HOOK_STATUS_LIMIT = 120
+
+function hookStatusText(value) {
+  var text = plain(value)
+  return text.length > HOOK_STATUS_LIMIT ? text.substring(0, HOOK_STATUS_LIMIT - 1) + "…" : text
+}
+
+// Floored rather than rounded: 99.6 rounded up reads as a finished copy.
+function hookPercent(value) {
+  var text = clean(value)
+  if (text === "") return null
+  var n = Number(text)
+  if (!isFinite(n)) return null
+  return Math.max(0, Math.min(100, Math.floor(n)))
+}
+
+function parseHookProgress(raw) {
+  var percent = null
+  var status = ""
+  var done = false
+  var said = false
+  var lines = String(raw === undefined || raw === null ? "" : raw).split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var line = clean(lines[i])
+    if (line === "") continue
+    var pair = line.match(/^([A-Za-z]+)=(.*)$/)
+    if (!pair) {
+      // The laziest possible hook writes a bare number and nothing else.
+      if (/^\d+$/.test(line)) {
+        percent = hookPercent(line)
+        said = true
+      }
+      continue
+    }
+    var key = pair[1].toLowerCase()
+    if (key === "percent") {
+      percent = hookPercent(pair[2])
+      said = true
+    } else if (key === "status") {
+      status = hookStatusText(pair[2])
+      said = true
+    } else if (key === "done") {
+      done = /^(1|true|yes)$/i.test(clean(pair[2]))
+      said = true
+    }
+  }
+  if (!said) return null
+  return { percent: percent, status: status, done: done }
+}
+
+// Whether the hook is alive is a separate fact from what its file says, and it
+// is the more trustworthy of the two: a hook that dies mid-copy stops updating
+// its file and leaves the last percent sitting there forever. So the process
+// is what ends it, whatever the file still claims.
+function hookState(progress, running) {
+  var alive = running === true
+  var said = progress || null
+  var finished = said !== null && (said.done === true || !alive)
+  return {
+    active: alive && !(said !== null && said.done === true),
+    percent: said ? said.percent : null,
+    status: said ? said.status : "",
+    done: finished
+  }
+}
+
+// The sibling of activityLabel: what the row says while the hook runs. A hook
+// that reports nothing still gets a line, because the drive is being written
+// to and the silence is what the feature exists to end.
+function hookLabel(state) {
+  if (!state || !state.active) return ""
+  return state.status !== "" ? state.status : "Running its connect hook…"
+}
+
+// One poll covers every drive with a hook, the way the I/O sampler covers
+// every drive at once: a header line per drive carrying its liveness, then
+// whatever the hook wrote.
+function parseHookReport(raw) {
+  var out = {}
+  var lines = String(raw || "").split("\n")
+  var name = ""
+  var running = false
+  var body = []
+
+  function flush() {
+    if (name === "") return
+    out[name] = hookState(parseHookProgress(body.join("\n")), running)
+    name = ""
+    body = []
+  }
+
+  for (var i = 0; i < lines.length; i++) {
+    var header = lines[i].match(/^==>\s*(\S+)\s+([01])\s*<==\s*$/)
+    if (header) {
+      flush()
+      name = header[1]
+      running = header[2] === "1"
+      continue
+    }
+    if (name !== "") body.push(lines[i])
+  }
+  flush()
+  return out
+}
+
+// ------------------------------------------------------- phones & cameras
+//
+// A phone is not a block device — it speaks MTP, and gvfs is what mounts it.
+// `gio mount -li` prints nested Drive/Volume/Mount blocks; the ones that
+// matter identify themselves either by their volume-monitor type or by an
+// mtp:// / gphoto2:// URI, so either signal is enough to catch one.
+
+var PORTABLE_URI = /^(mtp|gphoto2|afc):\/\//
+
+// An iPhone speaks PTP, so gvfs files it under the gphoto2 backend and its
+// icon set says "camera". It is still a phone to the person holding it, so the
+// name decides what it looks like and the backend decides what it can reach.
+var PHONE_NAME = /iphone|ipad|android|phone|pixel|galaxy|oneplus|xiaomi|nexus|redmi/i
+
+function isPortableType(typeLine) {
+  return /MTP|GPhoto2|Afc/i.test(String(typeLine || ""))
+}
+
+function parseGioMounts(raw) {
+  var out = []
+  var lines = String(raw || "").split("\n")
+  var current = null
+  var mountsByName = {}
+
+  function flush() {
+    if (!current) return
+    var isPortable = isPortableType(current.type) || PORTABLE_URI.test(current.uri)
+    if (isPortable && clean(current.name) !== "") {
+      var name = clean(current.name)
+      // The URI is an argument to `gio mount` and `gio open`, so it is a path
+      // by another name and gets the same byte-exact treatment.
+      var uri = exact(current.uri)
+      var scheme = (uri.match(/^([a-z0-9]+):\/\//) || ["", ""])[1]
+      var looksLikeCamera = scheme === "gphoto2" || /GPhoto2/i.test(current.type)
+      out.push({
+        name: name,
+        uri: uri,
+        mounted: current.mounted === true,
+        scheme: scheme,
+        // PTP only ever exposes the camera roll; MTP and AFC reach further.
+        access: looksLikeCamera ? "Photos" : "Files",
+        kind: PHONE_NAME.test(name) ? "phone" : (looksLikeCamera ? "camera" : "phone")
+      })
+    }
+    current = null
+  }
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+
+    // A new Volume or Drive block ends the previous one. Volumes are what
+    // can be mounted, so a Drive block only starts one when no Volume
+    // follows it — flushing on both keeps the two cases from merging.
+    var volume = line.match(/^\s*Volume\(\d+\):\s*(.+?)\s*$/)
+    if (volume) {
+      flush()
+      current = { name: volume[1], type: "", uri: "", mounted: false }
+      continue
+    }
+    var drive = line.match(/^\s*Drive\(\d+\):\s*(.+?)\s*$/)
+    if (drive) {
+      flush()
+      current = { name: drive[1], type: "", uri: "", mounted: false }
+      continue
+    }
+    if (!current) continue
+
+    var type = line.match(/^\s*Type:\s*(.+?)\s*$/)
+    if (type) {
+      if (current.type === "") current.type = type[1]
+      continue
+    }
+    var activation = line.match(/^\s*activation_root=(\S+)\s*$/)
+    if (activation) {
+      if (current.uri === "") current.uri = activation[1]
+      continue
+    }
+    // "Mount(0): Pixel 7 -> mtp://Google_Pixel_7_1234/" — the arrow target is
+    // the URI, and the presence of the line is what says it is mounted.
+    //
+    // gio also prints top-level Mount lines after every Drive and Volume
+    // block, so a mount belonging to one device can appear while a different
+    // block is still open. Matching on the name is what stops an iPhone's
+    // gphoto2 URI being overwritten by the afc mount listed after it.
+    var mount = line.match(/^\s*Mount\(\d+\):\s*(.*?)\s*->\s*(\S+)\s*$/)
+    if (mount) {
+      var mountName = clean(mount[1])
+      mountsByName[mountName] = mount[2]
+      if (mountName === clean(current.name)) {
+        current.mounted = true
+        if (current.uri === "") current.uri = mount[2]
+      }
+      continue
+    }
+  }
+  flush()
+
+  // Mounts listed outside any block still prove their device is mounted —
+  // matched by name, or by URI, because gvfs names an MTP daemon mount after
+  // the backend ("Mount(1): mtp -> mtp://SAMSUNG_.../") rather than after the
+  // device it belongs to.
+  for (var m = 0; m < out.length; m++) {
+    if (mountsByName[out[m].name] !== undefined) {
+      out[m].mounted = true
+      if (out[m].uri === "") out[m].uri = mountsByName[out[m].name]
+      continue
+    }
+    if (out[m].uri === "") continue
+    for (var mountName in mountsByName) {
+      if (mountsByName[mountName] === out[m].uri) {
+        out[m].mounted = true
+        break
+      }
+    }
+  }
+
+  // gvfs reports one phone as both a Drive and a Volume under the same
+  // display name, and only the Volume carries the URI. Merge by name so the
+  // pair becomes one row that knows both its URI and whether it is mounted.
+  var byName = {}
+  var ordered = []
+  for (var o = 0; o < out.length; o++) {
+    var entry = out[o]
+    var seen = byName[entry.name]
+    if (seen) {
+      if (seen.uri === "" && entry.uri !== "") seen.uri = entry.uri
+      if (entry.mounted) seen.mounted = true
+      if (seen.scheme === "" && entry.scheme !== "") {
+        seen.scheme = entry.scheme
+        seen.access = entry.access
+      }
+      if (entry.kind === "camera" && !PHONE_NAME.test(seen.name)) seen.kind = "camera"
+      continue
+    }
+    byName[entry.name] = entry
+    ordered.push(entry)
+  }
+
+  // A device with no URI — a phone still locked, so gvfs has published the
+  // drive but no volume — offers nothing to mount or open, so it is left out
+  // rather than drawn as a row whose buttons do nothing.
+  var actionable = []
+  for (var a = 0; a < ordered.length; a++) {
+    if (ordered[a].uri !== "") actionable.push(ordered[a])
+  }
+  return actionable
+}
+
+function portableGlyph(entry) {
+  return entry && entry.kind === "camera" ? GLYPH_CAMERA : GLYPH_PHONE
+}
+
+function portableMeta(entry) {
+  if (!entry) return ""
+  var access = entry.access || "Files"
+  if (!entry.mounted) return access + " · not mounted"
+  return access + " · mounted"
+}
+
+// -------------------------------------------------- backend availability
+//
+// A phone only appears here if gvfs has a backend that speaks its protocol:
+// gvfs-mtp for Android, gvfs-afc (plus the usbmuxd daemon) for an iPhone,
+// gvfs-gphoto2 for a camera. Omarchy ships gvfs-mtp, so Android works out of
+// the box and Apple does not. A plugin may not install packages — Omarchy's
+// plugin installer never runs install hooks — so the most it can honestly do
+// is notice the gap and offer to open an installer.
+//
+// gvfs advertises what it can mount in /usr/share/gvfs/mounts/<scheme>.mount,
+// which makes availability a file check rather than a guess.
+
+var APPLE_VENDOR = "05ac"
+var IMAGING_CLASS = "06"
+
+function parseSupport(raw) {
+  var backends = {}
+  var devices = []
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var line = clean(lines[i])
+    if (line === "") continue
+
+    var backend = line.match(/^backend\s+(\S+)$/)
+    if (backend) {
+      backends[backend[1]] = true
+      continue
+    }
+    // "usb 05ac,06,ff iPhone" — vendor first, then every interface class the
+    // device exposes, then whatever name it reports.
+    var usb = line.match(/^usb\s+(\S+)\s*(.*)$/)
+    if (usb) {
+      var fields = usb[1].split(",")
+      devices.push({
+        vendor: fields[0] || "",
+        classes: fields.slice(1),
+        name: clean(usb[2])
+      })
+    }
+  }
+  return { backends: backends, devices: devices }
+}
+
+// What to say when something is plugged in that gvfs cannot reach. Silence
+// reads as a broken widget, which is the one outcome worth avoiding.
+// The sentence and the caption under it are both built from the package list
+// rather than written alongside it. Written by hand they drifted: the panel
+// offered "two more packages", named two, and installed three. A widget whose
+// whole argument is that it tells you the truth about your drives cannot
+// misreport what it is about to install on your machine.
+function packageList(packages) {
+  var parts = clean(packages).split(" ")
+  var out = []
+  for (var i = 0; i < parts.length; i++) {
+    if (parts[i] !== "") out.push(parts[i])
+  }
+  return out
+}
+
+var COUNT_WORDS = ["no", "one", "two", "three", "four", "five", "six"]
+
+function countWord(count) {
+  return COUNT_WORDS[count] !== undefined ? COUNT_WORDS[count] : String(count)
+}
+
+// "usbmuxd, gvfs-afc and gvfs-gphoto2" — an Oxford-less list, because it is
+// read as a caption rather than parsed.
+function joinNames(list) {
+  if (list.length === 0) return ""
+  if (list.length === 1) return list[0]
+  return list.slice(0, list.length - 1).join(", ") + " and " + list[list.length - 1]
+}
+
+function describePackages(packages) {
+  var list = packageList(packages)
+  return {
+    detail: joinNames(list),
+    count: list.length,
+    phrase: list.length === 1 ? "one more package" : countWord(list.length) + " more packages"
+  }
+}
+
+function supportHint(support) {
+  if (!support) return null
+  var backends = support.backends || {}
+  var devices = support.devices || []
+
+  for (var i = 0; i < devices.length; i++) {
+    var device = devices[i]
+    if (device.vendor === APPLE_VENDOR && !backends.afc) {
+      var apple = describePackages("usbmuxd gvfs-afc gvfs-gphoto2")
+      return {
+        text: (device.name !== "" ? device.name : "An Apple device") +
+              " is connected, but Linux needs " + apple.phrase + " to browse it",
+        detail: apple.detail,
+        packages: "usbmuxd gvfs-afc gvfs-gphoto2",
+        label: "iPhone support",
+        // usbmuxd is started by a udev rule that fires when an Apple device is
+        // plugged in. Installing it while the phone is already connected
+        // leaves it inactive, and AFC stays silently unavailable until the
+        // cable is pulled — which nothing else on screen would ever tell you.
+        reconnect: true
+      }
+    }
+    if (device.classes.indexOf(IMAGING_CLASS) !== -1 && !backends.gphoto2 && !backends.mtp) {
+      var camera = describePackages("gvfs-gphoto2")
+      return {
+        text: (device.name !== "" ? device.name : "A camera") + " is connected, but no gvfs backend can read it",
+        detail: camera.detail,
+        packages: "gvfs-gphoto2",
+        label: "Camera support",
+        reconnect: false
+      }
+    }
+  }
+  return null
+}
+
+// ------------------------------------------------- labels and integrity
+//
+// Two things udisks exposes on org.freedesktop.UDisks2.Filesystem that
+// `udisksctl` has no verb for: renaming a filesystem, and running its fsck.
+// Both are `modify-device` in the udisks policy, which is `allow_active: yes`
+// for a removable drive — so the logged-in session may do them without a
+// prompt, exactly like mounting, and nothing here runs as root either.
+//
+// Neither is offered against a mounted filesystem. Check and Repair refuse
+// outright. SetLabel usually succeeds, but the mount point was built from the
+// old label and does not follow it, leaving a drive mounted at
+// /run/media/<user>/OLDNAME while calling itself something else — so the
+// panel unmounts first and mounts back afterwards for both.
+
+// Every filesystem hands its label to a different tool — fatlabel, exfatlabel,
+// e2label, ntfslabel — and each has its own ceiling. These are libblockdev's
+// numbers, the same ones udisks refuses on, so the field can say "two
+// characters too long" while it is still open rather than after a round trip
+// that unmounted the drive for a write that was never going to land.
+var LABEL_LIMITS = {
+  vfat: 11, exfat: 11, ext2: 16, ext3: 16, ext4: 16, xfs: 12,
+  ntfs: 128, btrfs: 256, f2fs: 512, nilfs2: 80, udf: 126
+}
+
+// The DOS reserved characters, which fatlabel rejects one at a time.
+var VFAT_FORBIDDEN = "\"*/:<>?\\|"
+
+function labelLimit(fstype) {
+  var limit = LABEL_LIMITS[clean(fstype)]
+  return limit === undefined ? 0 : limit
+}
+
+// Renaming needs a filesystem that is readable and whose tool we know a limit
+// for. A LUKS partition still locked has no filesystem to name yet.
+function canRelabel(volume) {
+  if (!volume) return false
+  if (volume.isSystem || holdsSystemMount(volume)) return false
+  if (volume.encrypted && !volume.unlocked) return false
+  return labelLimit(volume.fstype) > 0
+}
+
+// The label is the one string in this file a person typed rather than a device
+// supplied, but it still travels to a filesystem tool, so it is trimmed at the
+// ends and otherwise left alone — interior spacing is the user's business, and
+// clean() would quietly rewrite "MY  STICK" into a different name than the one
+// on screen.
+function normaliseLabel(label) {
+  return String(label === undefined || label === null ? "" : label).replace(/^\s+|\s+$/g, "")
+}
+
+function validateLabel(volume, label) {
+  if (!volume) return { ok: false, message: "No volume selected", label: "" }
+  var fstype = clean(volume.fstype)
+  var limit = labelLimit(fstype)
+  var fs = formatFsType(fstype)
+  if (limit === 0) {
+    return { ok: false, message: (fs !== "" ? fs : "This") + " labels cannot be changed from here", label: "" }
+  }
+
+  var value = normaliseLabel(label)
+  if (value.length > limit) {
+    return {
+      ok: false,
+      label: value,
+      message: fs + " labels are at most " + limit + " characters — that is " +
+               (value.length - limit) + " too many"
+    }
+  }
+  if (fstype === "vfat") {
+    for (var i = 0; i < value.length; i++) {
+      var ch = value.charAt(i)
+      if (VFAT_FORBIDDEN.indexOf(ch) !== -1) {
+        return { ok: false, label: value, message: fs + " labels cannot contain " + ch }
+      }
+    }
+  }
+  // An empty label is a real answer: it clears the name rather than storing a
+  // blank one, which is how the drive shipped before anyone named it.
+  return { ok: true, message: "", label: value }
+}
+
+// How much room is left, for the counter beside the field. Negative once the
+// name is too long, which is what turns the counter urgent.
+function labelRemaining(volume, label) {
+  var limit = volume ? labelLimit(volume.fstype) : 0
+  if (limit === 0) return 0
+  return limit - normaliseLabel(label).length
+}
+
+// udisks answers "can you fsck this?" itself, and when the answer is no it
+// names the tool it went looking for rather than just refusing. That turns a
+// missing button into a sentence someone can act on, the same way the gvfs
+// backend check does for phones.
+//
+// Lines read `CanCheck vfat (bs) true ""` or `CanRepair ntfs (bs) false
+// "ntfsfix"`. A filesystem udisks will not fsck at all answers with an error
+// rather than a value, and the probe echoes the bare `CanCheck nilfs2` back.
+//
+// The same probe carries the Manager's own SupportedFilesystems on a
+// `Supported as 12 "ext2" "ext3" …` line, which is the only list a format is
+// ever allowed to choose from — a type udisks does not name here cannot reach
+// the bus at all.
+function parseFsCapabilities(raw) {
+  var caps = { check: {}, repair: {}, format: [] }
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var line = clean(lines[i])
+    var supported = line.match(/^Supported\b(.*)$/)
+    if (supported) {
+      caps.format = quotedList(supported[1])
+      continue
+    }
+    var match = line.match(/^Can(Check|Repair)\s+(\S+)(?:\s+\(bs\)\s+(true|false)\s+"([^"]*)")?$/)
+    if (!match) continue
+    var bucket = match[1] === "Check" ? caps.check : caps.repair
+    bucket[match[2]] = match[3] === undefined
+      ? { supported: false, available: false, missing: "" }
+      : { supported: true, available: match[3] === "true", missing: match[4] || "" }
+  }
+  return caps
+}
+
+// busctl prints an array of strings as its signature, a count, then the
+// quoted values. Reading the quotes rather than splitting on spaces keeps a
+// count or a stray field from being mistaken for a filesystem name.
+function quotedList(text) {
+  var out = []
+  var found = String(text === undefined || text === null ? "" : text).match(/"[^"]*"/g) || []
+  for (var i = 0; i < found.length; i++) {
+    var value = clean(found[i].replace(/^"|"$/g, ""))
+    if (value !== "") out.push(value)
+  }
+  return out
+}
+
+function fsCapability(caps, kind, fstype) {
+  var bucket = caps && caps[kind] ? caps[kind] : {}
+  var entry = bucket[clean(fstype)]
+  return entry === undefined ? null : entry
+}
+
+// Whether the volume is mounted is deliberately not part of this: the panel
+// unmounts it first rather than greying the button out and leaving the user to
+// work out which of the two buttons unblocks the other.
+function canCheck(caps, volume) {
+  if (!volume) return false
+  if (volume.isSystem || holdsSystemMount(volume)) return false
+  if (volume.encrypted && !volume.unlocked) return false
+  var entry = fsCapability(caps, "check", volume.fstype)
+  return entry !== null && entry.available === true
+}
+
+function canRepair(caps, volume) {
+  if (!volume) return false
+  if (volume.encrypted && !volume.unlocked) return false
+  var entry = fsCapability(caps, "repair", volume.fstype)
+  return entry !== null && entry.available === true
+}
+
+// Which package carries each helper udisks names when it cannot find one.
+var TOOL_PACKAGES = {
+  "ntfsfix": "ntfs-3g",
+  "fsck.ntfs": "ntfs-3g",
+  "ntfslabel": "ntfs-3g",
+  "fsck.exfat": "exfatprogs",
+  "exfatlabel": "exfatprogs",
+  "xfs_repair": "xfsprogs",
+  "xfs_db": "xfsprogs",
+  "xfs_admin": "xfsprogs",
+  "fsck.f2fs": "f2fs-tools",
+  "f2fslabel": "f2fs-tools",
+  "fsck.vfat": "dosfstools",
+  "fatlabel": "dosfstools",
+  "e2fsck": "e2fsprogs",
+  "e2label": "e2fsprogs",
+  "btrfs": "btrfs-progs",
+  "btrfsck": "btrfs-progs",
+  "fsck.nilfs2": "nilfs-utils",
+  "fsck.udf": "udftools"
+}
+
+function toolPackage(tool) {
+  return TOOL_PACKAGES[clean(tool)] || ""
+}
+
+// Said in place of the button when the check cannot be offered. A check udisks
+// would run if one package were present is worth naming; a filesystem it never
+// checks is worth saying so about rather than leaving a silent gap where a
+// button was on the row above.
+function checkHint(caps, volume) {
+  if (!volume) return null
+  if (volume.encrypted && !volume.unlocked) return null
+  if (clean(volume.fstype) === "") return null
+  var entry = fsCapability(caps, "check", volume.fstype)
+  if (entry === null || entry.available) return null
+
+  var fs = formatFsType(volume.fstype)
+  if (!entry.supported || entry.missing === "") {
+    return { text: "udisks cannot check " + fs, detail: "", packages: "", label: "" }
+  }
+  var pkg = toolPackage(entry.missing)
+  return {
+    text: "Checking " + fs + " needs " + entry.missing,
+    detail: pkg !== "" ? pkg : entry.missing,
+    packages: pkg,
+    label: fs + " repair tools"
+  }
+}
+
+// The probe costs a D-Bus round trip per filesystem, so ask about the types
+// actually attached rather than everything udisks lists. Sorted, because the
+// result doubles as the signature that decides whether to probe again at all.
+function fsTypesPresent(devices) {
+  var seen = {}
+  var out = []
+  for (var d = 0; d < (devices || []).length; d++) {
+    var volumes = devices[d].volumes || []
+    for (var v = 0; v < volumes.length; v++) {
+      var fs = clean(volumes[v].fstype)
+      if (fs === "" || fs === "crypto_LUKS") continue
+      if (seen[fs] === true) continue
+      seen[fs] = true
+      out.push(fs)
+    }
+  }
+  out.sort()
+  return out
+}
+
+// Check exits 0 whether or not it liked what it found — an unhealthy
+// filesystem is a result, not a failure — so the verdict is read off stdout
+// rather than off the exit code, and an unreadable answer stays null rather
+// than defaulting to "healthy".
+function parseFsVerdict(raw) {
+  var t = clean(raw)
+  if (/^b\s+true$/.test(t)) return true
+  if (/^b\s+false$/.test(t)) return false
+  return null
+}
+
+// A /dev path is reusable. Pull the stick that just failed its check, push in
+// another, and the kernel can hand the new one the same /dev/sda1 — at which
+// point a repair authorised by path alone would rewrite a filesystem nobody
+// ever looked at. Repair is the only thing here that rewrites a filesystem, so
+// its authorisation has to name the filesystem itself, not the socket it
+// happens to be sitting in.
+//
+// A volume with no UUID cannot be identified again after it disappears, so it
+// is refused rather than repaired on a maybe.
+function repairAuthorised(check, volume) {
+  if (!check || !volume) return false
+  if (check.verdict !== false) return false
+  var uuid = exact(check.uuid)
+  if (uuid === "" || exact(volume.uuid) === "") return false
+  if (exact(check.fsPath) === "" || exact(check.fsPath) !== exact(volume.fsPath)) return false
+  return uuid === exact(volume.uuid)
+}
+
+// The middle step of a rename or an fsck can succeed while putting the
+// filesystem back fails, and the drive is then sitting unmounted while the
+// panel says the thing worked. That is the one outcome the user has to act on,
+// so it travels back as its own exit code rather than being swallowed.
+var EXIT_REMOUNT_FAILED = 75
+
+function remountWarning(message) {
+  var done = clean(message)
+  if (done === "") return "The filesystem could not be mounted again"
+  return done + ", but it could not be mounted again"
+}
+
+function describeCheck(volume, consistent) {
+  var name = volume ? volume.title : "the filesystem"
+  if (consistent === true) return "No errors found on " + name
+  if (consistent === false) return "Errors found on " + name
+  return "Could not tell whether " + name + " is healthy"
+}
+
+function describeRepair(volume, repaired) {
+  var name = volume ? volume.title : "the filesystem"
+  if (repaired === true) return "Repaired " + name
+  if (repaired === false) return name + " could not be fully repaired"
+  return "Could not tell whether " + name + " was repaired"
+}
+
+// ------------------------------------------------- creating a filesystem
+//
+// The one action here that destroys data on purpose. So it is not a call with
+// four arguments that each get checked somewhere along the way — it is a plan,
+// { fsPath, fstype, label, quick }, approved as a whole before any part of it
+// reaches the bus. The fsPath is in the plan for the same reason a repair
+// carries a UUID: a /dev path is reusable, and a plan made while one stick was
+// in the socket must not run against the one that replaced it.
+
+// udisks will create twelve filesystems. These are the five worth offering —
+// what someone moving a stick between machines actually wants — in the order
+// they want them. swap and the raid member types are absent on purpose: a
+// removable drive is not where either belongs, and neither is a mistake anyone
+// makes deliberately from a panel.
+var FORMAT_TYPES = ["exfat", "vfat", "ntfs", "ext4", "btrfs"]
+
+function formatTypes(caps) {
+  var supported = (caps && caps.format) || []
+  var out = []
+  for (var i = 0; i < FORMAT_TYPES.length; i++) {
+    if (supported.indexOf(FORMAT_TYPES[i]) !== -1) out.push(FORMAT_TYPES[i])
+  }
+  return out
+}
+
+// A stand-in for the volume that does not exist yet, so the label rules answer
+// for the filesystem the drive is about to have rather than the one it is
+// losing: an ext4 stick being made exFAT loses five characters of label
+// ceiling, and the field has to count down against the new number while it is
+// still open.
+function formatTarget(fstype) {
+  var fs = clean(fstype)
+  return { fstype: fs, fstypeLabel: formatFsType(fs), encrypted: false, unlocked: false }
+}
+
+// The pairing the panel drew: this volume is one of the ones on that drive.
+function tracksVolume(device, volume) {
+  var target = exact(volume ? volume.fsPath : "")
+  if (target === "") return false
+  var volumes = (device && device.volumes) || []
+  for (var i = 0; i < volumes.length; i++) {
+    if (exact(volumes[i].fsPath) === target) return true
+  }
+  return false
+}
+
+// Why this volume may not be formatted, or null when it may. Everything the
+// pure layer can see is answered here. Whether the drive is still being
+// written to and whether another action is already running are the service's
+// to add: neither is in the lsblk tree.
+//
+// The mount is refused rather than dealt with. Every other action here
+// unmounts the filesystem and puts it back; this one asks the person to do it,
+// because unmounting a drive on the way to erasing it is one step too many to
+// take on somebody's behalf.
+function canFormat(caps, volume, device) {
+  if (!volume) return "No volume selected"
+  if (holdsSystemMount(volume) || holdsSystemMount(device)) {
+    return "That drive is holding a system mount"
+  }
+  if (!device || device.removable !== true || isVirtual(device.name) || !tracksVolume(device, volume)) {
+    return "That volume is not on a removable drive this panel tracks"
+  }
+  if (volume.mounted) return "Unmount " + volume.title + " first"
+  if (volume.encrypted && volume.unlocked) {
+    return "Lock " + volume.title + " before formatting it"
+  }
+  if (formatTypes(caps).length === 0) {
+    return "udisks has not said which filesystems it can create"
+  }
+  return null
+}
+
+function validateFormat(caps, volume, device, plan) {
+  var refusal = canFormat(caps, volume, device)
+  if (refusal !== null) return { ok: false, reason: refusal }
+  if (!plan) return { ok: false, reason: "No format was planned" }
+  if (exact(plan.fsPath) !== exact(volume.fsPath)) {
+    return { ok: false, reason: "That format was planned for a different volume" }
+  }
+  if (plan.quick !== true && plan.quick !== false) {
+    return { ok: false, reason: "A format has to say whether to erase the drive first" }
+  }
+
+  var fstype = clean(plan.fstype)
+  if (fstype === "") return { ok: false, reason: "Choose a filesystem to create" }
+  if (formatTypes(caps).indexOf(fstype) === -1) {
+    return { ok: false, reason: formatFsType(fstype) + " cannot be created here" }
+  }
+
+  var label = validateLabel(formatTarget(fstype), plan.label)
+  if (!label.ok) return { ok: false, reason: label.message }
+  return { ok: true, reason: "" }
+}
+
+// What has to be typed before the format runs: the kernel name of the volume,
+// not its label. It is short, it is what lsblk and dmesg call the same thing,
+// and unlike the label nobody chose it — a stick labelled with a single space,
+// or labelled to be retyped without looking, cannot water the confirmation
+// down.
+function formatToken(volume) {
+  return exact(volume ? volume.name : "")
+}
+
+function formatConfirmed(volume, typed) {
+  var token = formatToken(volume)
+  if (token === "") return false
+  return normaliseLabel(typed) === token
+}
+
+// The sentence above that field. It names the volume and the size of what is
+// going, because a second "are you sure?" over a drive nobody looked at twice
+// is how the wrong stick gets erased.
+function formatWarning(volume) {
+  if (!volume) return ""
+  var size = formatBytes(volume.sizeBytes)
+  return "Erases " + volume.title + (size !== "" ? " — " + size : "") +
+         " on " + exact(volume.fsPath) + ". Nothing brings it back."
+}
+
+function describeFormat(volume, fstype) {
+  var name = volume ? volume.title : "the volume"
+  var fs = formatFsType(fstype)
+  return "Formatted " + name + (fs !== "" ? " as " + fs : "")
+}
+
+// ------------------------------------------------------------ drive health
+//
+// smartctl is the reflex and it is the wrong tool here: it wants root for most
+// devices, and smartmontools is not standard on Omarchy, so reaching for it
+// would break both "nothing runs as root" and "no extra packages". udisks
+// already does the privileged read and publishes the answer on the same
+// `allow_active` no-password path everything else here takes — on
+// org.freedesktop.UDisks2.Drive.Ata or org.freedesktop.UDisks2.NVMe.Controller,
+// depending on how the drive is attached.
+//
+// Neither interface refreshes itself on a read, so the caller updates it first;
+// the numbers below are only as current as whoever fetched them made them.
+//
+// The fact that shapes this whole feature: a USB thumb drive carries neither
+// interface. Only external SSDs and hard drives behind a SAT-capable bridge
+// report health at all, so "this drive does not report health" is the common
+// answer, not the error path. It is a silence, not a warning, not a missing
+// dependency, and not a badge on a stick that will never have one.
+
+// udisks reports both drive temperatures in Kelvin — ATA as a double, NVMe as
+// a whole number — and reports 0 when it does not know, which is not −273 °C.
+//
+// The tenth is truncated rather than rounded, so the number on screen never
+// reads warmer than the one udisks handed over.
+var ZERO_CELSIUS_K = 273.15
+
+function celsiusFromKelvin(kelvin) {
+  var k = Number(clean(kelvin))
+  if (!isFinite(k) || k <= 0) return null
+  return Math.floor((k - ZERO_CELSIUS_K) * 10) / 10
+}
+
+function smartCount(value) {
+  var n = Number(clean(value))
+  if (!isFinite(n) || n < 0) return null
+  return Math.round(n)
+}
+
+// What udisks' NVMe critical-warning flags mean, since the bus reports each as
+// a single word a person has no way to expand. Anything not listed is repeated
+// as udisks named it rather than guessed at.
+var SMART_WARNINGS = {
+  "spare": "spare capacity is low",
+  "temperature": "its temperature is out of range",
+  "degraded": "its reliability is degraded",
+  "readonly": "it has gone read-only",
+  "volatile_mem": "its volatile memory backup failed",
+  "pmr_readonly": "its persistent memory region has gone read-only"
+}
+
+// The unmapped fallback and the self-test status below go into a tooltip whose
+// Text belongs to qs.Ui, so they are stripped the way a drive label is. udisks
+// chooses these words rather than the device, but the rule is cheap to keep.
+function smartWarningText(name) {
+  var key = clean(name).toLowerCase()
+  return SMART_WARNINGS[key] !== undefined ? SMART_WARNINGS[key] : plain(key)
+}
+
+// A self-test that ended in an error is evidence, and calling such a drive
+// healthy would be the overreach describeCheck already refuses to make. Only
+// the statuses naming an error count: one someone cancelled reads as
+// "aborted", and a drive is not sick for having been interrupted.
+function selftestFailed(status) {
+  var s = clean(status).toLowerCase()
+  if (s === "") return false
+  return s === "fatal" || s.indexOf("error") !== -1
+}
+
+// Each line is a property name, the type signature busctl printed, then the
+// value — "SmartTemperature q 306", "SmartFailing b false". The names are what
+// say which interface answered: SmartFailing and SmartPowerOnSeconds are ATA's,
+// SmartCriticalWarning and SmartPowerOnHours are NVMe's, and a drive carrying
+// neither interface answers with nothing at all.
+function parseSmart(raw) {
+  var smart = {
+    supported: false,
+    failing: null,
+    temperatureC: null,
+    powerOnHours: null,
+    badSectors: null,
+    selftest: null,
+    updatedAt: null,
+    warnings: null
+  }
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var match = clean(lines[i]).match(/^(Smart[A-Za-z]+)\s+\S+\s*(.*)$/)
+    if (!match) continue
+    var name = match[1]
+    var value = match[2]
+
+    if (name === "SmartFailing") {
+      smart.failing = value === "true" ? true : (value === "false" ? false : null)
+    } else if (name === "SmartTemperature") {
+      smart.temperatureC = celsiusFromKelvin(value)
+    } else if (name === "SmartPowerOnHours") {
+      smart.powerOnHours = smartCount(value)
+    } else if (name === "SmartPowerOnSeconds") {
+      var seconds = smartCount(value)
+      smart.powerOnHours = seconds === null ? null : Math.floor(seconds / 3600)
+    } else if (name === "SmartNumBadSectors") {
+      smart.badSectors = smartCount(value)
+    } else if (name === "SmartSelftestStatus") {
+      smart.selftest = clean(value).replace(/"/g, "")
+    } else if (name === "SmartUpdated") {
+      var at = smartCount(value)
+      smart.updatedAt = at > 0 ? at : null
+    } else if (name === "SmartCriticalWarning") {
+      // "as 0" when clear, "as 2 \"spare\" \"temperature\"" when not.
+      var flags = []
+      var quoted = value.match(/"[^"]*"/g) || []
+      for (var q = 0; q < quoted.length; q++) {
+        var flag = clean(quoted[q].replace(/"/g, ""))
+        if (flag !== "") flags.push(flag)
+      }
+      smart.warnings = flags
+    } else {
+      continue
+    }
+    smart.supported = true
+  }
+  return smart
+}
+
+// One probe covers every attached drive, so the answers arrive with a header
+// naming the device each belongs to.
+function parseSmartReport(raw) {
+  var out = {}
+  var lines = String(raw || "").split("\n")
+  var path = ""
+  var body = []
+
+  function flush() {
+    if (path === "") return
+    out[path] = parseSmart(body.join("\n"))
+    path = ""
+    body = []
+  }
+
+  for (var i = 0; i < lines.length; i++) {
+    var header = lines[i].match(/^==>\s*(.+?)\s*<==\s*$/)
+    if (header) {
+      flush()
+      path = header[1]
+      continue
+    }
+    if (path !== "") body.push(lines[i])
+  }
+  flush()
+  return out
+}
+
+function smartVerdict(smart) {
+  if (!smart || smart.supported !== true) return "unsupported"
+  if (smart.failing === true) return "failing"
+  if (smart.badSectors > 0) return "warning"
+  if (smart.warnings && smart.warnings.length > 0) return "warning"
+  if (selftestFailed(smart.selftest)) return "warning"
+  return "healthy"
+}
+
+function smartConcern(smart) {
+  var bad = smart.badSectors
+  if (bad > 0) return bad === 1 ? "1 reallocated sector" : bad + " reallocated sectors"
+  var flags = smart.warnings || []
+  if (flags.length > 0) {
+    var said = []
+    for (var i = 0; i < flags.length; i++) said.push(smartWarningText(flags[i]))
+    return "The drive says " + joinNames(said)
+  }
+  return "Its last self-test ended in " + plain(smart.selftest)
+}
+
+// Nothing at all for a drive that does not report health, because that is most
+// of them and a row saying so on every thumb drive would be noise. Where there
+// is an answer, the temperature and the hours are printed rather than judged:
+// a threshold guessed at here would be worth less than a number someone can
+// read and look up.
+function smartHint(smart) {
+  var verdict = smartVerdict(smart)
+  if (verdict === "unsupported") return ""
+
+  var parts = []
+  if (verdict === "failing") parts.push("This drive reports itself as failing")
+  else if (verdict === "warning") parts.push(smartConcern(smart))
+  else parts.push("No problems reported")
+
+  if (smart.temperatureC !== null) parts.push(smart.temperatureC.toFixed(1) + " °C")
+  if (smart.powerOnHours !== null) {
+    parts.push(smart.powerOnHours + (smart.powerOnHours === 1 ? " hour" : " hours") + " powered on")
+  }
+  return parts.join(" · ")
+}
+
+function hasUnmountedNtfs(devices) {
+  if (!devices) return false
+  for (var d = 0; d < devices.length; d++) {
+    var vols = devices[d].volumes || []
+    for (var v = 0; v < vols.length; v++) {
+      var vol = vols[v]
+      if ((vol.fstype === "ntfs" || vol.fstype === "ntfs3") && !vol.mounted) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// ------------------------------------------------------------ temperature & sparkline
+
+function tempStatus(tempC) {
+  if (tempC === null || tempC === undefined) return "unknown"
+  if (tempC >= 60) return "hot"
+  if (tempC >= 48) return "warm"
+  return "normal"
+}
+
+function tempStats(history, currentTemp) {
+  var list = (history || []).slice()
+  if (currentTemp !== null && currentTemp !== undefined) {
+    if (list.length === 0 || list[list.length - 1] !== currentTemp) {
+      list.push(currentTemp)
+    }
+  }
+  if (list.length === 0) {
+    return { min: null, max: null, current: currentTemp, trend: "stable", samples: [] }
+  }
+  var min = list[0]
+  var max = list[0]
+  for (var i = 1; i < list.length; i++) {
+    if (list[i] < min) min = list[i]
+    if (list[i] > max) max = list[i]
+  }
+  var trend = "stable"
+  if (list.length >= 2) {
+    var diff = list[list.length - 1] - list[0]
+    if (diff >= 0.5) trend = "rising"
+    else if (diff <= -0.5) trend = "cooling"
+  }
+  return {
+    min: min,
+    max: max,
+    current: list[list.length - 1],
+    trend: trend,
+    samples: list
+  }
+}
+
+function sparklineCoords(values, width, height, padding) {
+  var pad = padding || 2
+  var w = Math.max(10, width || 44)
+  var h = Math.max(8, height || 16)
+  var pts = []
+  if (!values || values.length === 0) return pts
+  if (values.length === 1) {
+    var yMid = h / 2
+    return [{ x: pad, y: yMid }, { x: w - pad, y: yMid }]
+  }
+  var min = values[0]
+  var max = values[0]
+  for (var i = 1; i < values.length; i++) {
+    if (values[i] < min) min = values[i]
+    if (values[i] > max) max = values[i]
+  }
+  var range = max - min
+  if (range === 0) range = 1
+  var availW = w - (pad * 2)
+  var availH = h - (pad * 2)
+  for (var j = 0; j < values.length; j++) {
+    var x = pad + (j / (values.length - 1)) * availW
+    var normY = (values[j] - min) / range
+    var y = h - pad - (normY * availH)
+    pts.push({ x: x, y: y })
+  }
+  return pts
+}
+
+// ------------------------------------------------------------ network & cloud mounts
+
+var NETWORK_FS_TYPES = [
+  "nfs", "nfs4", "cifs", "smb3", "smbfs",
+  "fuse.sshfs", "sshfs",
+  "fuse.rclone", "rclone",
+  "davfs", "davfs2", "fuse.davfs",
+  "fuse.s3fs", "fuse.gcsfuse",
+  "afpfs", "fuse.afpfs", "glusterfs", "ceph"
+]
+
+function isNetworkFs(fstype, source) {
+  var t = clean(fstype).toLowerCase()
+  if (NETWORK_FS_TYPES.indexOf(t) !== -1) return true
+  if (t.indexOf("fuse.") === 0) {
+    if (t.indexOf("sshfs") !== -1 || t.indexOf("rclone") !== -1
+        || t.indexOf("davfs") !== -1 || t.indexOf("s3") !== -1) return true
+  }
+  var s = clean(source)
+  if (s.indexOf("//") === 0) return true
+  if (s.indexOf(":/") !== -1 && s.indexOf("/dev/") !== 0) {
+    if (t !== "tmpfs" && t !== "devtmpfs" && t !== "proc" && t !== "sysfs") return true
+  }
+  return false
+}
+
+function networkShareLabel(fstype) {
+  var t = clean(fstype).toLowerCase()
+  if (t === "nfs" || t === "nfs4") return "NFS"
+  if (t === "cifs" || t === "smb3" || t === "smbfs") return "Samba (CIFS)"
+  if (t === "fuse.sshfs" || t === "sshfs") return "SSHFS"
+  if (t === "fuse.rclone" || t === "rclone") return "Cloud (Rclone)"
+  if (t === "davfs" || t === "davfs2" || t === "fuse.davfs") return "WebDAV"
+  if (t === "fuse.s3fs" || t === "fuse.gcsfuse") return "Cloud Storage"
+  return formatFsType(t)
+}
+
+function networkShareGlyph(fstype) {
+  var t = clean(fstype).toLowerCase()
+  if (t === "fuse.rclone" || t === "rclone" || t === "davfs" || t === "davfs2"
+      || t === "fuse.davfs" || t === "fuse.s3fs" || t === "fuse.gcsfuse") {
+    return GLYPH_CLOUD
+  }
+  if (t === "nfs" || t === "nfs4" || t === "fuse.sshfs" || t === "sshfs") {
+    return GLYPH_SERVER
+  }
+  return GLYPH_NETWORK
+}
+
+function parseNetworkMounts(rawInput) {
+  if (!rawInput) return []
+  var str = String(rawInput).trim()
+  var out = []
+
+  // Case A: findmnt JSON output
+  if (str.charAt(0) === "{" && str.indexOf("\"filesystems\"") !== -1) {
+    try {
+      var parsed = JSON.parse(str)
+      var list = parsed.filesystems || []
+      for (var i = 0; i < list.length; i++) {
+        var item = list[i]
+        if (!item || !isNetworkFs(item.fstype, item.source)) continue
+        var mnt = unescapeMountPath(item.target || "")
+        var src = clean(item.source)
+        var fsType = clean(item.fstype)
+        var opts = clean(item.options)
+        var ro = opts.indexOf("ro") === 0 || opts.indexOf(",ro") !== -1
+        var sizeB = Number(item.size || 0)
+        var usedB = Number(item.used || 0)
+        var availB = Number(item.avail || 0)
+
+        var server = ""
+        var remotePath = ""
+        if (src.indexOf("//") === 0) {
+          var trimmed = src.slice(2)
+          var slashIdx = trimmed.indexOf("/")
+          if (slashIdx !== -1) {
+            server = trimmed.slice(0, slashIdx)
+            remotePath = trimmed.slice(slashIdx)
+          } else {
+            server = trimmed
+          }
+        } else if (src.indexOf(":") !== -1) {
+          var colonIdx = src.indexOf(":")
+          server = src.slice(0, colonIdx)
+          remotePath = src.slice(colonIdx + 1)
+        } else {
+          server = src
+        }
+
+        var title = remotePath !== "" ? clean(remotePath.replace(/^\/+/, "")) : ""
+        if (title === "") {
+          var pathParts = mnt.split("/").filter(Boolean)
+          title = pathParts.length > 0 ? pathParts[pathParts.length - 1] : src
+        }
+
+        out.push({
+          id: "net:" + mnt,
+          mountpoint: mnt,
+          source: src,
+          fstype: fsType,
+          typeLabel: networkShareLabel(fsType),
+          glyph: networkShareGlyph(fsType),
+          server: server,
+          remotePath: remotePath,
+          title: title,
+          options: opts,
+          readOnly: ro,
+          sizeBytes: sizeB,
+          usedBytes: usedB,
+          availBytes: availB,
+          sizeText: formatBytes(sizeB),
+          usedText: formatBytes(usedB),
+          availText: formatBytes(availB),
+          usedFraction: sizeB > 0 ? Math.max(0, Math.min(1, usedB / sizeB)) : 0
+        })
+      }
+      return out
+    } catch (e) {
+      // Fall through to plain text parsing
+    }
+  }
+
+  // Case B: /proc/mounts lines
+  var lines = str.split("\n")
+  for (var l = 0; l < lines.length; l++) {
+    var parts = lines[l].split(" ")
+    if (parts.length < 4) continue
+    var srcB = unescapeMountPath(parts[0])
+    var mntB = unescapeMountPath(parts[1])
+    var fsTypeB = parts[2]
+    var optsB = parts[3]
+    if (!isNetworkFs(fsTypeB, srcB)) continue
+
+    var roB = optsB.indexOf("ro") === 0 || optsB.indexOf(",ro") !== -1
+    var srv = ""
+    var rem = ""
+    if (srcB.indexOf("//") === 0) {
+      var tr = srcB.slice(2)
+      var sIdx = tr.indexOf("/")
+      if (sIdx !== -1) {
+        srv = tr.slice(0, sIdx)
+        rem = tr.slice(sIdx)
+      } else {
+        srv = tr
+      }
+    } else if (srcB.indexOf(":") !== -1) {
+      var cIdx = srcB.indexOf(":")
+      srv = srcB.slice(0, cIdx)
+      rem = srcB.slice(cIdx + 1)
+    } else {
+      srv = srcB
+    }
+
+    var tit = rem !== "" ? clean(rem.replace(/^\/+/, "")) : ""
+    if (tit === "") {
+      var pp = mntB.split("/").filter(Boolean)
+      tit = pp.length > 0 ? pp[pp.length - 1] : srcB
+    }
+
+    out.push({
+      id: "net:" + mntB,
+      mountpoint: mntB,
+      source: srcB,
+      fstype: fsTypeB,
+      typeLabel: networkShareLabel(fsTypeB),
+      glyph: networkShareGlyph(fsTypeB),
+      server: srv,
+      remotePath: rem,
+      title: tit,
+      options: optsB,
+      readOnly: roB,
+      sizeBytes: 0,
+      usedBytes: 0,
+      availBytes: 0,
+      sizeText: "",
+      usedText: "",
+      availText: "",
+      usedFraction: 0
+    })
+  }
+
+  return out
+}
+
+
