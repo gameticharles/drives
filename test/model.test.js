@@ -930,6 +930,45 @@ test("quotes the empty and null cases without producing bare quotes", () => {
   assert.strictEqual(api.shellQuote("/run/media/x/PLAIN"), "'/run/media/x/PLAIN'")
 })
 
+test("quotes hostile device labels and mountpoints with single quotes, double quotes, and newlines", () => {
+  // Removable filesystems control their volume labels and udisks mountpoints.
+  // A label with single quotes or newlines must never break out of shell quoting
+  // when invoked by Speed Test, Scrub, Trim, Recovery, or Format.
+  const hostileMounts = [
+    "/run/media/user/Flash'Drive",
+    "/run/media/user/Drive\nWith\nNewlines",
+    "/run/media/user/Don't Stop\nNow",
+    "/run/media/user/USB'$(reboot)'",
+    "/run/media/user/My 'Favorite' Drive\n2026",
+    "/run/media/user/a'; rm -rf /; echo 'pwned"
+  ]
+
+  for (const mountpoint of hostileMounts) {
+    const quoted = api.shellQuote(mountpoint)
+    // Always wrapped in POSIX single quotes
+    assert.ok(quoted.startsWith("'") && quoted.endsWith("'"))
+    // In POSIX shell, no literal unescaped single quote exists inside the single quotes
+    const inner = quoted.slice(1, -1)
+    const segments = inner.split("'\\''")
+    for (const segment of segments) {
+      assert.ok(!segment.includes("'"), `segment still contained unescaped single quote: ${segment}`)
+    }
+    // Round-trip verification: what a POSIX shell produces when unquoting
+    const unquoted = segments.join("'")
+    assert.strictEqual(unquoted, mountpoint, "POSIX shell unquotes back to exact original path")
+  }
+})
+
+test("device with hostile label containing quotes and newlines parses with exact mountpoint", () => {
+  const hostileLabel = "Jane's\nBackup"
+  const hostileMount = `/run/media/user/${hostileLabel}`
+  const parsed = api.parse(tree([disk({
+    children: [part({ label: hostileLabel, mountpoint: hostileMount })]
+  })]))
+  assert.strictEqual(parsed[0].volumes[0].mountpoint, hostileMount)
+  assert.strictEqual(api.shellQuote(parsed[0].volumes[0].mountpoint), `'/run/media/user/Jane'\\''s\nBackup'`)
+})
+
 test("keeps paths byte-exact, since commands are built from them", () => {
   // Sanitising is for display only. A mount point containing an angle bracket
   // is legal on Linux, and mangling it would unmount or open the wrong thing.

@@ -1,8 +1,8 @@
-# Advanced Storage & Drives (`drives`)
+# Storage Drives (`storage-drives`)
 
 USB sticks, SD cards, phones, external HDDs/SSDs, and internal system storage in the Omarchy bar: mount, open, inspect, format, auto-repair NTFS dirty bits, and safely eject without leaving the desktop.
 
-## Advanced Features in Drives
+## Advanced Features in Storage Drives
 
 - **Whole-Disk & Partition Formatter**: Format an entire physical drive (e.g. `/dev/sda`) or single partitions directly from the UI. Automatically cleans old signatures (`wipefs`), re-creates a clean GPT partition table via `parted`, provisions filesystems (`exfat`, `ntfs`, `ext4`, `btrfs`, `vfat`), fixes ownership/permissions, and mounts via `udisksctl`. Features built-in safeguards to strictly block system NVMe/root drives from accidental destruction.
 - **NTFS Dirty-Bit Auto-Fix**: Automatically detects NTFS volumes unmountable due to Windows hibernation or dirty flags. One click runs targeted repair via `omarchy-ntfs-fix` in a presentation terminal and re-mounts the drive.
@@ -228,24 +228,24 @@ an archive drive came up writable.
 ## Scripting
 
 ```bash
-omarchy-shell drives toggle
-omarchy-shell drives refresh                       # re-read what is attached
-omarchy-shell drives list                          # drives, as JSON
-omarchy-shell drives phones                        # phones, as JSON
-omarchy-shell drives network                       # network & cloud mounts, as JSON
-omarchy-shell drives status                        # {"busy":false,…}
-omarchy-shell drives eject /dev/sdb                # or ejectAll
-omarchy-shell drives rename /dev/sdb "Work backup" # "" clears it
-omarchy-shell drives label /dev/sdb1 "Photos"      # the label on the drive
-omarchy-shell drives check /dev/sdb1               # verdict lands in status
-omarchy-shell drives smart /dev/sdb                # health, as JSON
-omarchy-shell drives mountReadOnly /dev/sdb1       # rescue without writing
-omarchy-shell drives lock /dev/mapper/luks-…       # close an open container
-omarchy-shell drives format /dev/sdb1 exfat Photos # erases the volume
-omarchy-shell drives expandDevice /dev/sdb         # expand drive settings
-omarchy-shell drives expandVolume /dev/sdb1        # expand volume drawer
-omarchy-shell drives toggleTelemetry /dev/sdb      # toggle telemetry row
-omarchy-shell drives setTab network                # switch to "local" or "network"
+omarchy-shell storage-drives toggle
+omarchy-shell storage-drives refresh                       # re-read what is attached
+omarchy-shell storage-drives list                          # drives, as JSON
+omarchy-shell storage-drives phones                        # phones, as JSON
+omarchy-shell storage-drives network                       # network & cloud mounts, as JSON
+omarchy-shell storage-drives status                        # {"busy":false,…}
+omarchy-shell storage-drives eject /dev/sdb                # or ejectAll
+omarchy-shell storage-drives rename /dev/sdb "Work backup" # "" clears it
+omarchy-shell storage-drives label /dev/sdb1 "Photos"      # the label on the drive
+omarchy-shell storage-drives check /dev/sdb1               # verdict lands in status
+omarchy-shell storage-drives smart /dev/sdb                # health, as JSON
+omarchy-shell storage-drives mountReadOnly /dev/sdb1       # rescue without writing
+omarchy-shell storage-drives lock /dev/mapper/luks-…       # close an open container
+omarchy-shell storage-drives format /dev/sdb1 exfat Photos # erases the volume
+omarchy-shell storage-drives expandDevice /dev/sdb         # expand drive settings
+omarchy-shell storage-drives expandVolume /dev/sdb1        # expand volume drawer
+omarchy-shell storage-drives toggleTelemetry /dev/sdb      # toggle telemetry row
+omarchy-shell storage-drives setTab network                # switch to "local" or "network"
 ```
 
 `format` destroys what is on the volume. It takes the same refusals the panel

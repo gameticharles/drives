@@ -928,7 +928,7 @@ Item {
     var name = progressName(device)
     if (name === "") return
     markHookStarted(name)
-    Quickshell.execDetached(["bash", "-c", hookScript, "removable-drives",
+    Quickshell.execDetached(["bash", "-c", hookScript, "storage-drives",
                              progressDir, name, device.path, mountpointOf(device), command])
   }
 
@@ -1524,7 +1524,7 @@ Item {
       smart = ({})
       return
     }
-    var command = ["bash", "-c", smartScript, "drives"]
+    var command = ["bash", "-c", smartScript, "storage-drives"]
     for (var p = 0; p < paths.length; p++) command.push(paths[p])
     smartProcess.command = command
     smartProcess.running = true
@@ -1623,7 +1623,7 @@ Item {
 
   function copyPath(volume) {
     if (!volume || !volume.mounted) return
-    Quickshell.execDetached(["bash", "-c", 'printf %s "$1" | wl-copy', "removable-drives", volume.mountpoint])
+    Quickshell.execDetached(["bash", "-c", 'printf %s "$1" | wl-copy', "storage-drives", volume.mountpoint])
     actionStatus = "Copied " + volume.mountpoint
   }
 

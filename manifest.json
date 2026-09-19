@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "drives",
-  "name": "Drives",
+  "id": "storage-drives",
+  "name": "Storage Drives",
   "version": "2.1.0",
   "author": "Charles Gameti",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Drives",
+    "displayName": "Storage Drives",
     "description": "View all drives and storage on the machine, monitor stats, format, auto-repair NTFS, and safely eject removable media.",
     "category": "Files",
     "allowMultiple": false,

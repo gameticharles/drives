@@ -43,8 +43,11 @@ attempt "a panel binding to a service property that does not exist" \
 attempt "a device path concatenated into a command instead of quoted" \
   "sed -i 's|\"udisksctl power-off --no-user-interaction -b \" + quote(device.path)|\"udisksctl power-off --no-user-interaction -b \" + device.path|' Service.qml"
 
+attempt "a panel command using literal single quotes instead of Model.shellQuote" \
+  "node -e 'const f=\"Panel.qml\",s=require(\"fs\");s.writeFileSync(f,s.readFileSync(f,\"utf8\").replace(\"Model.shellQuote(mountpoint || \\\"/tmp\\\")\",\"\\\"\\x27\\\" + mountpoint + \\\"\\x27\\\"\"))'"
+
 attempt "a scripting verb the README promises but nothing handles" \
-  "sed -i 's|omarchy-shell drives toggle|omarchy-shell drives defragment|' README.md"
+  "sed -i 's|omarchy-shell storage-drives toggle|omarchy-shell storage-drives defragment|' README.md"
 
 attempt "a scripting verb that works but is undocumented" \
   "sed -i 's|function phones(): string|function undocumentedVerb(): string { return \"\" }\n    function phones(): string|' Panel.qml"

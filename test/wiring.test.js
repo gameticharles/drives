@@ -193,6 +193,13 @@ check("no device path reaches a shell command unquoted", () => {
       problems.push(`Service.qml:${index + 1}: ${match[0]} reaches a command without quote()`)
     }
   })
+  panelSource.split("\n").forEach((line, index) => {
+    const code = stripComment(line)
+    if (!code.includes("omarchy-")) return
+    if (code.includes("'\" +") || code.includes("+ \"'") || code.includes("+'\"") || code.includes("\"'+")) {
+      problems.push(`Panel.qml:${index + 1}: command argument uses literal single quotes instead of Model.shellQuote()`)
+    }
+  })
   return problems
 })
 
@@ -202,7 +209,7 @@ const IPC_INTERNAL = new Set(["open", "close", "show", "hide", "toggle"])
 
 check("every scripting verb the README documents is handled", () => {
   const handled = new Set(ipcVerbs())
-  return [...readme.matchAll(/omarchy-shell (?:removable-drives|drives) ([A-Za-z]\w*)/g)]
+  return [...readme.matchAll(/omarchy-shell (?:removable-drives|drives|storage-drives) ([A-Za-z]\w*)/g)]
     .map(m => m[1])
     .filter(verb => !handled.has(verb))
     .map(verb => `README documents "${verb}", which the IpcHandler does not define`)

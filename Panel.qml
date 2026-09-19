@@ -16,8 +16,8 @@ import "Model.js" as Model
 Panel {
   id: root
 
-  moduleName: "drives"
-  ipcTarget: "drives"
+  moduleName: "storage-drives"
+  ipcTarget: "storage-drives"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -64,7 +64,7 @@ Panel {
   }
 
   function runNtfsFix(path) {
-    var cmd = path && path !== "" ? "omarchy-ntfs-fix " + path : "omarchy-ntfs-fix"
+    var cmd = path && path !== "" ? "omarchy-ntfs-fix " + Model.shellQuote(path) : "omarchy-ntfs-fix"
     if (root.bar) {
       root.bar.run("omarchy-launch-floating-terminal-with-presentation " + cmd)
     } else {
@@ -74,7 +74,7 @@ Panel {
 
   function launchFormat(devicePath) {
     if (!devicePath || devicePath === "") return
-    var cmd = "omarchy-drive-format '" + devicePath + "'"
+    var cmd = "omarchy-drive-format " + Model.shellQuote(devicePath)
     if (root.bar) {
       root.bar.run("omarchy-launch-floating-terminal-with-presentation " + cmd)
     } else {
@@ -83,7 +83,7 @@ Panel {
   }
 
   function runSpeedTest(mountpoint) {
-    var cmd = "omarchy-disk-speedtest '" + (mountpoint || "/tmp") + "'"
+    var cmd = "omarchy-disk-speedtest " + Model.shellQuote(mountpoint || "/tmp")
     if (root.bar) {
       root.bar.run("omarchy-launch-floating-terminal-with-presentation " + cmd)
     } else {
@@ -92,7 +92,7 @@ Panel {
   }
 
   function runBtrfsScrub(mountpoint) {
-    var cmd = "omarchy-drive-scrub '" + (mountpoint || "/") + "'"
+    var cmd = "omarchy-drive-scrub " + Model.shellQuote(mountpoint || "/")
     if (root.bar) {
       root.bar.run("omarchy-launch-floating-terminal-with-presentation " + cmd)
     } else {
@@ -101,7 +101,7 @@ Panel {
   }
 
   function runTrim(mountpoint) {
-    var cmd = "omarchy-drive-trim '" + (mountpoint || "/") + "'"
+    var cmd = "omarchy-drive-trim " + Model.shellQuote(mountpoint || "/")
     if (root.bar) {
       root.bar.run("omarchy-launch-floating-terminal-with-presentation " + cmd)
     } else {
@@ -110,7 +110,7 @@ Panel {
   }
 
   function runFlash(devicePath) {
-    var cmd = "omarchy-drive-flash '" + (devicePath || "") + "'"
+    var cmd = "omarchy-drive-flash " + Model.shellQuote(devicePath || "")
     if (root.bar) {
       root.bar.run("omarchy-launch-floating-terminal-with-presentation " + cmd)
     } else {
@@ -119,7 +119,7 @@ Panel {
   }
 
   function runRecovery(targetPath) {
-    var cmd = "omarchy-drive-recover '" + (targetPath || "") + "'"
+    var cmd = "omarchy-drive-recover " + Model.shellQuote(targetPath || "")
     if (root.bar) {
       root.bar.run("omarchy-launch-floating-terminal-with-presentation " + cmd)
     } else {
@@ -685,7 +685,7 @@ Panel {
           PanelHero {
             id: hero
             width: parent.width
-            title: root.activeTab === "network" ? "Network Storage" : "Drives"
+            title: root.activeTab === "network" ? "Network Storage" : "Storage Drives"
             meta: root.activeTab === "network"
               ? (drives.networkCount === 0 ? "No active network mounts" : drives.networkCount + " mounted network / cloud " + (drives.networkCount === 1 ? "share" : "shares"))
               : (drives.anyBusy
