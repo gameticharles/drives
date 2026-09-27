@@ -52,6 +52,16 @@ var GLYPH_SPEEDOMETER = codepoint(0xF04C5) // md-speedometer
 var GLYPH_SHIELD = codepoint(0xF0498)     // md-shield
 var GLYPH_SERVER = codepoint(0xF048B)      // md-server
 var GLYPH_CLOUD = codepoint(0xF015F)       // md-cloud
+var GLYPH_CLOUD_SYNC = codepoint(0xF063F)     // md-cloud_sync
+var GLYPH_CLOUD_CHECK = codepoint(0xF0160)    // md-cloud_check
+var GLYPH_CLOUD_ALERT = codepoint(0xF015E)    // md-cloud_alert
+var GLYPH_GOOGLE_DRIVE = codepoint(0xF02B6)   // md-google_drive
+var GLYPH_ONEDRIVE = codepoint(0xF03CA)       // md-microsoft_onedrive
+var GLYPH_DROPBOX = codepoint(0xF01E3)        // md-dropbox
+var GLYPH_MEGA = codepoint(0xF0C10)           // md-alpha_m_circle
+var GLYPH_FOLDER_SYNC = codepoint(0xF0CE6)    // md-folder_sync
+var GLYPH_PLUS = codepoint(0xF0415)           // md-plus
+var GLYPH_ARROW_LEFT = codepoint(0xF004D)     // md-arrow_left
 var GLYPH_NETWORK = codepoint(0xF0318)     // md-lan
 var GLYPH_THERMOMETER = codepoint(0xF050F) // md-thermometer
 
@@ -2150,4 +2160,314 @@ function parseNetworkMounts(rawInput) {
   return out
 }
 
+// ------------------------------------------------------------ cloud storage & rclone
 
+var CLOUD_PROVIDERS = [
+  {
+    id: "drive",
+    type: "drive",
+    label: "Google Drive",
+    glyph: GLYPH_GOOGLE_DRIVE,
+    defaultFolder: "~/Google Drive",
+    defaultMount: "~/GDrive-Browse",
+    description: "Two-way selective sync with Google Drive."
+  },
+  {
+    id: "mega",
+    type: "mega",
+    label: "Mega",
+    glyph: GLYPH_MEGA,
+    defaultFolder: "~/Mega",
+    defaultMount: "~/Mega-Browse",
+    description: "High-capacity encrypted cloud storage."
+  },
+  {
+    id: "onedrive",
+    type: "onedrive",
+    label: "Microsoft OneDrive",
+    glyph: GLYPH_ONEDRIVE,
+    defaultFolder: "~/OneDrive",
+    defaultMount: "~/OneDrive-Browse",
+    description: "Personal and Microsoft 365 / SharePoint storage."
+  },
+  {
+    id: "dropbox",
+    type: "dropbox",
+    label: "Dropbox",
+    glyph: GLYPH_DROPBOX,
+    defaultFolder: "~/Dropbox",
+    defaultMount: "~/Dropbox-Browse",
+    description: "Dropbox cloud folder sync."
+  },
+  {
+    id: "webdav",
+    type: "webdav",
+    label: "Nextcloud / WebDAV",
+    glyph: GLYPH_SERVER,
+    defaultFolder: "~/Nextcloud",
+    defaultMount: "~/Nextcloud-Browse",
+    description: "Nextcloud, ownCloud, and generic WebDAV servers."
+  },
+  {
+    id: "other",
+    type: "other",
+    label: "Other rclone Remote",
+    glyph: GLYPH_CLOUD,
+    defaultFolder: "~/Cloud",
+    defaultMount: "~/Cloud-Browse",
+    description: "Connect any other remote configured in rclone."
+  }
+]
+
+function cloudProvider(type) {
+  var t = String(type || "").toLowerCase().trim()
+  for (var i = 0; i < CLOUD_PROVIDERS.length; i++) {
+    if (CLOUD_PROVIDERS[i].type === t || CLOUD_PROVIDERS[i].id === t) return CLOUD_PROVIDERS[i]
+  }
+  return CLOUD_PROVIDERS[CLOUD_PROVIDERS.length - 1]
+}
+
+function cloudProviderLabel(type) {
+  return cloudProvider(type).label
+}
+
+function cloudProviderGlyph(type) {
+  return cloudProvider(type).glyph
+}
+
+function cloudProviderOptions() {
+  var options = []
+  for (var i = 0; i < CLOUD_PROVIDERS.length; i++) {
+    var p = CLOUD_PROVIDERS[i]
+    options.push({
+      value: p.type,
+      label: p.glyph + "   " + p.label
+    })
+  }
+  return options
+}
+
+function defaultCloudStore() {
+  return { version: 1, accounts: [] }
+}
+
+function parseCloudStore(raw) {
+  var text = String(raw || "").trim()
+  if (text === "") return defaultCloudStore()
+  try {
+    var parsed = JSON.parse(text)
+    if (!parsed || typeof parsed !== "object") return defaultCloudStore()
+    if (!Array.isArray(parsed.accounts)) parsed.accounts = []
+    return parsed
+  } catch (e) {
+    return defaultCloudStore()
+  }
+}
+
+function withCloudAccount(store, account) {
+  var base = store && Array.isArray(store.accounts) ? store.accounts.slice() : []
+  if (!account || !account.remoteName) return store || defaultCloudStore()
+  var remote = String(account.remoteName).trim()
+  var found = false
+  for (var i = 0; i < base.length; i++) {
+    if (base[i].remoteName === remote) {
+      base[i] = Object.assign({}, base[i], account)
+      found = true
+      break
+    }
+  }
+  if (!found) base.push(account)
+  return { version: 1, accounts: base }
+}
+
+function withoutCloudAccount(store, remoteName) {
+  var base = store && Array.isArray(store.accounts) ? store.accounts.slice() : []
+  var remote = String(remoteName || "").trim()
+  var filtered = base.filter(function(a) { return a.remoteName !== remote })
+  return { version: 1, accounts: filtered }
+}
+
+function defaultCloudStatus(remoteName) {
+  return {
+    ok: true,
+    installed: false,
+    authenticated: false,
+    remoteType: "",
+    accountEmail: "",
+    accountName: "",
+    syncing: false,
+    statusText: "Checking…",
+    folderPath: "",
+    mountPath: "",
+    remoteName: String(remoteName || ""),
+    selectedCount: 0,
+    rootFiles: true,
+    localBytes: 0,
+    localBytesApprox: false,
+    usedBytes: 0,
+    quotaBytes: 0,
+    usagePercent: 0,
+    quotaKnown: false,
+    browseMounted: false,
+    browseStale: false,
+    browseEnabled: false,
+    timerEnabled: false,
+    unitsInstalled: false,
+    lastResult: "",
+    lastFinishedTs: 0,
+    lastDurationSec: 0,
+    baseline: false,
+    warning: "",
+    lastError: ""
+  }
+}
+
+function parseCloudStatus(raw, remoteName) {
+  var text = String(raw || "").trim()
+  if (text === "") return defaultCloudStatus(remoteName)
+  try {
+    var parsed = JSON.parse(text)
+    if (!parsed || typeof parsed !== "object") return defaultCloudStatus(remoteName)
+    parsed.accountEmail = String(parsed.accountEmail || "")
+    parsed.accountName = String(parsed.accountName || "")
+    return parsed
+  } catch (e) {
+    var d = defaultCloudStatus(remoteName)
+    d.ok = false
+    d.lastError = "Failed to parse cloud status"
+    return d
+  }
+}
+
+function cloudAuthCommand(remoteName, providerType) {
+  var name = String(remoteName || "").trim()
+  var p = String(providerType || "").trim().toLowerCase()
+  if (name === "") return "rclone config"
+  var quoted = shellQuote(name)
+  if (p === "drive") {
+    return "rclone config create " + quoted + " drive scope=drive config_is_local=true config_shared_client_id=true"
+  }
+  if (p === "onedrive") {
+    return "rclone config create " + quoted + " onedrive config_is_local=true"
+  }
+  if (p === "dropbox") {
+    return "rclone config create " + quoted + " dropbox config_is_local=true"
+  }
+  if (p === "mega") {
+    return "rclone config create " + quoted + " mega"
+  }
+  if (p === "webdav") {
+    return "rclone config create " + quoted + " webdav"
+  }
+  return "rclone config"
+}
+
+function parseCloudFolders(raw) {
+  var text = String(raw || "").trim()
+  var fallback = { ok: false, folders: [], rootFiles: true, rootFileCount: 0, rootFileBytes: 0, staleBytes: 0, staleCount: 0, lastError: "" }
+  if (text === "") return fallback
+  try {
+    var parsed = JSON.parse(text)
+    if (!parsed || typeof parsed !== "object") return fallback
+    if (!Array.isArray(parsed.folders)) parsed.folders = []
+    parsed.staleBytes = Number(parsed.staleBytes || 0)
+    parsed.staleCount = Number(parsed.staleCount || 0)
+    parsed.rootFileCount = Number(parsed.rootFileCount || 0)
+    parsed.rootFileBytes = Number(parsed.rootFileBytes || 0)
+    return parsed
+  } catch (e) {
+    fallback.lastError = "Failed to parse cloud folder list"
+    return fallback
+  }
+}
+
+function parseCloudRemotes(raw) {
+  var text = String(raw || "").trim()
+  if (text === "") return []
+  try {
+    var parsed = JSON.parse(text)
+    if (parsed && Array.isArray(parsed.remotes)) return parsed.remotes
+    return []
+  } catch (e) {
+    return []
+  }
+}
+
+function parseCloudCheck(raw) {
+  var text = String(raw || "").trim()
+  if (text === "") return { ok: false, installed: false, version: "", fuse3: false }
+  try {
+    var parsed = JSON.parse(text)
+    return parsed && typeof parsed === "object" ? parsed : { ok: false, installed: false, version: "", fuse3: false }
+  } catch (e) {
+    return { ok: false, installed: false, version: "", fuse3: false }
+  }
+}
+
+function formatCloudBytes(bytes) {
+  var b = Number(bytes || 0)
+  if (!isFinite(b) || b <= 0) return "0 B"
+  var formatted = formatBytes(b)
+  return formatted !== "" ? formatted : "0 B"
+}
+
+function relativeTime(timestampSec, nowMs) {
+  var ts = Number(timestampSec || 0)
+  if (!isFinite(ts) || ts <= 0) return "Never"
+  var now = nowMs === undefined ? Date.now() : Number(nowMs)
+  var diff = Math.max(0, Math.floor((now - ts * 1000) / 1000))
+  if (diff < 45) return "Just now"
+  var minutes = Math.floor(diff / 60)
+  if (minutes < 60) return Math.max(1, minutes) + "m ago"
+  var hours = Math.floor(minutes / 60)
+  if (hours < 24) return hours + "h ago"
+  var days = Math.floor(hours / 24)
+  if (days < 30) return days + "d ago"
+  var months = Math.floor(days / 30)
+  if (months < 12) return months + "mo ago"
+  return Math.floor(days / 365) + "y ago"
+}
+
+function cloudUsageText(usedBytes, quotaBytes, quotaKnown) {
+  var used = Number(usedBytes || 0)
+  var quota = Number(quotaBytes || 0)
+  if (quotaKnown && quota > 0)
+    return formatCloudBytes(used) + " of " + formatCloudBytes(quota)
+  return formatCloudBytes(used)
+}
+
+function cloudSummary(status) {
+  if (!status) return ""
+  var count = Number(status.selectedCount || 0)
+  var parts = []
+  parts.push(count === 0 ? "No folders" : (count === 1 ? "1 folder" : count + " folders"))
+  if (status.rootFiles) parts.push("root files")
+  parts.push((status.localBytesApprox ? "≈ " : "") + formatCloudBytes(status.localBytes) + " on disk")
+  return parts.join(" · ")
+}
+
+function cloudFolderMeta(folder) {
+  if (!folder) return ""
+  var bytes = (folder.approx ? "≈ " : "") + formatCloudBytes(folder.localBytes)
+  if (folder.stale) return "No longer syncing · " + bytes
+  if (folder.selected) return folder.onDisk ? bytes + " on disk" : "Waiting for first sync"
+  return "Not synced"
+}
+
+function cloudFolderGlyph(folder) {
+  return folder && folder.selected ? GLYPH_FOLDER_SYNC : GLYPH_FOLDER
+}
+
+function cloudRootFilesMeta(count, bytes) {
+  var n = Number(count || 0)
+  if (n <= 0) return "Files that sit in no folder"
+  return n + (n === 1 ? " file" : " files") + " · " + formatCloudBytes(bytes)
+}
+
+function shortHomePath(path, home) {
+  var value = String(path || "")
+  var prefix = String(home || "")
+  if (prefix !== "" && value === prefix) return "~"
+  if (prefix !== "" && value.indexOf(prefix + "/") === 0) return "~" + value.substring(prefix.length)
+  return value
+}

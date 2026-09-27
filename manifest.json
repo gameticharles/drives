@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "storage-drives",
   "name": "Storage Drives",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": "Charles Gameti",
   "license": "MIT",
-  "description": "View and manage all storage drives on the machine, monitor stats, format, auto-repair NTFS, and eject removable media safely.",
+  "description": "View and manage all storage drives on the machine, monitor stats, format, auto-repair NTFS, multi-cloud sync (Google Drive, Mega, OneDrive), and eject removable media safely.",
   "kinds": [
     "bar-widget"
   ],

@@ -38,6 +38,71 @@ Panel {
   property string filterQuery: ""
   property string activeTab: "local"
 
+  // Cloud & rclone state
+  property bool cloudAddOpen: false
+  property string cloudAddProvider: "drive"
+  property string cloudAddRemoteName: "gdrive"
+  property string cloudAddFolder: "~/Google Drive"
+  property string cloudAddMount: "~/Google Drive (Cloud)"
+  property int cloudAddInterval: 10
+  property bool cloudConfigDrawerOpen: false
+
+  function nextAvailableRemote(baseName) {
+    if (!drives.hasCloudAccount(baseName)) return baseName
+    for (var i = 2; i <= 20; i++) {
+      var candidate = baseName + i
+      if (!drives.hasCloudAccount(candidate)) return candidate
+    }
+    return baseName + "-new"
+  }
+
+  function nextAvailableFolder(baseFolder) {
+    for (var i = 0; i < drives.cloudAccounts.length; i++) {
+      if (drives.cloudAccounts[i].folderPath === baseFolder) {
+        return baseFolder + " 2"
+      }
+    }
+    return baseFolder
+  }
+
+  function nextAvailableMount(baseMount) {
+    for (var i = 0; i < drives.cloudAccounts.length; i++) {
+      if (drives.cloudAccounts[i].browseMountPath === baseMount) {
+        return baseMount + " 2"
+      }
+    }
+    return baseMount
+  }
+
+  function selectCloudAddProvider(type) {
+    cloudAddProvider = type
+    if (type === "drive") {
+      cloudAddRemoteName = nextAvailableRemote("gdrive")
+      cloudAddFolder = nextAvailableFolder("~/Google Drive")
+      cloudAddMount = nextAvailableMount("~/Google Drive (Cloud)")
+    } else if (type === "mega") {
+      cloudAddRemoteName = nextAvailableRemote("mega")
+      cloudAddFolder = nextAvailableFolder("~/Mega")
+      cloudAddMount = nextAvailableMount("~/Mega (Cloud)")
+    } else if (type === "onedrive") {
+      cloudAddRemoteName = nextAvailableRemote("onedrive")
+      cloudAddFolder = nextAvailableFolder("~/OneDrive")
+      cloudAddMount = nextAvailableMount("~/OneDrive (Cloud)")
+    } else if (type === "dropbox") {
+      cloudAddRemoteName = nextAvailableRemote("dropbox")
+      cloudAddFolder = nextAvailableFolder("~/Dropbox")
+      cloudAddMount = nextAvailableMount("~/Dropbox (Cloud)")
+    } else if (type === "webdav") {
+      cloudAddRemoteName = nextAvailableRemote("nextcloud")
+      cloudAddFolder = nextAvailableFolder("~/Nextcloud")
+      cloudAddMount = nextAvailableMount("~/Nextcloud (Cloud)")
+    } else {
+      cloudAddRemoteName = nextAvailableRemote("cloud")
+      cloudAddFolder = nextAvailableFolder("~/Cloud")
+      cloudAddMount = nextAvailableMount("~/Cloud (Browse)")
+    }
+  }
+
   function isTelemetryExpanded(path) {
     if (!path) return false
     return !!expandedTelemetry[path]
@@ -510,6 +575,7 @@ Panel {
 
     function phones(): string { return JSON.stringify(drives.portables) }
     function network(): string { return JSON.stringify(drives.networkShares) }
+    function cloud(): string { return JSON.stringify(drives.cloudAccounts) }
 
     function smart(path: string): string {
       for (var i = 0; i < drives.devices.length; i++) {
@@ -621,6 +687,7 @@ Panel {
       anchors.fill: parent
       blocked: root.renamingKey !== "" || root.renamingLabelPath !== ""
         || root.unlockingPath !== "" || root.formattingPath !== ""
+        || root.cloudAddOpen
 
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) {
@@ -903,7 +970,7 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: "Network & Cloud (" + drives.networkCount + ")"
+                    text: "Network & Cloud (" + (drives.networkCount + drives.cloudAccountCount) + ")"
                     color: root.activeTab === "network" ? root.foreground : root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -1214,73 +1281,1515 @@ Panel {
           }
 
           // ------------------------------------------------------------ Network & Cloud Storage
-          // Network Empty State
+
+          // rclone Missing Warning Banner
+          Rectangle {
+            visible: root.activeTab === "network" && !drives.rcloneInstalled
+            width: parent.width
+            radius: Style.space(8)
+            color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.08)
+            border.width: 1
+            border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.3)
+            implicitHeight: rcloneWarnCol.implicitHeight + Style.space(20)
+
+            ColumnLayout {
+              id: rcloneWarnCol
+              anchors.fill: parent
+              anchors.margins: Style.space(10)
+              spacing: Style.space(6)
+
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(8)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: Model.GLYPH_ALERT
+                  color: root.urgent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.icon
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  Layout.fillWidth: true
+                  text: "rclone is required for cloud drives"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: "rclone is not installed. It is required to connect, sync, and mount Google Drive, Mega, OneDrive, and other cloud storage accounts."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(8)
+
+                ActionChip {
+                  label: "Install rclone (Official)"
+                  iconText: Model.GLYPH_MOUNT
+                  tooltipText: "Install rclone and fuse3 via Omarchy package manager"
+                  danger: true
+                  onClicked: drives.installRclone()
+                }
+
+                ActionChip {
+                  label: "Terminal Setup"
+                  iconText: Model.GLYPH_TERMINAL
+                  tooltipText: "Open terminal to configure rclone"
+                  onClicked: drives.launchRcloneTerminal("rclone config")
+                }
+              }
+            }
+          }
+
+          // ====================================================================
+          // CASE A: Cloud Drive Detail View (when an account is selected)
+          // ====================================================================
           Column {
-            visible: root.activeTab === "network" && drives.networkCount === 0
+            visible: root.activeTab === "network" && drives.selectedCloudRemote !== ""
             width: parent.width
-            spacing: Style.space(6)
-            topPadding: Style.space(24)
-            bottomPadding: Style.space(24)
+            spacing: Style.space(12)
 
-            Text {
-              textFormat: Text.PlainText
+            // Top navigation row
+            RowLayout {
               width: parent.width
-              text: Model.GLYPH_SERVER
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.display
-              horizontalAlignment: Text.AlignHCenter
+              spacing: Style.space(8)
+
+              ActionChip {
+                label: "Back"
+                iconText: Model.GLYPH_ARROW_LEFT
+                tooltipText: "Return to cloud accounts list"
+                onClicked: {
+                  drives.selectedCloudRemote = ""
+                  root.cloudConfigDrawerOpen = false
+                }
+              }
+
+              Item { Layout.fillWidth: true }
+
+              ActionChip {
+                label: drives.cloudFoldersLoading ? "Reading…" : "Refresh"
+                iconText: Model.GLYPH_REFRESH
+                tooltipText: "Reload cloud folders and sync status"
+                onClicked: {
+                  drives.refreshCloudStatus(drives.selectedCloudRemote)
+                  drives.refreshCloudFolders(drives.selectedCloudRemote)
+                }
+              }
             }
 
-            Text {
-              textFormat: Text.PlainText
+            // Cloud Drive Hero & Controls Box
+            Rectangle {
               width: parent.width
-              text: "No network or cloud shares mounted"
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
-              horizontalAlignment: Text.AlignHCenter
+              radius: Style.space(10)
+              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.04)
+              border.width: 1
+              border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.1)
+              implicitHeight: cloudHeroLayout.implicitHeight + Style.space(20)
+
+              ColumnLayout {
+                id: cloudHeroLayout
+                anchors.fill: parent
+                anchors.margins: Style.space(12)
+                spacing: Style.space(10)
+
+                RowLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(10)
+
+                  // Icon
+                  Rectangle {
+                    implicitWidth: Style.space(38)
+                    implicitHeight: Style.space(38)
+                    radius: Style.space(8)
+                    color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+                    border.width: 1
+                    border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+                    Layout.alignment: Qt.AlignVCenter
+
+                    GoogleDriveIcon {
+                      visible: !!(drives.selectedCloudAccount && drives.selectedCloudAccount.type === "drive")
+                      anchors.centerIn: parent
+                      iconSize: Style.font.iconLarge || Style.space(22)
+                      color: root.foreground
+                    }
+
+                    Text {
+                      visible: !(drives.selectedCloudAccount && drives.selectedCloudAccount.type === "drive")
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: drives.selectedCloudAccount ? Model.cloudProviderGlyph(drives.selectedCloudAccount.type) : Model.GLYPH_CLOUD
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.iconLarge || Style.space(20)
+                    }
+                  }
+
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(2)
+
+                    // Row 1: Remote Name + Provider Tag + Status Tag
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: drives.selectedCloudRemote
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodyLarge || Style.space(15)
+                        font.bold: true
+                        elide: Text.ElideRight
+                      }
+
+                      Rectangle {
+                        implicitWidth: provTag.implicitWidth + Style.space(10)
+                        implicitHeight: provTag.implicitHeight + Style.space(4)
+                        radius: Style.space(3)
+                        color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                        border.width: 1
+                        border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+                        Layout.alignment: Qt.AlignVCenter
+
+                        Text {
+                          id: provTag
+                          anchors.centerIn: parent
+                          textFormat: Text.PlainText
+                          text: drives.selectedCloudAccount ? Model.cloudProviderLabel(drives.selectedCloudAccount.type).toUpperCase() : "CLOUD"
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.captionSmall || Style.space(9)
+                          font.bold: true
+                        }
+                      }
+
+                      Rectangle {
+                        visible: drives.selectedCloudStatus.statusText !== ""
+                        implicitWidth: detailStTag.implicitWidth + Style.space(10)
+                        implicitHeight: detailStTag.implicitHeight + Style.space(4)
+                        radius: Style.space(3)
+                        color: drives.selectedCloudStatus.lastResult === "error"
+                          ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.15)
+                          : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                        border.width: 1
+                        border.color: drives.selectedCloudStatus.lastResult === "error"
+                          ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.3)
+                          : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+                        Layout.alignment: Qt.AlignVCenter
+
+                        Text {
+                          id: detailStTag
+                          anchors.centerIn: parent
+                          textFormat: Text.PlainText
+                          text: drives.selectedCloudStatus.statusText
+                          color: drives.selectedCloudStatus.lastResult === "error" ? root.urgent : root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.captionSmall || Style.space(9)
+                        }
+                      }
+                    }
+
+                    // Row 2: Account Identity
+                    Text {
+                      textFormat: Text.PlainText
+                      Layout.fillWidth: true
+                      text: drives.selectedCloudStatus.accountEmail !== ""
+                        ? (drives.selectedCloudStatus.accountName !== "" ? drives.selectedCloudStatus.accountEmail + " (" + drives.selectedCloudStatus.accountName + ")" : drives.selectedCloudStatus.accountEmail)
+                        : (drives.selectedCloudStatus.authenticated ? Model.shortHomePath(drives.selectedCloudStatus.folderPath, drives.homePath) : "Not configured in rclone")
+                      color: drives.selectedCloudStatus.accountEmail !== "" ? root.foreground : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: drives.selectedCloudStatus.accountEmail !== ""
+                      elide: Text.ElideRight
+                    }
+
+                    // Row 3: Folders & Storage summary
+                    Text {
+                      textFormat: Text.PlainText
+                      Layout.fillWidth: true
+                      text: Model.cloudSummary(drives.selectedCloudStatus)
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
+                  }
+                }
+
+                // Action status or error banner
+                Text {
+                  visible: text !== ""
+                  textFormat: Text.PlainText
+                  Layout.fillWidth: true
+                  text: drives.cloudActionStatus !== "" ? drives.cloudActionStatus
+                    : (drives.selectedCloudStatus.lastError !== "" ? drives.selectedCloudStatus.lastError
+                      : (drives.cloudFoldersError !== "" ? drives.cloudFoldersError : drives.selectedCloudStatus.warning))
+                  color: (drives.selectedCloudStatus.lastError !== "" || drives.cloudFoldersError !== "") && drives.cloudActionStatus === ""
+                    ? root.urgent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+
+                // Notice if not authenticated in rclone
+                Rectangle {
+                  visible: !drives.selectedCloudStatus.authenticated && drives.rcloneInstalled
+                  Layout.fillWidth: true
+                  radius: Style.space(6)
+                  color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.08)
+                  border.width: 1
+                  border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.25)
+                  implicitHeight: unauthCol.implicitHeight + Style.space(16)
+
+                  ColumnLayout {
+                    id: unauthCol
+                    anchors.fill: parent
+                    anchors.margins: Style.space(8)
+                    spacing: Style.space(4)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Remote '" + drives.selectedCloudRemote + "' is not yet configured in rclone"
+                      color: root.urgent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      Layout.fillWidth: true
+                      text: "Authenticate this remote in your browser to start syncing."
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    RowLayout {
+                      spacing: Style.space(6)
+
+                      ActionChip {
+                        label: "Authorize in Browser"
+                        iconText: Model.GLYPH_UNLOCKED
+                        danger: true
+                        tooltipText: "Trigger browser authentication for this remote"
+                        onClicked: drives.authenticateCloudRemote(drives.selectedCloudRemote, drives.selectedCloudAccount ? drives.selectedCloudAccount.type : "drive")
+                      }
+
+                      ActionChip {
+                        label: "Delete Account"
+                        iconText: Model.GLYPH_TRASH
+                        danger: true
+                        tooltipText: "Remove this account from Storage Drives and rclone"
+                        onClicked: drives.removeCloudAccount(drives.selectedCloudRemote, true)
+                      }
+                    }
+                  }
+                }
+
+                // Info Pairs (Disk usage, Cloud storage, Sync folder, Browse mount, Last sync)
+                ColumnLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(4)
+
+                  RowLayout {
+                    visible: drives.selectedCloudStatus.accountEmail !== ""
+                    Layout.fillWidth: true
+                    Text { text: "Account"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                      Layout.maximumWidth: parent.width * 0.62
+                      text: drives.selectedCloudStatus.accountEmail + (drives.selectedCloudStatus.accountName !== "" ? " (" + drives.selectedCloudStatus.accountName + ")" : "")
+                      color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true
+                      elide: Text.ElideMiddle
+                    }
+                  }
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    Text { text: "On disk"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                      text: (drives.selectedCloudStatus.localBytesApprox ? "≈ " : "") + Model.formatCloudBytes(drives.selectedCloudStatus.localBytes)
+                      color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true
+                    }
+                  }
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    Text { text: "In Cloud"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                      text: Model.cloudUsageText(drives.selectedCloudStatus.usedBytes, drives.selectedCloudStatus.quotaBytes, drives.selectedCloudStatus.quotaKnown)
+                      color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true
+                    }
+                  }
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    Text { text: "Synced folder"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                      Layout.maximumWidth: parent.width * 0.62
+                      text: Model.shortHomePath(drives.selectedCloudStatus.folderPath, drives.homePath)
+                      color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption; elide: Text.ElideMiddle
+                    }
+                  }
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    Text { text: "Browse mount"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                      Layout.maximumWidth: parent.width * 0.62
+                      text: Model.shortHomePath(drives.selectedCloudStatus.mountPath, drives.homePath) + (drives.selectedCloudStatus.browseMounted ? " (mounted)" : "")
+                      color: drives.selectedCloudStatus.browseMounted ? root.foreground : root.dim
+                      font.family: root.fontFamily; font.pixelSize: Style.font.caption; elide: Text.ElideMiddle
+                    }
+                  }
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    Text { text: "Last sync"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                      text: drives.selectedCloudStatus.syncing ? "Syncing now" : Model.relativeTime(drives.selectedCloudStatus.lastFinishedTs)
+                      color: drives.selectedCloudStatus.syncing ? root.foreground : root.dim
+                      font.family: root.fontFamily; font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    Text { text: "Auto-sync"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
+                    Item { Layout.fillWidth: true }
+                    Rectangle {
+                      implicitHeight: Style.space(18)
+                      implicitWidth: autoSyncText.implicitWidth + Style.space(12)
+                      radius: Style.space(3)
+                      color: autoSyncMouse.containsMouse
+                        ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+                        : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+                      border.width: 1
+                      border.color: drives.selectedCloudStatus.timerEnabled
+                        ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.2)
+                        : Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.25)
+
+                      MouseArea {
+                        id: autoSyncMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: drives.setCloudAutoSync(drives.selectedCloudRemote, !drives.selectedCloudStatus.timerEnabled, drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 10)
+                      }
+
+                      Text {
+                        id: autoSyncText
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: drives.selectedCloudStatus.timerEnabled
+                          ? "Active (" + (drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 10) + "m)"
+                          : "Paused"
+                        color: drives.selectedCloudStatus.timerEnabled ? root.foreground : root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.captionSmall || Style.space(9)
+                        font.bold: true
+                      }
+                    }
+                  }
+                }
+
+                // Action Buttons Row
+                RowLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(6)
+
+                  ActionChip {
+                    label: drives.selectedCloudStatus.syncing ? "Syncing…" : "Sync now"
+                    iconText: Model.GLYPH_REFRESH
+                    active: drives.selectedCloudStatus.syncing
+                    tooltipText: "Run two-way sync with cloud remote"
+                    Layout.fillWidth: true
+                    onClicked: drives.syncCloudNow(drives.selectedCloudRemote, false)
+                  }
+
+                  ActionChip {
+                    label: "Open"
+                    iconText: Model.GLYPH_FOLDER
+                    tooltipText: "Open synced folder in file manager"
+                    Layout.fillWidth: true
+                    onClicked: drives.openCloudFolder(drives.selectedCloudStatus.folderPath)
+                  }
+
+                  ActionChip {
+                    label: drives.selectedCloudStatus.browseMounted ? "Browsing" : "Browse"
+                    iconText: drives.selectedCloudStatus.browseMounted ? Model.GLYPH_HEALTHY : Model.GLYPH_CLOUD
+                    active: drives.selectedCloudStatus.browseMounted
+                    tooltipText: drives.selectedCloudStatus.browseMounted ? "Unmount read-only browse view" : "Mount full remote read-only without downloading"
+                    Layout.fillWidth: true
+                    onClicked: drives.toggleCloudBrowse(drives.selectedCloudRemote)
+                  }
+
+                  ActionChip {
+                    label: "Config"
+                    iconText: Model.GLYPH_COG
+                    active: root.cloudConfigDrawerOpen
+                    tooltipText: "Configure drive settings or disconnect"
+                    onClicked: root.cloudConfigDrawerOpen = !root.cloudConfigDrawerOpen
+                  }
+                }
+
+                // Inline Config Drawer
+                Rectangle {
+                  visible: root.cloudConfigDrawerOpen
+                  Layout.fillWidth: true
+                  radius: Style.space(6)
+                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.05)
+                  border.width: 1
+                  border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+                  implicitHeight: cfgDrawerCol.implicitHeight + Style.space(16)
+
+                  ColumnLayout {
+                    id: cfgDrawerCol
+                    anchors.fill: parent
+                    anchors.margins: Style.space(8)
+                    spacing: Style.space(6)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Drive Configuration"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
+
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
+                      ActionChip {
+                        label: drives.selectedCloudStatus.timerEnabled ? "Pause Auto-sync" : "Resume Auto-sync"
+                        iconText: drives.selectedCloudStatus.timerEnabled ? Model.GLYPH_HEALTHY : Model.GLYPH_REFRESH
+                        active: drives.selectedCloudStatus.timerEnabled
+                        onClicked: drives.setCloudAutoSync(drives.selectedCloudRemote, !drives.selectedCloudStatus.timerEnabled, drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 10)
+                      }
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Auto-sync interval: " + (drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 10) + " minutes"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
+                      ActionChip {
+                        label: "5 min"
+                        active: drives.selectedCloudAccount && drives.selectedCloudAccount.syncIntervalMin === 5
+                        onClicked: {
+                          if (drives.selectedCloudAccount) {
+                            var updated = Object.assign({}, drives.selectedCloudAccount, { syncIntervalMin: 5 })
+                            drives.addCloudAccount(updated)
+                            if (drives.selectedCloudStatus.timerEnabled) drives.setCloudAutoSync(drives.selectedCloudRemote, true, 5)
+                          }
+                        }
+                      }
+                      ActionChip {
+                        label: "10 min"
+                        active: !drives.selectedCloudAccount || drives.selectedCloudAccount.syncIntervalMin === 10
+                        onClicked: {
+                          if (drives.selectedCloudAccount) {
+                            var updated = Object.assign({}, drives.selectedCloudAccount, { syncIntervalMin: 10 })
+                            drives.addCloudAccount(updated)
+                            if (drives.selectedCloudStatus.timerEnabled) drives.setCloudAutoSync(drives.selectedCloudRemote, true, 10)
+                          }
+                        }
+                      }
+                      ActionChip {
+                        label: "30 min"
+                        active: drives.selectedCloudAccount && drives.selectedCloudAccount.syncIntervalMin === 30
+                        onClicked: {
+                          if (drives.selectedCloudAccount) {
+                            var updated = Object.assign({}, drives.selectedCloudAccount, { syncIntervalMin: 30 })
+                            drives.addCloudAccount(updated)
+                            if (drives.selectedCloudStatus.timerEnabled) drives.setCloudAutoSync(drives.selectedCloudRemote, true, 30)
+                          }
+                        }
+                      }
+                      ActionChip {
+                        label: "60 min"
+                        active: drives.selectedCloudAccount && drives.selectedCloudAccount.syncIntervalMin === 60
+                        onClicked: {
+                          if (drives.selectedCloudAccount) {
+                            var updated = Object.assign({}, drives.selectedCloudAccount, { syncIntervalMin: 60 })
+                            drives.addCloudAccount(updated)
+                            if (drives.selectedCloudStatus.timerEnabled) drives.setCloudAutoSync(drives.selectedCloudRemote, true, 60)
+                          }
+                        }
+                      }
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Account Management"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                      topPadding: Style.space(4)
+                    }
+
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
+                      ActionChip {
+                        Layout.fillWidth: true
+                        label: "Re-authenticate"
+                        iconText: Model.GLYPH_UNLOCKED
+                        tooltipText: "Reconnect or refresh browser authorization token for this remote"
+                        onClicked: drives.authenticateCloudRemote(drives.selectedCloudRemote, drives.selectedCloudAccount ? drives.selectedCloudAccount.type : "drive")
+                      }
+
+                      ActionChip {
+                        Layout.fillWidth: true
+                        label: "Disconnect Drive"
+                        iconText: Model.GLYPH_EJECT
+                        tooltipText: "Remove from Storage Drives (files in cloud and rclone config are kept)"
+                        onClicked: drives.removeCloudAccount(drives.selectedCloudRemote, false)
+                      }
+                    }
+
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
+                      ActionChip {
+                        Layout.fillWidth: true
+                        label: "Delete Account from rclone"
+                        iconText: Model.GLYPH_TRASH
+                        danger: true
+                        tooltipText: "Remove from Storage Drives and delete remote from rclone completely"
+                        onClicked: drives.removeCloudAccount(drives.selectedCloudRemote, true)
+                      }
+                    }
+                  }
+                }
+              }
             }
 
-            Text {
-              textFormat: Text.PlainText
+            // Folders list
+            Column {
+              id: foldersListCol
               width: parent.width
-              text: "NFS, Samba/CIFS, SSHFS, Rclone, and DAVFS endpoints appear here automatically when mounted."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              horizontalAlignment: Text.AlignHCenter
-              wrapMode: Text.WordWrap
+              spacing: Style.space(6)
+
+              Text {
+                textFormat: Text.PlainText
+                text: "FOLDERS TO KEEP ON DISK"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.captionSmall || Style.space(9)
+                font.bold: true
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                visible: drives.cloudFoldersLoading && drives.cloudFolders.length === 0
+                width: parent.width
+                text: "Reading your cloud folders…"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                horizontalAlignment: Text.AlignHCenter
+                topPadding: Style.space(8)
+                bottomPadding: Style.space(8)
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                visible: !drives.cloudFoldersLoading && drives.cloudFolders.length === 0
+                width: parent.width
+                text: "No folders found in this drive"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                horizontalAlignment: Text.AlignHCenter
+                topPadding: Style.space(8)
+                bottomPadding: Style.space(8)
+              }
+
+              // Root files row
+              Rectangle {
+                width: foldersListCol.width
+                radius: Style.space(6)
+                color: rootMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.02)
+                border.width: 1
+                border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                implicitHeight: rootFilesRow.implicitHeight + Style.space(12)
+
+                MouseArea {
+                  id: rootMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: drives.setCloudRootFiles(drives.selectedCloudRemote, !drives.cloudRootFiles)
+                }
+
+                RowLayout {
+                  id: rootFilesRow
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  anchors.topMargin: Style.space(8)
+                  anchors.bottomMargin: Style.space(8)
+                  spacing: Style.space(8)
+
+                  Item {
+                    implicitWidth: Style.space(20)
+                    implicitHeight: Style.space(20)
+                    Layout.alignment: Qt.AlignVCenter
+
+                    Text {
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: drives.cloudRootFiles ? "󰄲" : "󰄱"
+                      color: drives.cloudRootFiles ? root.foreground : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.icon
+                    }
+                  }
+
+                  Item {
+                    implicitWidth: Style.space(20)
+                    implicitHeight: Style.space(20)
+                    Layout.alignment: Qt.AlignVCenter
+
+                    Text {
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: "󰈔"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.icon
+                    }
+                  }
+
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                    spacing: Style.space(1)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      Layout.fillWidth: true
+                      text: "Loose files at top of Drive"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      elide: Text.ElideRight
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      Layout.fillWidth: true
+                      text: Model.cloudRootFilesMeta(drives.cloudRootFileCount, drives.cloudRootFileBytes)
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
+                  }
+                }
+              }
+
+              // Repeater over cloud folders
+              Repeater {
+                model: drives.cloudFolders
+
+                Rectangle {
+                  required property var modelData
+                  required property int index
+
+                  width: foldersListCol.width
+                  radius: Style.space(6)
+                  color: fMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.02)
+                  border.width: 1
+                  border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                  implicitHeight: fRow.implicitHeight + Style.space(12)
+
+                  MouseArea {
+                    id: fMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: drives.toggleCloudFolder(drives.selectedCloudRemote, modelData)
+                  }
+
+                  RowLayout {
+                    id: fRow
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.space(10)
+                    anchors.rightMargin: Style.space(10)
+                    anchors.topMargin: Style.space(8)
+                    anchors.bottomMargin: Style.space(8)
+                    spacing: Style.space(8)
+
+                    Item {
+                      implicitWidth: Style.space(20)
+                      implicitHeight: Style.space(20)
+                      Layout.alignment: Qt.AlignVCenter
+
+                      Text {
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: drives.isCloudFolderSelected(modelData) ? "󰄲" : "󰄱"
+                        color: drives.isCloudFolderSelected(modelData) ? root.foreground : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.icon
+                      }
+                    }
+
+                    Item {
+                      implicitWidth: Style.space(20)
+                      implicitHeight: Style.space(20)
+                      Layout.alignment: Qt.AlignVCenter
+
+                      Text {
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: Model.cloudFolderGlyph(modelData)
+                        color: modelData && modelData.stale ? root.urgent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.icon
+                      }
+                    }
+
+                    ColumnLayout {
+                      Layout.fillWidth: true
+                      Layout.alignment: Qt.AlignVCenter
+                      spacing: Style.space(1)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        text: modelData ? String(modelData.name || "Untitled") : "Untitled"
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        elide: Text.ElideRight
+                      }
+
+                      Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        text: Model.cloudFolderMeta(modelData)
+                        color: modelData && modelData.stale ? root.urgent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Stale cleanup bar
+              Rectangle {
+                visible: drives.cloudStaleBytes > 0 || drives.cloudStaleCount > 0
+                width: parent.width
+                radius: Style.space(6)
+                color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.08)
+                border.width: 1
+                border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.2)
+                implicitHeight: staleLayout.implicitHeight + Style.space(16)
+
+                RowLayout {
+                  id: staleLayout
+                  anchors.fill: parent
+                  anchors.margins: Style.space(8)
+                  spacing: Style.space(8)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: Model.formatCloudBytes(drives.cloudStaleBytes) + " is still on disk for folders you stopped syncing."
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                  }
+
+                  ActionChip {
+                    label: "Clean up"
+                    iconText: Model.GLYPH_TRASH
+                    danger: true
+                    tooltipText: "Verify files still exist in cloud, then remove local copies"
+                    onClicked: drives.cleanupCloudStale(drives.selectedCloudRemote)
+                  }
+                }
+              }
             }
           }
 
-          // Network Filter Empty State
-          Text {
-            textFormat: Text.PlainText
-            visible: root.activeTab === "network" && root.filterQuery !== "" && root.matchingNetworkCount === 0 && drives.networkCount > 0
+          // ====================================================================
+          // CASE B: Main Network & Cloud Overview (when no account is opened in detail)
+          // ====================================================================
+          Column {
+            visible: root.activeTab === "network" && drives.selectedCloudRemote === ""
             width: parent.width
-            text: "No network shares matching \"" + root.filterQuery + "\""
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            horizontalAlignment: Text.AlignHCenter
-            topPadding: Style.space(20)
-            bottomPadding: Style.space(20)
-          }
+            spacing: Style.space(12)
 
-          // Network Share Cards
-          Repeater {
-            model: root.activeTab === "network" ? drives.networkShares : []
+            // Section 1: Cloud Storage (rclone)
+            Column {
+              width: parent.width
+              spacing: Style.space(8)
 
-            NetworkShareCard {
-              required property var modelData
-              required property int index
+              RowLayout {
+                width: parent.width
 
-              width: column.width
-              share: modelData
-              shareIndex: index
-              visible: !!root.networkShareMatchesFilter(modelData, root.filterQuery)
+                Text {
+                  textFormat: Text.PlainText
+                  text: "CLOUD DRIVES (RCLONE)"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.captionSmall || Style.space(9)
+                  font.bold: true
+                }
+
+                Item { Layout.fillWidth: true }
+
+                ActionChip {
+                  label: root.cloudAddOpen ? "Cancel" : "Add Cloud Drive"
+                  iconText: root.cloudAddOpen ? Model.GLYPH_ALERT : Model.GLYPH_PLUS
+                  active: root.cloudAddOpen
+                  tooltipText: "Add multiple Google Drives, Mega, OneDrive, or Dropbox accounts"
+                  onClicked: root.cloudAddOpen = !root.cloudAddOpen
+                }
+              }
+
+              // Add Cloud Drive Drawer / Dialog
+              Rectangle {
+                visible: root.cloudAddOpen
+                width: parent.width
+                radius: Style.space(8)
+                color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.04)
+                border.width: 1
+                border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14)
+                implicitHeight: addFormCol.implicitHeight + Style.space(20)
+
+                ColumnLayout {
+                  id: addFormCol
+                  anchors.fill: parent
+                  anchors.margins: Style.space(10)
+                  spacing: Style.space(8)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "Add Cloud Storage Account"
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                  }
+
+                  // Provider Selection Dropdown
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(4)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Storage Provider:"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Dropdown {
+                      id: cloudProviderDropdown
+                      Layout.fillWidth: true
+                      showLabel: false
+                      options: Model.cloudProviderOptions()
+                      value: root.cloudAddProvider
+                      foreground: root.foreground
+                      background: Color.popups.background
+                      accent: Color.accent
+                      fontFamily: root.fontFamily
+                      onChanged: function(val) { root.selectCloudAddProvider(val) }
+
+                      Binding {
+                        target: cloudProviderDropdown
+                        property: "value"
+                        value: root.cloudAddProvider
+                      }
+                    }
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: Model.cloudProvider(root.cloudAddProvider).description
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                  }
+
+                  // Detected Remotes in rclone (if any)
+                  ColumnLayout {
+                    visible: drives.availableRemotes.length > 0
+                    Layout.fillWidth: true
+                    spacing: Style.space(4)
+
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: "Remotes detected in rclone:"
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+
+                      Item { Layout.fillWidth: true }
+
+                      ActionChip {
+                        label: "rclone config"
+                        iconText: Model.GLYPH_TERMINAL
+                        tooltipText: "Run rclone config in terminal to authenticate or create a remote"
+                        onClicked: drives.launchRcloneTerminal("rclone config")
+                      }
+                    }
+
+                    Flow {
+                      width: addFormCol.width
+                      spacing: Style.space(6)
+
+                      Repeater {
+                        model: drives.availableRemotes
+
+                        ActionChip {
+                          required property var modelData
+                          label: modelData.name + " (" + modelData.type + ")"
+                          iconText: Model.cloudProviderGlyph(modelData.type)
+                          active: root.cloudAddRemoteName === modelData.name
+                          onClicked: {
+                            root.cloudAddRemoteName = modelData.name
+                            if (modelData.type === "drive") root.selectCloudAddProvider("drive")
+                            else if (modelData.type === "mega") root.selectCloudAddProvider("mega")
+                            else if (modelData.type === "onedrive") root.selectCloudAddProvider("onedrive")
+                            else if (modelData.type === "dropbox") root.selectCloudAddProvider("dropbox")
+                            else if (modelData.type === "webdav") root.selectCloudAddProvider("webdav")
+                            else root.selectCloudAddProvider("other")
+                            root.cloudAddRemoteName = modelData.name
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  // Form Fields: Remote Name, Folder, Mount
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(4)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Remote name (as configured in rclone):"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    TextField {
+                      id: rNameField
+                      Layout.fillWidth: true
+                      foreground: root.foreground
+                      verticalPadding: Style.space(4)
+                      text: root.cloudAddRemoteName
+                      onTextChanged: root.cloudAddRemoteName = text
+                      placeholderText: "e.g. gdrive, gdrive-work, mega"
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Local sync folder:"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    TextField {
+                      id: rFolderField
+                      Layout.fillWidth: true
+                      foreground: root.foreground
+                      verticalPadding: Style.space(4)
+                      text: root.cloudAddFolder
+                      onTextChanged: root.cloudAddFolder = text
+                      placeholderText: "e.g. ~/Google Drive"
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Browse mount path (on-demand FUSE view):"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    TextField {
+                      id: rMountField
+                      Layout.fillWidth: true
+                      foreground: root.foreground
+                      verticalPadding: Style.space(4)
+                      text: root.cloudAddMount
+                      onTextChanged: root.cloudAddMount = text
+                      placeholderText: "e.g. ~/GDrive-Browse"
+                    }
+                  }
+
+                  // Buttons Row
+                  RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(8)
+
+                    ActionChip {
+                      label: "Cancel"
+                      onClicked: root.cloudAddOpen = false
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    ActionChip {
+                      label: "Connect & Add Drive"
+                      iconText: Model.GLYPH_PLUS
+                      active: true
+                      enabled: root.cloudAddRemoteName.trim() !== ""
+                      tooltipText: root.cloudAddRemoteName.trim() === "" ? "Enter a remote name to connect" : "Save and connect this drive"
+                      onClicked: {
+                        var remote = root.cloudAddRemoteName.trim()
+                        if (remote === "") return
+                        var provider = root.cloudAddProvider
+                        var st = drives.cloudStatuses[remote]
+                        var isAuth = drives.isRemoteAuthenticated(remote) || (st && st.authenticated === true)
+                        var needsAuth = !isAuth
+                        drives.addCloudAccount({
+                          remoteName: remote,
+                          type: provider,
+                          displayName: remote,
+                          folderPath: root.cloudAddFolder.trim(),
+                          browseMountPath: root.cloudAddMount.trim(),
+                          syncIntervalMin: root.cloudAddInterval,
+                          autoSync: true,
+                          autoMount: true
+                        })
+                        root.cloudAddOpen = false
+                        if (needsAuth) {
+                          drives.authenticateCloudRemote(remote, provider)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Cloud Accounts Empty State
+              Rectangle {
+                visible: drives.cloudAccountCount === 0 && !root.cloudAddOpen
+                width: parent.width
+                radius: Style.space(8)
+                color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.03)
+                border.width: 1
+                border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                implicitHeight: cloudEmptyCol.implicitHeight + Style.space(24)
+
+                ColumnLayout {
+                  id: cloudEmptyCol
+                  anchors.fill: parent
+                  anchors.margins: Style.space(12)
+                  spacing: Style.space(6)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: Model.GLYPH_CLOUD
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.display
+                    Layout.alignment: Qt.AlignHCenter
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "No Cloud Drives Connected"
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    Layout.alignment: Qt.AlignHCenter
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: "Connect multiple Google Drive, Mega, OneDrive, or Dropbox accounts with selective two-way sync."
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                  }
+
+                  Flow {
+                    width: cloudEmptyCol.width
+                    spacing: Style.space(8)
+
+                    ActionChip {
+                      label: "+ Google Drive"
+                      iconText: Model.GLYPH_GOOGLE_DRIVE
+                      onClicked: {
+                        root.selectCloudAddProvider("drive")
+                        root.cloudAddOpen = true
+                      }
+                    }
+
+                    ActionChip {
+                      label: "+ Mega"
+                      iconText: Model.GLYPH_MEGA
+                      onClicked: {
+                        root.selectCloudAddProvider("mega")
+                        root.cloudAddOpen = true
+                      }
+                    }
+
+                    ActionChip {
+                      label: "+ OneDrive"
+                      iconText: Model.GLYPH_ONEDRIVE
+                      onClicked: {
+                        root.selectCloudAddProvider("onedrive")
+                        root.cloudAddOpen = true
+                      }
+                    }
+
+                    ActionChip {
+                      label: "+ Dropbox"
+                      iconText: Model.GLYPH_DROPBOX
+                      onClicked: {
+                        root.selectCloudAddProvider("dropbox")
+                        root.cloudAddOpen = true
+                      }
+                    }
+                  }
+                }
+              }
+
+              // Cloud Accounts Cards
+              Repeater {
+                model: drives.cloudAccounts
+
+                Rectangle {
+                  id: cloudCardRoot
+                  required property var modelData
+                  required property int index
+
+                  readonly property var st: drives.cloudStatuses[modelData.remoteName] || Model.defaultCloudStatus(modelData.remoteName)
+
+                  width: parent ? parent.width : 0
+                  radius: Style.space(10)
+                  color: cardHover.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.035)
+                  border.width: 1
+                  border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.09)
+                  implicitHeight: cardLayout.implicitHeight + Style.space(16)
+
+                  MouseArea {
+                    id: cardHover
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      drives.selectedCloudRemote = modelData.remoteName
+                      drives.refreshCloudStatus(modelData.remoteName)
+                      drives.refreshCloudFolders(modelData.remoteName)
+                    }
+                  }
+
+                  ColumnLayout {
+                    id: cardLayout
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Style.space(10)
+                    spacing: Style.space(8)
+
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(8)
+
+                      // Provider Icon
+                      Rectangle {
+                        implicitWidth: Style.space(34)
+                        implicitHeight: Style.space(34)
+                        radius: Style.space(6)
+                        color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.07)
+                        border.width: 1
+                        border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+                        Layout.alignment: Qt.AlignVCenter
+
+                        GoogleDriveIcon {
+                          visible: modelData.type === "drive"
+                          anchors.centerIn: parent
+                          iconSize: Style.font.iconLarge || Style.space(20)
+                          color: root.foreground
+                        }
+
+                        Text {
+                          visible: modelData.type !== "drive"
+                          anchors.centerIn: parent
+                          textFormat: Text.PlainText
+                          text: Model.cloudProviderGlyph(modelData.type)
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.icon
+                        }
+                      }
+
+                      ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: Style.space(2)
+
+                        RowLayout {
+                          Layout.fillWidth: true
+                          spacing: Style.space(6)
+
+                          Text {
+                            textFormat: Text.PlainText
+                            text: modelData.remoteName
+                            color: root.foreground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.body
+                            font.bold: true
+                            elide: Text.ElideRight
+                          }
+
+                          Rectangle {
+                            implicitWidth: typeTag.implicitWidth + Style.space(10)
+                            implicitHeight: typeTag.implicitHeight + Style.space(4)
+                            radius: Style.space(3)
+                            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                            border.width: 1
+                            border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+                            Layout.alignment: Qt.AlignVCenter
+
+                            Text {
+                              id: typeTag
+                              anchors.centerIn: parent
+                              textFormat: Text.PlainText
+                              text: Model.cloudProviderLabel(modelData.type).toUpperCase()
+                              color: root.dim
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.captionSmall || Style.space(9)
+                              font.bold: true
+                            }
+                          }
+
+                          Rectangle {
+                            visible: st.statusText !== ""
+                            implicitWidth: stTag.implicitWidth + Style.space(10)
+                            implicitHeight: stTag.implicitHeight + Style.space(4)
+                            radius: Style.space(3)
+                            color: st.lastResult === "error"
+                              ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.15)
+                              : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                            border.width: 1
+                            border.color: st.lastResult === "error"
+                              ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.3)
+                              : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+                            Layout.alignment: Qt.AlignVCenter
+
+                            Text {
+                              id: stTag
+                              anchors.centerIn: parent
+                              textFormat: Text.PlainText
+                              text: st.statusText
+                              color: st.lastResult === "error" ? root.urgent : root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.captionSmall || Style.space(9)
+                            }
+                          }
+                        }
+
+                        // Row 2: Account identity / path
+                        Text {
+                          textFormat: Text.PlainText
+                          Layout.fillWidth: true
+                          text: st.accountEmail !== ""
+                            ? (st.accountName !== "" ? st.accountEmail + " (" + st.accountName + ")" : st.accountEmail)
+                            : (st.authenticated ? Model.shortHomePath(modelData.folderPath, drives.homePath) : "Not configured in rclone")
+                          color: st.accountEmail !== "" ? root.foreground : root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: st.accountEmail !== ""
+                          elide: Text.ElideRight
+                        }
+
+                        // Row 3: Folders & Disk Usage
+                        Text {
+                          textFormat: Text.PlainText
+                          Layout.fillWidth: true
+                          text: Model.cloudSummary(st)
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          elide: Text.ElideRight
+                        }
+                      }
+
+                      // Quick Actions Row
+                      Row {
+                        spacing: Style.space(2)
+                        Layout.alignment: Qt.AlignVCenter
+
+                        PanelActionButton {
+                          iconText: Model.GLYPH_REFRESH
+                          tooltipText: "Sync now"
+                          foreground: root.foreground
+                          fontFamily: root.fontFamily
+                          onClicked: drives.syncCloudNow(modelData.remoteName, false)
+                        }
+
+                        PanelActionButton {
+                          iconText: Model.GLYPH_FOLDER
+                          tooltipText: st.browseMounted ? "Open browse drive in file manager" : "Open synced folder in file manager"
+                          foreground: root.foreground
+                          fontFamily: root.fontFamily
+                          onClicked: {
+                            if (st.browseMounted && modelData.browseMountPath) {
+                              drives.openCloudBrowse(modelData.browseMountPath)
+                            } else {
+                              drives.openCloudFolder(modelData.folderPath)
+                            }
+                          }
+                        }
+
+                        PanelActionButton {
+                          iconText: st.browseMounted ? Model.GLYPH_HEALTHY : Model.GLYPH_CLOUD
+                          tooltipText: st.browseMounted ? "Unmount browse folder" : "Mount browse folder"
+                          foreground: st.browseMounted ? (bar && "activeColor" in bar ? bar.activeColor : root.foreground) : root.dim
+                          fontFamily: root.fontFamily
+                          onClicked: drives.toggleCloudBrowse(modelData.remoteName)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            // Section 2: Mounted Network Shares
+            Column {
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                textFormat: Text.PlainText
+                text: "MOUNTED NETWORK SHARES (" + drives.networkCount + ")"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.captionSmall || Style.space(9)
+                font.bold: true
+              }
+
+              // Network Empty State
+              Column {
+                visible: drives.networkCount === 0
+                width: parent.width
+                spacing: Style.space(6)
+                topPadding: Style.space(16)
+                bottomPadding: Style.space(16)
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: Model.GLYPH_SERVER
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.display
+                  horizontalAlignment: Text.AlignHCenter
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: "No network shares mounted"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                  horizontalAlignment: Text.AlignHCenter
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: "NFS, Samba/CIFS, SSHFS, Rclone, and DAVFS endpoints appear here automatically when mounted."
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  horizontalAlignment: Text.AlignHCenter
+                  wrapMode: Text.WordWrap
+                }
+              }
+
+              // Network Filter Empty State
+              Text {
+                textFormat: Text.PlainText
+                visible: root.filterQuery !== "" && root.matchingNetworkCount === 0 && drives.networkCount > 0
+                width: parent.width
+                text: "No network shares matching \"" + root.filterQuery + "\""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                horizontalAlignment: Text.AlignHCenter
+                topPadding: Style.space(16)
+                bottomPadding: Style.space(16)
+              }
+
+              // Network Share Cards
+              Repeater {
+                model: drives.networkShares
+
+                NetworkShareCard {
+                  required property var modelData
+                  required property int index
+
+                  width: column.width
+                  share: modelData
+                  shareIndex: index
+                  visible: !!root.networkShareMatchesFilter(modelData, root.filterQuery)
+                }
+              }
             }
           }
         }

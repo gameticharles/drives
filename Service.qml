@@ -59,6 +59,49 @@ Item {
   property var networkShares: []
   readonly property int networkCount: networkShares.length
 
+  // Cloud & rclone accounts (Google Drive, Mega, OneDrive, etc.)
+  readonly property string homePath: Quickshell.env("HOME") || ""
+  readonly property string cloudStorePath: Quickshell.env("HOME") + "/.local/state/omarchy/cloud-drives.json"
+  property var cloudStore: ({ version: 1, accounts: [] })
+  readonly property var cloudAccounts: (cloudStore && cloudStore.accounts) ? cloudStore.accounts : []
+  readonly property int cloudAccountCount: cloudAccounts.length
+
+  property bool rcloneInstalled: false
+  property string rcloneVersion: ""
+  property bool rcloneFuse: false
+  property var availableRemotes: []
+  property var cloudStatuses: ({})
+
+  property string selectedCloudRemote: ""
+  readonly property var selectedCloudAccount: {
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === selectedCloudRemote) return cloudAccounts[i]
+    }
+    return null
+  }
+  readonly property var selectedCloudStatus: {
+    if (!selectedCloudRemote || selectedCloudRemote === "") return Model.defaultCloudStatus("")
+    return cloudStatuses[selectedCloudRemote] || Model.defaultCloudStatus(selectedCloudRemote)
+  }
+
+  property var cloudFolders: []
+  property int cloudStaleCount: 0
+  property double cloudStaleBytes: 0
+  property int cloudRootFileCount: 0
+  property double cloudRootFileBytes: 0
+  property bool cloudRootFiles: true
+  property bool cloudFoldersLoading: false
+  property string cloudFoldersError: ""
+  property var pendingCloudFolders: ({})
+  property string cloudActionStatus: ""
+
+  readonly property bool cloudBusy: cloudControlProcess.running
+  readonly property string cloudHelperPath: {
+    var value = String(Qt.resolvedUrl("cloud-sync.py"))
+    if (value.indexOf("file://") === 0) value = value.substring(7)
+    return decodeURIComponent(value)
+  }
+
   // S.M.A.R.T. and temperature telemetry gating:
   // When telemetryActive is false (default), background S.M.A.R.T. querying halts completely.
   // Polling only occurs when at least one drive's telemetry row is explicitly shown.
@@ -721,6 +764,288 @@ Item {
       "umount \"$MNT\""
     ].join("\n")
     runAction(["bash", "-c", script], share.mountpoint, "unmount", "Unmounted " + share.title)
+  }
+
+  // ------------------------------------------------------- Cloud drive actions
+
+  function expandHome(path) {
+    var value = String(path || "")
+    var home = String(Quickshell.env("HOME") || "")
+    if (value === "~") return home
+    if (value.indexOf("~/") === 0) return home + value.substring(1)
+    return value
+  }
+
+  function noteCloud(text) {
+    cloudActionStatus = text
+    cloudActionTimer.restart()
+  }
+
+  function saveCloudStore(next) {
+    cloudStore = next
+    cloudStoreWriter.command = ["bash", "-c",
+                                'mkdir -p "$(dirname "$2")" && printf %s "$1" > "$2"',
+                                "storage-drives-cloud", JSON.stringify(next), cloudStorePath]
+    cloudStoreWriter.running = true
+  }
+
+  function addCloudAccount(account) {
+    if (!account || !account.remoteName) return
+    var next = Model.withCloudAccount(cloudStore, account)
+    saveCloudStore(next)
+    refreshCloudStatus(account.remoteName)
+    var st = cloudStatuses[account.remoteName]
+    var isAuth = isRemoteAuthenticated(account.remoteName) || (st && st.authenticated === true)
+    if (isAuth && account.browseMountPath && account.autoMount !== false) {
+      var folderP = expandHome(account.folderPath || "~/Cloud")
+      var mountP = expandHome(account.browseMountPath)
+      runCloudControl(["python3", cloudHelperPath, "browse", "--remote", account.remoteName, "--folder", folderP, "--mount", mountP, "--enable"], function() {
+        refreshCloudStatus(account.remoteName)
+      })
+    }
+  }
+
+  function removeCloudAccount(remoteName, purgeRcloneRemote) {
+    if (!remoteName) return
+    var acc = null
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
+    }
+    var folderP = acc ? acc.folderPath : ""
+    var mountP = acc ? acc.browseMountPath : ""
+    var next = Model.withoutCloudAccount(cloudStore, remoteName)
+    saveCloudStore(next)
+    var args = ["python3", cloudHelperPath, "remove-account", "--remote", remoteName]
+    if (purgeRcloneRemote) args.push("--purge-remote")
+    if (mountP) args = args.concat(["--mount", expandHome(mountP)])
+    if (folderP) args = args.concat(["--folder", expandHome(folderP)])
+    runCloudControl(args, function() {
+      refreshCloud()
+    })
+    if (selectedCloudRemote === remoteName) selectedCloudRemote = ""
+  }
+
+  function refreshCloud() {
+    if (!cloudCheckProcess.running) cloudCheckProcess.running = true
+    if (!cloudRemotesProcess.running) cloudRemotesProcess.running = true
+    refreshCloudStatuses()
+  }
+
+  function refreshCloudStatuses() {
+    if (!cloudAccounts || cloudAccounts.length === 0) return
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      refreshCloudStatus(cloudAccounts[i].remoteName)
+    }
+  }
+
+  function refreshCloudStatus(remoteName) {
+    if (!remoteName || cloudStatusProcess.running) return
+    var acc = null
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
+    }
+    if (!acc) return
+    var folderP = expandHome(acc.folderPath || "~/Cloud")
+    var mountP = expandHome(acc.browseMountPath || "~/Cloud-Browse")
+    cloudStatusProcess.targetRemote = remoteName
+    cloudStatusProcess.command = ["python3", cloudHelperPath, "status",
+                                  "--remote", remoteName,
+                                  "--folder", folderP,
+                                  "--mount", mountP]
+    cloudStatusProcess.running = true
+  }
+
+  function refreshCloudFolders(remoteName) {
+    if (!remoteName || cloudFoldersProcess.running) return
+    var acc = null
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
+    }
+    var folderP = acc ? expandHome(acc.folderPath || "~/Cloud") : expandHome("~/Cloud")
+    cloudFoldersLoading = true
+    cloudFoldersProcess.targetRemote = remoteName
+    cloudFoldersProcess.command = ["python3", cloudHelperPath, "folders",
+                                   "--remote", remoteName,
+                                   "--folder", folderP]
+    cloudFoldersProcess.running = true
+  }
+
+  function isCloudFolderSelected(folder) {
+    if (!folder) return false
+    var pending = pendingCloudFolders[folder.name]
+    return pending === undefined ? folder.selected === true : pending === true
+  }
+
+  function toggleCloudFolder(remoteName, folder) {
+    if (!folder || cloudBusy || !remoteName) return
+    var name = String(folder.name)
+    var next = !isCloudFolderSelected(folder)
+    var copy = {}
+    for (var key in pendingCloudFolders) copy[key] = pendingCloudFolders[key]
+    copy[name] = next
+    pendingCloudFolders = copy
+
+    noteCloud(next ? "Adding " + name + "…" : "Removing " + name + " from sync…")
+    runCloudControl(["python3", cloudHelperPath, "select", "--remote", remoteName, (next ? "--add=" : "--remove=") + name], function() {
+      refreshCloudFolders(remoteName)
+      refreshCloudStatus(remoteName)
+    })
+  }
+
+  function setCloudRootFiles(remoteName, enabled) {
+    if (cloudBusy || !remoteName) return
+    noteCloud(enabled ? "Including root files…" : "Excluding root files…")
+    runCloudControl(["python3", cloudHelperPath, "select", "--remote", remoteName, enabled ? "--root-files" : "--no-root-files"], function() {
+      refreshCloudFolders(remoteName)
+      refreshCloudStatus(remoteName)
+    })
+  }
+
+  function syncCloudNow(remoteName, resync) {
+    if (cloudBusy || !remoteName) return
+    var acc = null
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
+    }
+    var folderP = acc ? expandHome(acc.folderPath || "~/Cloud") : expandHome("~/Cloud")
+    var mountP = acc ? expandHome(acc.browseMountPath || "~/Cloud-Browse") : expandHome("~/Cloud-Browse")
+    noteCloud("Starting sync…")
+    var args = ["python3", cloudHelperPath, "sync", "--remote", remoteName, "--folder", folderP, "--mount", mountP]
+    if (resync === true) args.push("--resync")
+    runCloudControl(args, function() {
+      refreshCloudStatus(remoteName)
+      cloudSyncPoll.restart()
+    })
+  }
+
+  function setCloudAutoSync(remoteName, enabled, intervalMin) {
+    if (cloudBusy || !remoteName) return
+    var acc = null
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
+    }
+    var folderP = acc ? expandHome(acc.folderPath || "~/Cloud") : expandHome("~/Cloud")
+    var mountP = acc ? expandHome(acc.browseMountPath || "~/Cloud-Browse") : expandHome("~/Cloud-Browse")
+    var interval = intervalMin || (acc ? acc.syncIntervalMin : 10) || 10
+    noteCloud(enabled ? "Enabling automatic sync…" : "Pausing automatic sync…")
+    var args = ["python3", cloudHelperPath, "timer", "--remote", remoteName, "--folder", folderP, "--mount", mountP, enabled ? "--enable" : "--disable"]
+    if (enabled) args = args.concat(["--interval", String(interval)])
+    runCloudControl(args, function() {
+      refreshCloudStatus(remoteName)
+    })
+  }
+
+  function toggleCloudBrowse(remoteName) {
+    if (cloudBusy || !remoteName) return
+    var acc = null
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
+    }
+    var folderP = acc ? expandHome(acc.folderPath || "~/Cloud") : expandHome("~/Cloud")
+    var mountP = acc ? expandHome(acc.browseMountPath || "~/Cloud-Browse") : expandHome("~/Cloud-Browse")
+    var st = cloudStatuses[remoteName]
+    var turningOn = !(st && st.browseMounted)
+    noteCloud(turningOn ? "Mounting browse folder…" : "Unmounting browse folder…")
+    var args = ["python3", cloudHelperPath, "browse", "--remote", remoteName, "--folder", folderP, "--mount", mountP, turningOn ? "--enable" : "--disable"]
+    runCloudControl(args, function() {
+      refreshCloudStatus(remoteName)
+    })
+  }
+
+  function cleanupCloudStale(remoteName) {
+    if (cloudBusy || !remoteName) return
+    var acc = null
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
+    }
+    var folderP = acc ? expandHome(acc.folderPath || "~/Cloud") : expandHome("~/Cloud")
+    noteCloud("Verifying against remote before deleting…")
+    runCloudControl(["python3", cloudHelperPath, "cleanup", "--remote", remoteName, "--folder", folderP], function() {
+      refreshCloudFolders(remoteName)
+      refreshCloudStatus(remoteName)
+    })
+  }
+
+  function openCloudFolder(folderPath) {
+    var expanded = expandHome(folderPath)
+    if (!expanded) return
+    var command = String(setting("fileManager", "")).replace(/^\s+|\s+$/g, "")
+    if (command === "") {
+      Quickshell.execDetached(["uwsm-app", "--", "xdg-open", expanded])
+      return
+    }
+    Quickshell.execDetached(["bash", "-c", command + " " + quote(expanded)])
+  }
+
+  function openCloudBrowse(mountPath) {
+    var expanded = expandHome(mountPath)
+    if (!expanded) return
+    var command = String(setting("fileManager", "")).replace(/^\s+|\s+$/g, "")
+    if (command === "") {
+      Quickshell.execDetached(["uwsm-app", "--", "xdg-open", expanded])
+      return
+    }
+    Quickshell.execDetached(["bash", "-c", command + " " + quote(expanded)])
+  }
+
+  function launchRcloneTerminal(cmd) {
+    var c = cmd && cmd !== "" ? cmd : "rclone config"
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", c])
+  }
+
+  function installRclone() {
+    var cmd = "omarchy pkg add rclone fuse3"
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", cmd])
+  }
+
+  function hasRemote(remoteName) {
+    var r = String(remoteName || "").trim()
+    for (var i = 0; i < availableRemotes.length; i++) {
+      if (availableRemotes[i].name === r) return true
+    }
+    return false
+  }
+
+  function isRemoteAuthenticated(remoteName) {
+    var r = String(remoteName || "").trim()
+    for (var i = 0; i < availableRemotes.length; i++) {
+      if (availableRemotes[i].name === r) {
+        return availableRemotes[i].authenticated === true
+      }
+    }
+    return false
+  }
+
+  function hasCloudAccount(remoteName) {
+    var r = String(remoteName || "").trim()
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === r) return true
+    }
+    return false
+  }
+
+  function authenticateCloudRemote(remoteName, providerType) {
+    var cmd = Model.cloudAuthCommand(remoteName, providerType)
+    if (providerType === "onedrive") {
+      cmd = cmd + " || true; python3 " + quote(cloudHelperPath) + " status --remote " + quote(remoteName)
+    }
+    launchRcloneTerminal(cmd)
+  }
+
+  function hasUnauthenticatedCloudAccount() {
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      var r = cloudAccounts[i].remoteName
+      var st = cloudStatuses[r]
+      if (!st || !st.authenticated) return true
+    }
+    return false
+  }
+
+  property var _onCloudControlDone: null
+  function runCloudControl(command, onDone) {
+    _onCloudControlDone = onDone || null
+    cloudControlProcess.command = command
+    cloudControlProcess.running = true
   }
 
   // ------------------------------------------------------- sleep guard
@@ -1964,13 +2289,169 @@ Item {
     onTriggered: root.refresh()
   }
 
+  Process {
+    id: cloudStoreWriter
+  }
+
+  FileView {
+    id: cloudStoreFile
+    path: root.cloudStorePath
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      root.cloudStore = Model.parseCloudStore(text())
+      root.refreshCloudStatuses()
+    }
+    onFileChanged: reload()
+    onLoadFailed: root.cloudStore = Model.defaultCloudStore()
+  }
+
+  Process {
+    id: cloudCheckProcess
+    command: ["python3", root.cloudHelperPath, "rclone-check"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var parsed = Model.parseCloudCheck(text)
+        root.rcloneInstalled = parsed.installed === true
+        root.rcloneVersion = String(parsed.version || "")
+        root.rcloneFuse = parsed.fuse3 === true
+      }
+    }
+  }
+
+  Process {
+    id: cloudRemotesProcess
+    command: ["python3", root.cloudHelperPath, "remotes"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.availableRemotes = Model.parseCloudRemotes(text)
+      }
+    }
+  }
+
+  Process {
+    id: cloudStatusProcess
+    property string targetRemote: ""
+    stdout: StdioCollector {
+      id: cloudStatusStdout
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: cloudStatusStderr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (!targetRemote || targetRemote === "") return
+      var parsed = Model.parseCloudStatus(String(cloudStatusStdout.text || ""), targetRemote)
+      var copy = Object.assign({}, root.cloudStatuses)
+      copy[targetRemote] = parsed
+      root.cloudStatuses = copy
+
+      if (parsed.authenticated && !parsed.browseMounted && !parsed.browseEnabled && parsed.mountPath) {
+        var acc = null
+        for (var i = 0; i < cloudAccounts.length; i++) {
+          if (cloudAccounts[i].remoteName === targetRemote) { acc = cloudAccounts[i]; break }
+        }
+        if (acc && acc.autoMount !== false) {
+          var folderP = expandHome(acc.folderPath || "~/Cloud")
+          var mountP = expandHome(acc.browseMountPath || "~/Cloud-Browse")
+          runCloudControl(["python3", cloudHelperPath, "browse", "--remote", targetRemote, "--folder", folderP, "--mount", mountP, "--enable"], function() {
+            refreshCloudStatus(targetRemote)
+          })
+        }
+      }
+    }
+  }
+
+  Process {
+    id: cloudFoldersProcess
+    property string targetRemote: ""
+    stdout: StdioCollector {
+      id: cloudFoldersStdout
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: cloudFoldersStderr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root.cloudFoldersLoading = false
+      var parsed = Model.parseCloudFolders(String(cloudFoldersStdout.text || ""))
+      if (parsed.ok) {
+        root.cloudFolders = parsed.folders
+        root.cloudStaleBytes = parsed.staleBytes
+        root.cloudStaleCount = parsed.staleCount
+        root.cloudRootFiles = parsed.rootFiles
+        root.cloudRootFileCount = parsed.rootFileCount
+        root.cloudRootFileBytes = parsed.rootFileBytes
+        root.cloudFoldersError = ""
+        root.pendingCloudFolders = ({})
+      } else {
+        root.cloudFoldersError = parsed.lastError || "Could not list cloud folders"
+      }
+    }
+  }
+
+  Process {
+    id: cloudControlProcess
+    stdout: StdioCollector {
+      id: cloudControlStdout
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: cloudControlStderr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        var err = String(cloudControlStderr.text || "").trim()
+        root.lastError = err || "Cloud operation failed"
+        root.noteCloud(root.lastError)
+      }
+      var cb = root._onCloudControlDone
+      root._onCloudControlDone = null
+      if (cb) Qt.callLater(cb)
+    }
+  }
+
+  Timer {
+    id: cloudActionTimer
+    interval: 3200
+    repeat: false
+    onTriggered: root.cloudActionStatus = ""
+  }
+
+  Timer {
+    id: cloudSyncPoll
+    interval: 3000
+    repeat: true
+    running: {
+      if (!root.selectedCloudRemote || root.selectedCloudRemote === "") return false
+      var st = root.cloudStatuses[root.selectedCloudRemote]
+      return st && st.syncing === true
+    }
+    onTriggered: root.refreshCloudStatus(root.selectedCloudRemote)
+  }
+
+  Timer {
+    id: cloudUnauthPoll
+    interval: 3500
+    repeat: true
+    running: root.cloudAccountCount > 0 && root.hasUnauthenticatedCloudAccount()
+    onTriggered: root.refreshCloud()
+  }
+
   onWatchCloselyChanged: if (watchClosely) {
     refreshPortables()
     probeTrash()
+    refreshCloudStatuses()
   }
 
   Component.onCompleted: {
     refresh()
     refreshPortables()
+    refreshCloud()
   }
 }

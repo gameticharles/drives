@@ -2140,5 +2140,167 @@ test("parseNetworkMounts parses /proc/mounts text fallback", () => {
   assert.strictEqual(mounts[1].readOnly, true)
 })
 
+test("cloudProvider returns matched provider or fallback", () => {
+  const gdrive = api.cloudProvider("drive")
+  assert.strictEqual(gdrive.label, "Google Drive")
+  assert.strictEqual(gdrive.defaultFolder, "~/Google Drive")
+
+  const mega = api.cloudProvider("mega")
+  assert.strictEqual(mega.label, "Mega")
+
+  const onedrive = api.cloudProvider("onedrive")
+  assert.strictEqual(onedrive.label, "Microsoft OneDrive")
+
+  const fallback = api.cloudProvider("unknown_provider")
+  assert.strictEqual(fallback.label, "Other rclone Remote")
+})
+
+test("parseCloudStore, withCloudAccount, and withoutCloudAccount manage accounts", () => {
+  const initial = api.parseCloudStore("")
+  assert.deepStrictEqual(initial.accounts, [])
+
+  const withOne = api.withCloudAccount(initial, {
+    remoteName: "gdrive-work",
+    type: "drive",
+    folderPath: "~/Work Drive",
+    mountPath: "~/Work-Browse"
+  })
+  assert.strictEqual(withOne.accounts.length, 1)
+  assert.strictEqual(withOne.accounts[0].remoteName, "gdrive-work")
+
+  const withTwo = api.withCloudAccount(withOne, {
+    remoteName: "mega-personal",
+    type: "mega"
+  })
+  assert.strictEqual(withTwo.accounts.length, 2)
+
+  // Updating existing account
+  const updated = api.withCloudAccount(withTwo, {
+    remoteName: "gdrive-work",
+    folderPath: "~/Google Drive Work"
+  })
+  assert.strictEqual(updated.accounts.length, 2)
+  assert.strictEqual(updated.accounts[0].folderPath, "~/Google Drive Work")
+
+  const removed = api.withoutCloudAccount(updated, "gdrive-work")
+  assert.strictEqual(removed.accounts.length, 1)
+  assert.strictEqual(removed.accounts[0].remoteName, "mega-personal")
+})
+
+test("parseCloudStatus parses valid and fallback status", () => {
+  const parsed = api.parseCloudStatus(JSON.stringify({
+    ok: true,
+    installed: true,
+    authenticated: true,
+    statusText: "Synced",
+    selectedCount: 3,
+    localBytes: 104857600,
+    usedBytes: 5000000000,
+    quotaBytes: 15000000000,
+    quotaKnown: true
+  }), "gdrive")
+  assert.strictEqual(parsed.authenticated, true)
+  assert.strictEqual(parsed.statusText, "Synced")
+  assert.strictEqual(parsed.selectedCount, 3)
+
+  const empty = api.parseCloudStatus("", "myremote")
+  assert.strictEqual(empty.remoteName, "myremote")
+  assert.strictEqual(empty.authenticated, false)
+})
+
+test("parseCloudFolders parses folder lists, stale bytes, and root files", () => {
+  const json = JSON.stringify({
+    ok: true,
+    folders: [
+      { name: "Documents", selected: true, localBytes: 50000, onDisk: true },
+      { name: "Photos", selected: false, localBytes: 20000, onDisk: true, stale: true }
+    ],
+    rootFiles: true,
+    rootFileCount: 5,
+    rootFileBytes: 12000,
+    staleBytes: 20000,
+    staleCount: 1
+  })
+  const folders = api.parseCloudFolders(json)
+  assert.strictEqual(folders.folders.length, 2)
+  assert.strictEqual(folders.staleCount, 1)
+  assert.strictEqual(folders.staleBytes, 20000)
+  assert.strictEqual(folders.rootFileCount, 5)
+})
+
+test("cloud formatters: relativeTime, formatCloudBytes, cloudUsageText, shortHomePath", () => {
+  assert.strictEqual(api.formatCloudBytes(0), "0 B")
+  assert.strictEqual(api.formatCloudBytes(1048576), "1.0 MB")
+  assert.strictEqual(api.cloudUsageText(1048576, 5000000, true), "1.0 MB of 4.8 MB")
+
+  assert.strictEqual(api.shortHomePath("/home/user/Google Drive", "/home/user"), "~/Google Drive")
+  assert.strictEqual(api.shortHomePath("/home/user", "/home/user"), "~")
+  assert.strictEqual(api.shortHomePath("/mnt/nas", "/home/user"), "/mnt/nas")
+
+  const nowSec = 1700000000
+  assert.strictEqual(api.relativeTime(nowSec - 10, nowSec * 1000), "Just now")
+  assert.strictEqual(api.relativeTime(nowSec - 120, nowSec * 1000), "2m ago")
+  assert.strictEqual(api.relativeTime(nowSec - 7200, nowSec * 1000), "2h ago")
+  assert.strictEqual(api.relativeTime(0), "Never")
+})
+
+test("cloudProviderOptions returns list of providers with glyph and label", () => {
+  const options = api.cloudProviderOptions()
+  assert.strictEqual(options.length, 6)
+  assert.strictEqual(options[0].value, "drive")
+  assert(options[0].label.includes("Google Drive"))
+  assert(options[0].label.includes(api.GLYPH_GOOGLE_DRIVE))
+  assert.strictEqual(options[1].value, "mega")
+  assert(options[1].label.includes("Mega"))
+  assert(options[1].label.includes(api.GLYPH_MEGA))
+  assert.strictEqual(options[2].value, "onedrive")
+  assert(options[2].label.includes("Microsoft OneDrive"))
+  assert(options[2].label.includes(api.GLYPH_ONEDRIVE))
+  assert.strictEqual(options[3].value, "dropbox")
+  assert(options[3].label.includes("Dropbox"))
+  assert(options[3].label.includes(api.GLYPH_DROPBOX))
+  assert.strictEqual(options[4].value, "webdav")
+  assert(options[4].label.includes("Nextcloud / WebDAV"))
+  assert(options[4].label.includes(api.GLYPH_SERVER))
+  assert.strictEqual(options[5].value, "other")
+  assert(options[5].label.includes("Other rclone Remote"))
+  assert(options[5].label.includes(api.GLYPH_CLOUD))
+})
+
+test("cloudAuthCommand formats rclone setup commands correctly", () => {
+  assert(api.cloudAuthCommand("gdrive-work", "drive").includes("rclone config create 'gdrive-work' drive scope=drive config_is_local=true"))
+  assert(api.cloudAuthCommand("personal", "onedrive").includes("rclone config create 'personal' onedrive config_is_local=true"))
+  assert(api.cloudAuthCommand("box", "dropbox").includes("rclone config create 'box' dropbox config_is_local=true"))
+  assert(api.cloudAuthCommand("megadrive", "mega").includes("rclone config create 'megadrive' mega"))
+  assert.strictEqual(api.cloudAuthCommand("", "drive"), "rclone config")
+})
+
+test("parseCloudStatus preserves accountEmail and accountName", () => {
+  const parsed = api.parseCloudStatus(JSON.stringify({
+    ok: true,
+    authenticated: true,
+    accountEmail: "user@example.com",
+    accountName: "Example User"
+  }), "gdrive")
+  assert.strictEqual(parsed.accountEmail, "user@example.com")
+  assert.strictEqual(parsed.accountName, "Example User")
+})
+
+test("parseCloudRemotes parses remote list with authentication status", () => {
+  const json = JSON.stringify({
+    ok: true,
+    remotes: [
+      { name: "gdrive", type: "drive", authenticated: true },
+      { name: "testremote", type: "drive", authenticated: false }
+    ]
+  })
+  const remotes = api.parseCloudRemotes(json)
+  assert.strictEqual(remotes.length, 2)
+  assert.strictEqual(remotes[0].name, "gdrive")
+  assert.strictEqual(remotes[0].authenticated, true)
+  assert.strictEqual(remotes[1].name, "testremote")
+  assert.strictEqual(remotes[1].authenticated, false)
+})
+
 console.log(failures === 0 ? "\nAll tests passed." : `\n${failures} test(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)
