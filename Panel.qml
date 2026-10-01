@@ -47,6 +47,58 @@ Panel {
   property int cloudAddInterval: 10
   property bool cloudConfigDrawerOpen: false
 
+  // A destructive cloud action waiting for its second click, e.g.
+  // "purge:gdrive". It disarms by itself, so a stray click later never
+  // finishes a delete somebody started and walked away from.
+  property string armedCloudAction: ""
+
+  function armOrRun(key, action) {
+    if (armedCloudAction === key) {
+      armedCloudAction = ""
+      disarmTimer.stop()
+      action()
+      return
+    }
+    armedCloudAction = key
+    disarmTimer.restart()
+  }
+
+  Timer {
+    id: disarmTimer
+    interval: 4000
+    onTriggered: root.armedCloudAction = ""
+  }
+
+  // Draft of the browse folder being edited in an account's config drawer.
+  property string cloudMountDraft: ""
+
+  readonly property color warnColor: Qt.rgba(0.96, 0.62, 0.04, 1)
+
+  function toneColor(tone) {
+    if (tone === "error") return root.urgent
+    if (tone === "warn") return root.warnColor
+    if (tone === "busy" || tone === "ok") return bar && "activeColor" in bar ? bar.activeColor : root.foreground
+    return root.dim
+  }
+
+  function rescanAll() {
+    drives.rescan()
+    if (activeTab === "network") drives.refreshCloud()
+  }
+
+  function openCloudAccount(remote) {
+    if (!remote) return
+    drives.selectedCloudRemote = remote
+    cloudConfigDrawerOpen = false
+    armedCloudAction = ""
+    var acc = drives.cloudAccount(remote)
+    cloudMountDraft = acc ? String(acc.browseMountPath || "") : ""
+    // A shared folder is the one thing worth fixing before anything else.
+    cloudConfigDrawerOpen = !!drives.cloudConflicts[remote]
+    drives.refreshCloudStatus(remote, true)
+    drives.refreshCloudFolders(remote)
+  }
+
   function nextAvailableRemote(baseName) {
     if (!drives.hasCloudAccount(baseName)) return baseName
     for (var i = 2; i <= 20; i++) {
@@ -56,23 +108,35 @@ Panel {
     return baseName + "-new"
   }
 
-  function nextAvailableFolder(baseFolder) {
+  // Whether any connected account already uses this path, as its sync or its
+  // browse folder — compared expanded, so "~/X" and "/home/me/X" collide.
+  function pathTaken(path) {
+    var target = Model.expandHomePath(path, drives.homePath)
     for (var i = 0; i < drives.cloudAccounts.length; i++) {
-      if (drives.cloudAccounts[i].folderPath === baseFolder) {
-        return baseFolder + " 2"
-      }
+      var a = drives.cloudAccounts[i]
+      if (Model.pathsOverlap(target, Model.expandHomePath(a.folderPath, drives.homePath))
+          || Model.pathsOverlap(target, Model.expandHomePath(a.browseMountPath, drives.homePath))) return true
     }
-    return baseFolder
+    return false
   }
 
-  function nextAvailableMount(baseMount) {
-    for (var i = 0; i < drives.cloudAccounts.length; i++) {
-      if (drives.cloudAccounts[i].browseMountPath === baseMount) {
-        return baseMount + " 2"
-      }
+  // "~/Google Drive" → "~/Google Drive 2"; "~/Google Drive (Cloud)" →
+  // "~/Google Drive 2 (Cloud)". Counts up until the path is free, rather than
+  // appending " 2" once — which is how two accounts ended up sharing a mount.
+  function nextAvailablePath(base) {
+    if (!pathTaken(base)) return base
+    var m = String(base).match(/^(.*?)(\s*\([^)]*\))?$/)
+    var stem = m ? m[1] : base
+    var suffix = m && m[2] ? m[2] : ""
+    for (var i = 2; i <= 50; i++) {
+      var candidate = stem + " " + i + suffix
+      if (!pathTaken(candidate)) return candidate
     }
-    return baseMount
+    return base
   }
+
+  function nextAvailableFolder(baseFolder) { return nextAvailablePath(baseFolder) }
+  function nextAvailableMount(baseMount) { return nextAvailablePath(baseMount) }
 
   function selectCloudAddProvider(type) {
     cloudAddProvider = type
@@ -130,16 +194,6 @@ Panel {
 
   function runNtfsFix(path) {
     var cmd = path && path !== "" ? "omarchy-ntfs-fix " + Model.shellQuote(path) : "omarchy-ntfs-fix"
-    if (root.bar) {
-      root.bar.run("omarchy-launch-floating-terminal-with-presentation " + cmd)
-    } else {
-      Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", cmd])
-    }
-  }
-
-  function launchFormat(devicePath) {
-    if (!devicePath || devicePath === "") return
-    var cmd = "omarchy-drive-format " + Model.shellQuote(devicePath)
     if (root.bar) {
       root.bar.run("omarchy-launch-floating-terminal-with-presentation " + cmd)
     } else {
@@ -248,8 +302,8 @@ Panel {
   readonly property int matchingNetworkCount: {
     if (!filterQuery || filterQuery === "") return drives.networkCount
     var count = 0
-    for (var i = 0; i < drives.networkShares.length; i++) {
-      if (networkShareMatchesFilter(drives.networkShares[i], filterQuery)) count++
+    for (var i = 0; i < drives.visibleNetworkShares.length; i++) {
+      if (networkShareMatchesFilter(drives.visibleNetworkShares[i], filterQuery)) count++
     }
     return count
   }
@@ -280,6 +334,10 @@ Panel {
   property string formattingPath: ""
   property string formatType: ""
   property bool formatQuick: true
+
+  // Device path of the drive being wiped whole, "" when none is. Shares the
+  // type and quick/zero choice with the volume form; only one is ever open.
+  property string formattingDevicePath: ""
 
   readonly property var devices: drives.devices
   readonly property var rows: Model.navRows(drives.devices, drives.portables)
@@ -348,9 +406,15 @@ Panel {
     return 0
   }
 
+  // Enter on a drive ejects it — but only a drive that can be pulled out. On
+  // an internal disk it opens the drive's drawer instead of powering it off.
   function activateCursor() {
     if (!currentRow) return
-    if (currentRow.kind === "device") drives.eject(currentDevice())
+    if (currentRow.kind === "device") {
+      var device = currentDevice()
+      if (Model.isEjectable(device)) drives.eject(device)
+      else if (device) toggleDeviceTools(device.path)
+    }
     else if (currentRow.kind === "portable") activatePortable(currentPortable())
     else activateVolume(currentVolume())
   }
@@ -409,13 +473,20 @@ Panel {
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
+  // A refusal is said in the status line rather than leaving the button dead,
+  // so "Unmount it first" reads as the next step instead of a broken button.
   function beginFormat(volume) {
     if (!volume) return
-    if (Model.canFormat(drives.fsCapabilities, volume, drives.deviceOfVolume(volume)) !== null) return
+    var refusal = Model.canFormat(drives.fsCapabilities, volume, drives.deviceOfVolume(volume))
+    if (refusal !== null) {
+      drives.refuse(refusal)
+      return
+    }
     expandedVolumePath = volume.fsPath
     renamingKey = ""
     renamingLabelPath = ""
     unlockingPath = ""
+    formattingDevicePath = ""
     var types = Model.formatTypes(drives.fsCapabilities)
     formatType = types.indexOf(volume.fstype) !== -1 ? volume.fstype : (types.length > 0 ? types[0] : "")
     formatQuick = true
@@ -424,6 +495,29 @@ Panel {
 
   function finishFormat() {
     formattingPath = ""
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  function beginDriveFormat(device) {
+    if (!device) return
+    var refusal = Model.canFormatDrive(drives.fsCapabilities, device)
+    if (refusal !== null) {
+      drives.refuse(refusal)
+      return
+    }
+    expandedDevicePath = device.path
+    renamingKey = ""
+    renamingLabelPath = ""
+    unlockingPath = ""
+    formattingPath = ""
+    var types = Model.formatTypes(drives.fsCapabilities)
+    formatType = types.length > 0 ? types[0] : ""
+    formatQuick = true
+    formattingDevicePath = device.path
+  }
+
+  function finishDriveFormat() {
+    formattingDevicePath = ""
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -436,7 +530,7 @@ Panel {
 
   function ejectCurrent() {
     var device = currentDevice()
-    if (device && !device.isSystem) drives.eject(device)
+    if (Model.isEjectable(device)) drives.eject(device)
   }
 
   function scrollItemIntoView(item) {
@@ -476,6 +570,7 @@ Panel {
     }
     if (renamingLabelPath !== "" && !drives.volumeByPath(renamingLabelPath)) renamingLabelPath = ""
     if (formattingPath !== "" && !drives.volumeByPath(formattingPath)) formattingPath = ""
+    if (formattingDevicePath !== "" && !drives.deviceByPath(formattingDevicePath)) formattingDevicePath = ""
     if (unlockingPath !== "") {
       var lockedHere = false
       for (i = 0; i < devices.length; i++) {
@@ -494,6 +589,7 @@ Panel {
     renamingLabelPath = ""
     unlockingPath = ""
     formattingPath = ""
+    formattingDevicePath = ""
     if (opened) {
       cursorActive = false
       cursor = 0
@@ -573,6 +669,34 @@ Panel {
       return drives.formatVolume(volume, fstype, name, true)
     }
 
+    function formatDrive(path: string, fstype: string, name: string): string {
+      var device = drives.deviceByPath(path)
+      if (!device) return "unknown device: " + path
+      return drives.formatDrive(device, fstype, name, true)
+    }
+
+    function unmountAll(path: string): string {
+      var device = drives.deviceByPath(path)
+      if (!device) return "unknown device: " + path
+      if (device.isSystem) return "refusing the system drive"
+      drives.unmountAll(device)
+      return "ok"
+    }
+
+    // The same rows the info grids draw, as an object, for a drive or a volume.
+    function info(path: string): string {
+      var device = drives.deviceByPath(path)
+      var rows = device ? drives.deviceInfoFor(device) : null
+      if (!rows) {
+        var volume = drives.volumeByPath(path)
+        if (!volume) return "unknown device or volume: " + path
+        rows = drives.volumeInfoFor(volume)
+      }
+      var out = {}
+      for (var i = 0; i < rows.length; i++) out[rows[i][0]] = rows[i][1]
+      return JSON.stringify(out)
+    }
+
     function phones(): string { return JSON.stringify(drives.portables) }
     function network(): string { return JSON.stringify(drives.networkShares) }
     function cloud(): string { return JSON.stringify(drives.cloudAccounts) }
@@ -604,6 +728,15 @@ Panel {
 
     function toggleTelemetry(path: string): string {
       root.toggleTelemetry(path)
+      return "ok"
+    }
+
+    // Opens the panel on one cloud account's detail view.
+    function openCloud(remote: string): string {
+      if (!drives.hasCloudAccount(remote)) return "unknown cloud account: " + remote
+      root.activeTab = "network"
+      root.openCloudAccount(remote)
+      root.open()
       return "ok"
     }
 
@@ -687,7 +820,7 @@ Panel {
       anchors.fill: parent
       blocked: root.renamingKey !== "" || root.renamingLabelPath !== ""
         || root.unlockingPath !== "" || root.formattingPath !== ""
-        || root.cloudAddOpen
+        || root.formattingDevicePath !== "" || root.cloudAddOpen
 
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) {
@@ -701,7 +834,7 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
-        if (text === "r" || text === "R") drives.rescan()
+        if (text === "r" || text === "R") root.rescanAll()
         else if (text === "e") root.ejectCurrent()
         else if (text === "E") drives.ejectAll()
         else if (text === "o" || text === "O") drives.openVolume(root.currentVolume())
@@ -713,11 +846,14 @@ Panel {
         else if (text === "l" || text === "L") root.beginLabelEdit(root.currentVolume())
         else if (text === "c" || text === "C") drives.checkVolume(root.currentVolume())
         else if (text === "f" || text === "F") {
-          var vol = root.currentVolume()
-          if (vol && !vol.isSystem) root.launchFormat(vol.fsPath || vol.path)
-          else {
-            var dev = root.currentDevice()
-            if (dev && !dev.isSystem) root.launchFormat(dev.path)
+          if (root.currentRow && root.currentRow.kind === "volume") root.beginFormat(root.currentVolume())
+          else if (root.currentRow && root.currentRow.kind === "device") root.beginDriveFormat(root.currentDevice())
+        }
+        else if (text === "i" || text === "I") {
+          if (root.currentRow && root.currentRow.kind === "volume" && root.currentVolume()) {
+            root.toggleVolumeDrawer(root.currentVolume().fsPath)
+          } else if (root.currentDevice()) {
+            root.toggleDeviceTools(root.currentDevice().path)
           }
         }
         else if (text === "m" || text === "M") {
@@ -754,7 +890,7 @@ Panel {
             width: parent.width
             title: root.activeTab === "network" ? "Network Storage" : "Storage Drives"
             meta: root.activeTab === "network"
-              ? (drives.networkCount === 0 ? "No active network mounts" : drives.networkCount + " mounted network / cloud " + (drives.networkCount === 1 ? "share" : "shares"))
+              ? Model.cloudOverview(drives.cloudAccounts, drives.cloudStatuses, drives.cloudConflicts, drives.networkCount)
               : (drives.anyBusy
                   ? (Model.formatRate(drives.totalWriteRate) !== ""
                       ? "Writing " + Model.formatRate(drives.totalWriteRate) + " — do not remove"
@@ -776,7 +912,7 @@ Panel {
                 spacing: Style.space(2)
 
                 PanelActionButton {
-                  visible: root.hasUnmountedNtfs
+                  visible: root.hasUnmountedNtfs && drives.hasTool("omarchy-ntfs-fix")
                   iconText: Model.GLYPH_WRENCH
                   tooltipText: "Fix & Mount All NTFS Partitions"
                   foreground: root.urgent
@@ -786,7 +922,7 @@ Panel {
                 }
 
                 PanelActionButton {
-                  visible: root.devices.length > 1
+                  visible: drives.ejectableDevices.length > 1
                   iconText: Model.GLYPH_EJECT
                   tooltipText: "Eject every removable drive"
                   foreground: root.foreground
@@ -810,7 +946,7 @@ Panel {
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   enabled: !drives.refreshing
-                  onClicked: drives.rescan()
+                  onClicked: root.rescanAll()
                 }
 
                 PanelActionButton {
@@ -1034,7 +1170,9 @@ Panel {
                 Text {
                   textFormat: Text.PlainText
                   Layout.fillWidth: true
-                  text: "Windows dirty bit may prevent mounting. Auto-repair is ready."
+                  text: drives.hasTool("omarchy-ntfs-fix")
+                    ? "Windows dirty bit may prevent mounting. Auto-repair is ready."
+                    : "Windows dirty bit may prevent mounting. Check the volume to offer a repair."
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1043,6 +1181,7 @@ Panel {
               }
 
               ActionChip {
+                visible: drives.hasTool("omarchy-ntfs-fix")
                 iconText: Model.GLYPH_WRENCH
                 label: "Fix All"
                 danger: true
@@ -1082,6 +1221,17 @@ Panel {
             }
 
             PanelActionButton {
+              iconText: Model.GLYPH_CLOSE
+              tooltipText: "Ask " + Model.describeBlockers(drives.blockers) + " to close, then try again"
+              foreground: root.foreground
+              hoverColor: root.urgent
+              fontFamily: root.fontFamily
+              enabled: !drives.busy
+              Layout.alignment: Qt.AlignVCenter
+              onClicked: drives.closeBlockersAndRetry()
+            }
+
+            PanelActionButton {
               iconText: Model.GLYPH_UNMOUNT
               tooltipText: "Unmount anyway (lazy unmount)"
               foreground: root.foreground
@@ -1091,6 +1241,21 @@ Panel {
               Layout.alignment: Qt.AlignVCenter
               onClicked: drives.forceUnmountBlocked()
             }
+          }
+
+          // Unflushed writes. System-wide — the kernel does not split it per
+          // device — so it is only a hint, shown while a removable drive is
+          // mounted and the amount is big enough to take noticeable time.
+          Text {
+            textFormat: Text.PlainText
+            visible: root.activeTab === "local" && drives.dirtyBytes >= 8 * 1024 * 1024
+              && Model.suspendTargets(drives.ejectableDevices).length > 0
+            width: parent.width
+            text: Model.formatBytes(drives.dirtyBytes) + " written but not yet flushed to disk — eject writes it out first"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           // Pending Eject Banner
@@ -1331,7 +1496,7 @@ Panel {
                 wrapMode: Text.WordWrap
               }
 
-              RowLayout {
+              Flow {
                 Layout.fillWidth: true
                 spacing: Style.space(8)
 
@@ -1508,7 +1673,8 @@ Panel {
                       Layout.fillWidth: true
                       text: drives.selectedCloudStatus.accountEmail !== ""
                         ? (drives.selectedCloudStatus.accountName !== "" ? drives.selectedCloudStatus.accountEmail + " (" + drives.selectedCloudStatus.accountName + ")" : drives.selectedCloudStatus.accountEmail)
-                        : (drives.selectedCloudStatus.authenticated ? Model.shortHomePath(drives.selectedCloudStatus.folderPath, drives.homePath) : "Not configured in rclone")
+                        : (drives.selectedCloudStatus.authenticated ? Model.shortHomePath(drives.selectedCloudStatus.folderPath, drives.homePath)
+                           : (drives.selectedCloudStatus.statusText === "Checking…" ? "Checking…" : "Not signed in to rclone"))
                       color: drives.selectedCloudStatus.accountEmail !== "" ? root.foreground : root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -1526,6 +1692,52 @@ Panel {
                       font.pixelSize: Style.font.caption
                       elide: Text.ElideRight
                     }
+                  }
+                }
+
+                // Quota bar for the account as a whole.
+                Rectangle {
+                  visible: drives.selectedCloudStatus.quotaKnown
+                  Layout.fillWidth: true
+                  implicitHeight: Math.max(3, Style.space(4))
+                  radius: height / 2
+                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+                  Rectangle {
+                    readonly property real fraction: Model.cloudUsageFraction(drives.selectedCloudStatus)
+                    readonly property bool hot: Model.cloudOverQuota(drives.selectedCloudStatus)
+                      || fraction >= drives.fullWarnPct / 100
+                    width: Math.max(fraction > 0 ? 2 : 0, parent.width * fraction)
+                    height: parent.height
+                    radius: parent.radius
+                    color: hot ? root.urgent : root.foreground
+                    opacity: hot ? 1 : 0.6
+                  }
+                }
+
+                // Shared-folder warning, with the fix one click away.
+                Rectangle {
+                  readonly property string reason: drives.cloudConflicts[drives.selectedCloudRemote] || ""
+                  readonly property string other: drives.selectedCloudStatus.browseConflict || ""
+                  visible: reason !== "" || other !== ""
+                  Layout.fillWidth: true
+                  radius: Style.space(6)
+                  color: Qt.rgba(root.warnColor.r, root.warnColor.g, root.warnColor.b, 0.1)
+                  border.width: 1
+                  border.color: Qt.rgba(root.warnColor.r, root.warnColor.g, root.warnColor.b, 0.35)
+                  implicitHeight: conflictText.implicitHeight + Style.space(14)
+
+                  Text {
+                    id: conflictText
+                    anchors.fill: parent
+                    anchors.margins: Style.space(7)
+                    textFormat: Text.PlainText
+                    text: (parent.reason !== "" ? parent.reason : "The browse folder is mounted for '" + parent.other + "'")
+                      + ". Two accounts sharing a folder mount or sync the wrong drive — give this one its own browse folder below."
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
                   }
                 }
 
@@ -1547,6 +1759,7 @@ Panel {
                 // Notice if not authenticated in rclone
                 Rectangle {
                   visible: !drives.selectedCloudStatus.authenticated && drives.rcloneInstalled
+                    && drives.selectedCloudStatus.statusText !== "Checking…"
                   Layout.fillWidth: true
                   radius: Style.space(6)
                   color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.08)
@@ -1578,7 +1791,8 @@ Panel {
                       font.pixelSize: Style.font.caption
                     }
 
-                    RowLayout {
+                    Flow {
+                      Layout.fillWidth: true
                       spacing: Style.space(6)
 
                       ActionChip {
@@ -1590,11 +1804,12 @@ Panel {
                       }
 
                       ActionChip {
-                        label: "Delete Account"
+                        readonly property string key: "purge:" + drives.selectedCloudRemote
+                        label: root.armedCloudAction === key ? "Click again to delete" : "Delete Account"
                         iconText: Model.GLYPH_TRASH
                         danger: true
-                        tooltipText: "Remove this account from Storage Drives and rclone"
-                        onClicked: drives.removeCloudAccount(drives.selectedCloudRemote, true)
+                        tooltipText: "Remove this account from Storage Drives and its sign-in from rclone. Files in the cloud and on disk are kept."
+                        onClicked: root.armOrRun(key, function() { drives.removeCloudAccount(drives.selectedCloudRemote, true) })
                       }
                     }
                   }
@@ -1712,8 +1927,8 @@ Panel {
                   }
                 }
 
-                // Action Buttons Row
-                RowLayout {
+                // Action buttons — wrap onto a second row rather than squeeze.
+                Flow {
                   Layout.fillWidth: true
                   spacing: Style.space(6)
 
@@ -1722,7 +1937,8 @@ Panel {
                     iconText: Model.GLYPH_REFRESH
                     active: drives.selectedCloudStatus.syncing
                     tooltipText: "Run two-way sync with cloud remote"
-                    Layout.fillWidth: true
+                    enabled: !drives.selectedCloudStatus.syncing && drives.selectedCloudStatus.authenticated
+                    opacity: enabled ? 1 : 0.5
                     onClicked: drives.syncCloudNow(drives.selectedCloudRemote, false)
                   }
 
@@ -1730,7 +1946,6 @@ Panel {
                     label: "Open"
                     iconText: Model.GLYPH_FOLDER
                     tooltipText: "Open synced folder in file manager"
-                    Layout.fillWidth: true
                     onClicked: drives.openCloudFolder(drives.selectedCloudStatus.folderPath)
                   }
 
@@ -1739,7 +1954,6 @@ Panel {
                     iconText: drives.selectedCloudStatus.browseMounted ? Model.GLYPH_HEALTHY : Model.GLYPH_CLOUD
                     active: drives.selectedCloudStatus.browseMounted
                     tooltipText: drives.selectedCloudStatus.browseMounted ? "Unmount read-only browse view" : "Mount full remote read-only without downloading"
-                    Layout.fillWidth: true
                     onClicked: drives.toggleCloudBrowse(drives.selectedCloudRemote)
                   }
 
@@ -1777,7 +1991,7 @@ Panel {
                       font.bold: true
                     }
 
-                    RowLayout {
+                    Flow {
                       Layout.fillWidth: true
                       spacing: Style.space(6)
 
@@ -1797,53 +2011,112 @@ Panel {
                       font.pixelSize: Style.font.caption
                     }
 
+                    Flow {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
+                      Repeater {
+                        model: [5, 10, 15, 30, 60, 180]
+
+                        ActionChip {
+                          required property int modelData
+                          readonly property int current: drives.selectedCloudAccount
+                            ? (drives.selectedCloudAccount.syncIntervalMin || 10) : 10
+                          label: modelData < 60 ? modelData + " min" : (modelData / 60) + " h"
+                          active: current === modelData
+                          onClicked: drives.setCloudInterval(drives.selectedCloudRemote, modelData)
+                        }
+                      }
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Browse folder"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                      topPadding: Style.space(4)
+                    }
+
                     RowLayout {
                       Layout.fillWidth: true
                       spacing: Style.space(6)
 
-                      ActionChip {
-                        label: "5 min"
-                        active: drives.selectedCloudAccount && drives.selectedCloudAccount.syncIntervalMin === 5
-                        onClicked: {
-                          if (drives.selectedCloudAccount) {
-                            var updated = Object.assign({}, drives.selectedCloudAccount, { syncIntervalMin: 5 })
-                            drives.addCloudAccount(updated)
-                            if (drives.selectedCloudStatus.timerEnabled) drives.setCloudAutoSync(drives.selectedCloudRemote, true, 5)
-                          }
-                        }
+                      TextField {
+                        id: cloudMountField
+                        Layout.fillWidth: true
+                        foreground: root.foreground
+                        verticalPadding: Style.space(2)
+                        text: root.cloudMountDraft
+                        onTextChanged: root.cloudMountDraft = text
+                        placeholderText: "e.g. ~/Google Drive 2 (Cloud)"
+                        onAccepted: if (mountSave.enabled) drives.changeCloudMount(drives.selectedCloudRemote, root.cloudMountDraft)
                       }
+
                       ActionChip {
-                        label: "10 min"
-                        active: !drives.selectedCloudAccount || drives.selectedCloudAccount.syncIntervalMin === 10
-                        onClicked: {
-                          if (drives.selectedCloudAccount) {
-                            var updated = Object.assign({}, drives.selectedCloudAccount, { syncIntervalMin: 10 })
-                            drives.addCloudAccount(updated)
-                            if (drives.selectedCloudStatus.timerEnabled) drives.setCloudAutoSync(drives.selectedCloudRemote, true, 10)
-                          }
-                        }
+                        id: mountSave
+                        readonly property bool changed: drives.selectedCloudAccount
+                          && root.cloudMountDraft.trim() !== String(drives.selectedCloudAccount.browseMountPath || "")
+                        label: "Move"
+                        iconText: Model.GLYPH_FOLDER
+                        enabled: changed && mountCheck.ok && !drives.cloudBusy
+                        opacity: enabled ? 1 : 0.5
+                        tooltipText: "Unmount at the old folder and mount at this one"
+                        onClicked: drives.changeCloudMount(drives.selectedCloudRemote, root.cloudMountDraft)
                       }
+                    }
+
+                    Text {
+                      id: mountCheckText
+                      readonly property var check: drives.selectedCloudAccount
+                        ? Model.validateCloudAccount(drives.cloudAccounts,
+                            Object.assign({}, drives.selectedCloudAccount, { browseMountPath: root.cloudMountDraft }),
+                            drives.homePath, drives.selectedCloudRemote)
+                        : ({ ok: true, reason: "" })
+                      visible: !check.ok
+                      Layout.fillWidth: true
+                      textFormat: Text.PlainText
+                      text: check.reason
+                      color: root.urgent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      wrapMode: Text.WordWrap
+                    }
+
+                    QtObject {
+                      id: mountCheck
+                      readonly property bool ok: mountCheckText.check.ok
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "Troubleshooting"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                      topPadding: Style.space(4)
+                    }
+
+                    Flow {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
                       ActionChip {
-                        label: "30 min"
-                        active: drives.selectedCloudAccount && drives.selectedCloudAccount.syncIntervalMin === 30
-                        onClicked: {
-                          if (drives.selectedCloudAccount) {
-                            var updated = Object.assign({}, drives.selectedCloudAccount, { syncIntervalMin: 30 })
-                            drives.addCloudAccount(updated)
-                            if (drives.selectedCloudStatus.timerEnabled) drives.setCloudAutoSync(drives.selectedCloudRemote, true, 30)
-                          }
-                        }
+                        label: "View sync log"
+                        iconText: Model.GLYPH_TERMINAL
+                        tooltipText: "Open this account's sync log at its last lines, where a failed run says why"
+                        onClicked: drives.openCloudLog(drives.selectedCloudRemote)
                       }
+
                       ActionChip {
-                        label: "60 min"
-                        active: drives.selectedCloudAccount && drives.selectedCloudAccount.syncIntervalMin === 60
-                        onClicked: {
-                          if (drives.selectedCloudAccount) {
-                            var updated = Object.assign({}, drives.selectedCloudAccount, { syncIntervalMin: 60 })
-                            drives.addCloudAccount(updated)
-                            if (drives.selectedCloudStatus.timerEnabled) drives.setCloudAutoSync(drives.selectedCloudRemote, true, 60)
-                          }
-                        }
+                        label: "Resync"
+                        iconText: Model.GLYPH_REFRESH
+                        tooltipText: "Rebuild the sync baseline: merges both sides, newer file wins. Use after a failed or interrupted sync."
+                        enabled: !drives.selectedCloudStatus.syncing && drives.selectedCloudStatus.authenticated
+                        opacity: enabled ? 1 : 0.5
+                        onClicked: drives.syncCloudNow(drives.selectedCloudRemote, true)
                       }
                     }
 
@@ -1857,12 +2130,11 @@ Panel {
                       topPadding: Style.space(4)
                     }
 
-                    RowLayout {
+                    Flow {
                       Layout.fillWidth: true
                       spacing: Style.space(6)
 
                       ActionChip {
-                        Layout.fillWidth: true
                         label: "Re-authenticate"
                         iconText: Model.GLYPH_UNLOCKED
                         tooltipText: "Reconnect or refresh browser authorization token for this remote"
@@ -1870,25 +2142,20 @@ Panel {
                       }
 
                       ActionChip {
-                        Layout.fillWidth: true
-                        label: "Disconnect Drive"
+                        readonly property string key: "disconnect:" + drives.selectedCloudRemote
+                        label: root.armedCloudAction === key ? "Click again to disconnect" : "Disconnect"
                         iconText: Model.GLYPH_EJECT
-                        tooltipText: "Remove from Storage Drives (files in cloud and rclone config are kept)"
-                        onClicked: drives.removeCloudAccount(drives.selectedCloudRemote, false)
+                        tooltipText: "Remove from Storage Drives. The rclone sign-in and every file are kept."
+                        onClicked: root.armOrRun(key, function() { drives.removeCloudAccount(drives.selectedCloudRemote, false) })
                       }
-                    }
-
-                    RowLayout {
-                      Layout.fillWidth: true
-                      spacing: Style.space(6)
 
                       ActionChip {
-                        Layout.fillWidth: true
-                        label: "Delete Account from rclone"
+                        readonly property string key: "purge:" + drives.selectedCloudRemote
+                        label: root.armedCloudAction === key ? "Click again to delete" : "Delete from rclone"
                         iconText: Model.GLYPH_TRASH
                         danger: true
-                        tooltipText: "Remove from Storage Drives and delete remote from rclone completely"
-                        onClicked: drives.removeCloudAccount(drives.selectedCloudRemote, true)
+                        tooltipText: "Disconnect and delete the rclone remote (its sign-in). Files in the cloud and on disk are kept."
+                        onClicked: root.armOrRun(key, function() { drives.removeCloudAccount(drives.selectedCloudRemote, true) })
                       }
                     }
                   }
@@ -2182,7 +2449,12 @@ Panel {
                   iconText: root.cloudAddOpen ? Model.GLYPH_ALERT : Model.GLYPH_PLUS
                   active: root.cloudAddOpen
                   tooltipText: "Add multiple Google Drives, Mega, OneDrive, or Dropbox accounts"
-                  onClicked: root.cloudAddOpen = !root.cloudAddOpen
+                  onClicked: {
+                    // Suggestions are recomputed on every open: computed once,
+                    // they went stale as soon as an account was added.
+                    if (!root.cloudAddOpen) root.selectCloudAddProvider(root.cloudAddProvider)
+                    root.cloudAddOpen = !root.cloudAddOpen
+                  }
                 }
               }
 
@@ -2285,7 +2557,7 @@ Panel {
                     }
 
                     Flow {
-                      width: addFormCol.width
+                      Layout.fillWidth: true
                       spacing: Style.space(6)
 
                       Repeater {
@@ -2371,6 +2643,25 @@ Panel {
                     }
                   }
 
+                  // Checked as you type, against every connected account, so a
+                  // second account cannot be pointed at the first one's folders.
+                  Text {
+                    id: addCheckText
+                    readonly property var check: Model.validateCloudAccount(drives.cloudAccounts, {
+                      remoteName: root.cloudAddRemoteName,
+                      folderPath: root.cloudAddFolder,
+                      browseMountPath: root.cloudAddMount
+                    }, drives.homePath, "")
+                    visible: !check.ok
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: check.reason
+                    color: root.urgent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                  }
+
                   // Buttons Row
                   RowLayout {
                     Layout.fillWidth: true
@@ -2387,8 +2678,9 @@ Panel {
                       label: "Connect & Add Drive"
                       iconText: Model.GLYPH_PLUS
                       active: true
-                      enabled: root.cloudAddRemoteName.trim() !== ""
-                      tooltipText: root.cloudAddRemoteName.trim() === "" ? "Enter a remote name to connect" : "Save and connect this drive"
+                      enabled: addCheckText.check.ok
+                      opacity: enabled ? 1 : 0.5
+                      tooltipText: addCheckText.check.ok ? "Save and connect this drive" : addCheckText.check.reason
                       onClicked: {
                         var remote = root.cloudAddRemoteName.trim()
                         if (remote === "") return
@@ -2396,7 +2688,7 @@ Panel {
                         var st = drives.cloudStatuses[remote]
                         var isAuth = drives.isRemoteAuthenticated(remote) || (st && st.authenticated === true)
                         var needsAuth = !isAuth
-                        drives.addCloudAccount({
+                        if (drives.addCloudAccount({
                           remoteName: remote,
                           type: provider,
                           displayName: remote,
@@ -2405,7 +2697,7 @@ Panel {
                           syncIntervalMin: root.cloudAddInterval,
                           autoSync: true,
                           autoMount: true
-                        })
+                        }) !== "ok") return
                         root.cloudAddOpen = false
                         if (needsAuth) {
                           drives.authenticateCloudRemote(remote, provider)
@@ -2454,7 +2746,7 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     Layout.fillWidth: true
-                    text: "Connect multiple Google Drive, Mega, OneDrive, or Dropbox accounts with selective two-way sync."
+                    text: "Keep chosen folders synced on disk, and browse the rest without downloading it. Pick a provider to start."
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -2462,246 +2754,58 @@ Panel {
                     wrapMode: Text.WordWrap
                   }
 
-                  Flow {
-                    width: cloudEmptyCol.width
-                    spacing: Style.space(8)
+                  // Every provider, as an even grid of equal-width buttons.
+                  // (A Flow given a plain `width` inside a ColumnLayout is
+                  // sized to its widest child instead, which stacked these
+                  // one per line.)
+                  GridLayout {
+                    id: providerGrid
+                    Layout.fillWidth: true
+                    Layout.topMargin: Style.space(4)
+                    columns: Math.max(1, Math.floor((cloudEmptyCol.width + columnSpacing) / Style.space(130)))
+                    columnSpacing: Style.space(6)
+                    rowSpacing: Style.space(6)
 
-                    ActionChip {
-                      label: "+ Google Drive"
-                      iconText: Model.GLYPH_GOOGLE_DRIVE
-                      onClicked: {
-                        root.selectCloudAddProvider("drive")
-                        root.cloudAddOpen = true
-                      }
-                    }
+                    Repeater {
+                      model: Model.CLOUD_PROVIDERS
 
-                    ActionChip {
-                      label: "+ Mega"
-                      iconText: Model.GLYPH_MEGA
-                      onClicked: {
-                        root.selectCloudAddProvider("mega")
-                        root.cloudAddOpen = true
-                      }
-                    }
-
-                    ActionChip {
-                      label: "+ OneDrive"
-                      iconText: Model.GLYPH_ONEDRIVE
-                      onClicked: {
-                        root.selectCloudAddProvider("onedrive")
-                        root.cloudAddOpen = true
-                      }
-                    }
-
-                    ActionChip {
-                      label: "+ Dropbox"
-                      iconText: Model.GLYPH_DROPBOX
-                      onClicked: {
-                        root.selectCloudAddProvider("dropbox")
-                        root.cloudAddOpen = true
+                      ActionChip {
+                        required property var modelData
+                        // Same preferred width for all, so fillWidth shares
+                        // the row evenly instead of by label length.
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: Style.space(100)
+                        label: modelData.type === "other" ? "Other remote" : modelData.label.replace(/^Microsoft /, "")
+                        iconText: modelData.type === "other" ? Model.GLYPH_PLUS : modelData.glyph
+                        tooltipText: modelData.description
+                        onClicked: {
+                          root.selectCloudAddProvider(modelData.type)
+                          root.cloudAddOpen = true
+                        }
                       }
                     }
                   }
                 }
               }
 
-              // Cloud Accounts Cards
-              Repeater {
-                model: drives.cloudAccounts
+              // Cloud account tiles, one full-width row each, so a long email
+              // address has room. Each says who the account is, how full it
+              // is, and whether it needs anything; a click opens the full view.
+              Column {
+                id: cloudTiles
+                visible: drives.cloudAccountCount > 0
+                width: parent.width
+                spacing: Style.space(8)
 
-                Rectangle {
-                  id: cloudCardRoot
-                  required property var modelData
-                  required property int index
+                Repeater {
+                  model: drives.cloudAccounts
 
-                  readonly property var st: drives.cloudStatuses[modelData.remoteName] || Model.defaultCloudStatus(modelData.remoteName)
-
-                  width: parent ? parent.width : 0
-                  radius: Style.space(10)
-                  color: cardHover.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.035)
-                  border.width: 1
-                  border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.09)
-                  implicitHeight: cardLayout.implicitHeight + Style.space(16)
-
-                  MouseArea {
-                    id: cardHover
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                      drives.selectedCloudRemote = modelData.remoteName
-                      drives.refreshCloudStatus(modelData.remoteName)
-                      drives.refreshCloudFolders(modelData.remoteName)
-                    }
-                  }
-
-                  ColumnLayout {
-                    id: cardLayout
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
-                    anchors.margins: Style.space(10)
-                    spacing: Style.space(8)
-
-                    RowLayout {
-                      Layout.fillWidth: true
-                      spacing: Style.space(8)
-
-                      // Provider Icon
-                      Rectangle {
-                        implicitWidth: Style.space(34)
-                        implicitHeight: Style.space(34)
-                        radius: Style.space(6)
-                        color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.07)
-                        border.width: 1
-                        border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
-                        Layout.alignment: Qt.AlignVCenter
-
-                        GoogleDriveIcon {
-                          visible: modelData.type === "drive"
-                          anchors.centerIn: parent
-                          iconSize: Style.font.iconLarge || Style.space(20)
-                          color: root.foreground
-                        }
-
-                        Text {
-                          visible: modelData.type !== "drive"
-                          anchors.centerIn: parent
-                          textFormat: Text.PlainText
-                          text: Model.cloudProviderGlyph(modelData.type)
-                          color: root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.icon
-                        }
-                      }
-
-                      ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: Style.space(2)
-
-                        RowLayout {
-                          Layout.fillWidth: true
-                          spacing: Style.space(6)
-
-                          Text {
-                            textFormat: Text.PlainText
-                            text: modelData.remoteName
-                            color: root.foreground
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.body
-                            font.bold: true
-                            elide: Text.ElideRight
-                          }
-
-                          Rectangle {
-                            implicitWidth: typeTag.implicitWidth + Style.space(10)
-                            implicitHeight: typeTag.implicitHeight + Style.space(4)
-                            radius: Style.space(3)
-                            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
-                            border.width: 1
-                            border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
-                            Layout.alignment: Qt.AlignVCenter
-
-                            Text {
-                              id: typeTag
-                              anchors.centerIn: parent
-                              textFormat: Text.PlainText
-                              text: Model.cloudProviderLabel(modelData.type).toUpperCase()
-                              color: root.dim
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.captionSmall || Style.space(9)
-                              font.bold: true
-                            }
-                          }
-
-                          Rectangle {
-                            visible: st.statusText !== ""
-                            implicitWidth: stTag.implicitWidth + Style.space(10)
-                            implicitHeight: stTag.implicitHeight + Style.space(4)
-                            radius: Style.space(3)
-                            color: st.lastResult === "error"
-                              ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.15)
-                              : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
-                            border.width: 1
-                            border.color: st.lastResult === "error"
-                              ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.3)
-                              : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
-                            Layout.alignment: Qt.AlignVCenter
-
-                            Text {
-                              id: stTag
-                              anchors.centerIn: parent
-                              textFormat: Text.PlainText
-                              text: st.statusText
-                              color: st.lastResult === "error" ? root.urgent : root.foreground
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.captionSmall || Style.space(9)
-                            }
-                          }
-                        }
-
-                        // Row 2: Account identity / path
-                        Text {
-                          textFormat: Text.PlainText
-                          Layout.fillWidth: true
-                          text: st.accountEmail !== ""
-                            ? (st.accountName !== "" ? st.accountEmail + " (" + st.accountName + ")" : st.accountEmail)
-                            : (st.authenticated ? Model.shortHomePath(modelData.folderPath, drives.homePath) : "Not configured in rclone")
-                          color: st.accountEmail !== "" ? root.foreground : root.dim
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
-                          font.bold: st.accountEmail !== ""
-                          elide: Text.ElideRight
-                        }
-
-                        // Row 3: Folders & Disk Usage
-                        Text {
-                          textFormat: Text.PlainText
-                          Layout.fillWidth: true
-                          text: Model.cloudSummary(st)
-                          color: root.dim
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
-                          elide: Text.ElideRight
-                        }
-                      }
-
-                      // Quick Actions Row
-                      Row {
-                        spacing: Style.space(2)
-                        Layout.alignment: Qt.AlignVCenter
-
-                        PanelActionButton {
-                          iconText: Model.GLYPH_REFRESH
-                          tooltipText: "Sync now"
-                          foreground: root.foreground
-                          fontFamily: root.fontFamily
-                          onClicked: drives.syncCloudNow(modelData.remoteName, false)
-                        }
-
-                        PanelActionButton {
-                          iconText: Model.GLYPH_FOLDER
-                          tooltipText: st.browseMounted ? "Open browse drive in file manager" : "Open synced folder in file manager"
-                          foreground: root.foreground
-                          fontFamily: root.fontFamily
-                          onClicked: {
-                            if (st.browseMounted && modelData.browseMountPath) {
-                              drives.openCloudBrowse(modelData.browseMountPath)
-                            } else {
-                              drives.openCloudFolder(modelData.folderPath)
-                            }
-                          }
-                        }
-
-                        PanelActionButton {
-                          iconText: st.browseMounted ? Model.GLYPH_HEALTHY : Model.GLYPH_CLOUD
-                          tooltipText: st.browseMounted ? "Unmount browse folder" : "Mount browse folder"
-                          foreground: st.browseMounted ? (bar && "activeColor" in bar ? bar.activeColor : root.foreground) : root.dim
-                          fontFamily: root.fontFamily
-                          onClicked: drives.toggleCloudBrowse(modelData.remoteName)
-                        }
-                      }
-                    }
+                  CloudTile {
+                    required property var modelData
+                    width: cloudTiles.width
+                    account: modelData
+                    visible: root.filterQuery === ""
+                      || String(modelData.remoteName).toLowerCase().indexOf(root.filterQuery.toLowerCase()) !== -1
                   }
                 }
               }
@@ -2778,7 +2882,7 @@ Panel {
 
               // Network Share Cards
               Repeater {
-                model: drives.networkShares
+                model: drives.visibleNetworkShares
 
                 NetworkShareCard {
                   required property var modelData
@@ -2893,6 +2997,463 @@ Panel {
     }
   }
 
+  // One cloud account on a full-width row:
+  //
+  //   [icon] gdrive                              (● Ready to sync)
+  //          Google Drive · gameticharles@gmail.com
+  //   [███░░░░░░░░░░░░░░░░░░░░░░░]  334 GB of 5.0 TB
+  //   Synced 8m ago                          [sync] [open] [browse]
+  component CloudTile: Rectangle {
+    id: tile
+    property var account: null
+    readonly property string remote: account ? account.remoteName : ""
+    readonly property var st: drives.cloudStatuses[remote] || Model.defaultCloudStatus(remote)
+    readonly property string conflict: drives.cloudConflicts[remote] || ""
+    readonly property string tone: Model.cloudTone(st, conflict)
+    readonly property color toneColor: root.toneColor(tone)
+    readonly property real fraction: Model.cloudUsageFraction(st)
+    readonly property bool overQuota: Model.cloudOverQuota(st)
+    readonly property bool hot: overQuota || fraction >= drives.fullWarnPct / 100
+    readonly property string usage: {
+      if (!st.quotaKnown && !(st.usedBytes > 0)) return ""
+      var t = Model.cloudUsageText(st.usedBytes, st.quotaBytes, st.quotaKnown)
+      return overQuota ? t + " · over quota" : t
+    }
+    readonly property string identity: st.accountEmail !== ""
+      ? (st.accountName !== "" ? st.accountEmail + " · " + st.accountName : st.accountEmail)
+      : (st.authenticated ? Model.shortHomePath(account ? account.folderPath : "", drives.homePath)
+                          : (st.statusText === "Checking…" ? "Checking…" : "Not signed in"))
+
+    implicitHeight: tileLayout.implicitHeight + Style.space(18)
+    radius: Style.space(10)
+    color: tileMouse.containsMouse
+      ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+      : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.035)
+    border.width: 1
+    border.color: tone === "error" || tone === "warn"
+      ? Qt.rgba(tile.toneColor.r, tile.toneColor.g, tile.toneColor.b, 0.35)
+      : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.09)
+
+    MouseArea {
+      id: tileMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.openCloudAccount(tile.remote)
+    }
+
+    ColumnLayout {
+      id: tileLayout
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      anchors.margins: Style.space(9)
+      spacing: Style.space(6)
+
+      // Icon, name and identity; status pill on the right.
+      RowLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(8)
+
+        Rectangle {
+          implicitWidth: Style.space(32)
+          implicitHeight: Style.space(32)
+          radius: Style.space(6)
+          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.07)
+          border.width: 1
+          border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+          Layout.alignment: Qt.AlignVCenter
+
+          GoogleDriveIcon {
+            visible: !!(tile.account && tile.account.type === "drive")
+            anchors.centerIn: parent
+            iconSize: Style.font.iconLarge || Style.space(18)
+            color: root.foreground
+          }
+
+          Text {
+            visible: !(tile.account && tile.account.type === "drive")
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: Model.cloudProviderGlyph(tile.account ? tile.account.type : "")
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.icon
+          }
+        }
+
+        ColumnLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(1)
+
+          RowLayout {
+            Layout.fillWidth: true
+            spacing: Style.space(6)
+
+            Text {
+              textFormat: Text.PlainText
+              Layout.fillWidth: true
+              text: tile.remote
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              elide: Text.ElideRight
+            }
+
+            // Status pill: dot (pulses while syncing) and the word for it.
+            Rectangle {
+              Layout.alignment: Qt.AlignVCenter
+              implicitWidth: pillRow.implicitWidth + Style.space(12)
+              implicitHeight: pillRow.implicitHeight + Style.space(4)
+              radius: height / 2
+              color: Qt.rgba(tile.toneColor.r, tile.toneColor.g, tile.toneColor.b, 0.12)
+              border.width: 1
+              border.color: Qt.rgba(tile.toneColor.r, tile.toneColor.g, tile.toneColor.b, 0.3)
+
+              RowLayout {
+                id: pillRow
+                anchors.centerIn: parent
+                spacing: Style.space(4)
+
+                Rectangle {
+                  id: toneDot
+                  implicitWidth: Style.space(6)
+                  implicitHeight: Style.space(6)
+                  radius: width / 2
+                  color: tile.toneColor
+                  Layout.alignment: Qt.AlignVCenter
+
+                  SequentialAnimation on opacity {
+                    running: tile.tone === "busy"
+                    loops: Animation.Infinite
+                    onRunningChanged: if (!running) toneDot.opacity = 1
+                    NumberAnimation { to: 0.3; duration: 600 }
+                    NumberAnimation { to: 1; duration: 600 }
+                  }
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: tile.conflict !== "" ? "Shared folder" : tile.st.statusText
+                  color: tile.tone === "idle" ? root.dim : tile.toneColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.captionSmall || Style.space(9)
+                  font.bold: true
+                }
+              }
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            text: Model.cloudProviderLabel(tile.account ? tile.account.type : "") + " · " + tile.identity
+            color: tile.st.accountEmail !== "" ? root.foreground : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideMiddle
+          }
+        }
+      }
+
+      // Quota bar with the figures beside it.
+      RowLayout {
+        visible: tile.usage !== ""
+        Layout.fillWidth: true
+        spacing: Style.space(8)
+
+        Rectangle {
+          visible: tile.st.quotaKnown
+          Layout.fillWidth: true
+          Layout.alignment: Qt.AlignVCenter
+          implicitHeight: Math.max(3, Style.space(4))
+          radius: height / 2
+          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+          Rectangle {
+            width: Math.max(tile.fraction > 0 ? 2 : 0, parent.width * tile.fraction)
+            height: parent.height
+            radius: parent.radius
+            color: tile.hot ? root.urgent : root.foreground
+            opacity: tile.hot ? 1 : 0.6
+          }
+        }
+
+        Item { visible: !tile.st.quotaKnown; Layout.fillWidth: true }
+
+        Text {
+          textFormat: Text.PlainText
+          text: tile.usage
+          color: tile.overQuota ? root.urgent : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          Layout.alignment: Qt.AlignVCenter
+        }
+      }
+
+      // What it is doing or needs, with the quick actions on the right.
+      RowLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(6)
+
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          text: {
+            if (tile.conflict !== "") return tile.conflict + " — open to fix"
+            if (tile.st.browseConflict) return "Browse folder is mounted for " + tile.st.browseConflict
+            if (!tile.st.authenticated && tile.st.statusText !== "Checking…") {
+              return tile.st.remoteType === "" ? "No rclone remote by this name — open to set it up"
+                                              : "Signed out of rclone — open to sign in again"
+            }
+            if (tile.st.lastResult === "error" && tile.st.lastError) return tile.st.lastError
+            if (tile.st.syncing) return "Syncing now…"
+            var parts = [Model.cloudSummary(tile.st)]
+            if (tile.st.lastFinishedTs > 0) parts.push("synced " + Model.relativeTime(tile.st.lastFinishedTs).toLowerCase())
+            if (tile.st.browseMounted) parts.push("browsing")
+            return parts.join(" · ")
+          }
+          color: tile.tone === "error" || tile.tone === "warn" ? tile.toneColor : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+          Layout.alignment: Qt.AlignVCenter
+        }
+
+        Row {
+          spacing: Style.space(1)
+          Layout.alignment: Qt.AlignVCenter
+
+          PanelActionButton {
+            iconText: Model.GLYPH_REFRESH
+            tooltipText: tile.st.syncing ? "Syncing…" : "Sync now"
+            foreground: tile.st.syncing ? tile.toneColor : root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            size: Style.space(24)
+            enabled: !tile.st.syncing && tile.st.authenticated
+            onClicked: drives.syncCloudNow(tile.remote, false)
+          }
+
+          PanelActionButton {
+            iconText: Model.GLYPH_FOLDER
+            tooltipText: tile.st.browseMounted ? "Open the browse folder" : "Open the synced folder"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            size: Style.space(24)
+            onClicked: {
+              if (tile.st.browseMounted && tile.account.browseMountPath) drives.openCloudBrowse(tile.account.browseMountPath)
+              else drives.openCloudFolder(tile.account.folderPath)
+            }
+          }
+
+          PanelActionButton {
+            iconText: tile.st.browseMounted ? Model.GLYPH_HEALTHY : Model.GLYPH_CLOUD
+            tooltipText: tile.st.browseMounted ? "Unmount the browse folder" : "Mount the browse folder"
+            foreground: tile.st.browseMounted ? (bar && "activeColor" in bar ? bar.activeColor : root.foreground) : root.dim
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            size: Style.space(24)
+            enabled: tile.conflict === "" && tile.st.authenticated
+            onClicked: drives.toggleCloudBrowse(tile.remote)
+          }
+        }
+      }
+    }
+  }
+
+  // Label/value grid for drive and volume details. Every value is click-to-copy,
+  // since a UUID or serial is far more often pasted somewhere than read.
+  // Rows arrive from Model.deviceInfoRows / volumeInfoRows already plain()ed.
+  component InfoGrid: ColumnLayout {
+    id: infoGrid
+    property var rows: []
+    property string heading: ""
+    spacing: Style.space(3)
+
+    Text {
+      visible: infoGrid.heading !== ""
+      textFormat: Text.PlainText
+      text: infoGrid.heading
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      font.bold: true
+      Layout.bottomMargin: Style.space(2)
+    }
+
+    Repeater {
+      model: infoGrid.rows
+
+      RowLayout {
+        id: infoRow
+        required property var modelData
+        Layout.fillWidth: true
+        spacing: Style.space(10)
+
+        Text {
+          textFormat: Text.PlainText
+          text: infoRow.modelData[0]
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          Layout.preferredWidth: Style.space(78)
+          Layout.alignment: Qt.AlignTop
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          text: infoRow.modelData[1]
+          color: valueMouse.containsMouse
+            ? (bar && "activeColor" in bar ? bar.activeColor : root.foreground)
+            : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WrapAnywhere
+          Layout.fillWidth: true
+
+          MouseArea {
+            id: valueMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: drives.copyText(infoRow.modelData[0], infoRow.modelData[1])
+          }
+        }
+      }
+    }
+  }
+
+  // Built-in format form, shared by a single volume and a whole drive. The
+  // owner supplies the target's own rules (validation, confirmation token,
+  // warning) and decides what happens on commit; this only draws the fields.
+  component FormatForm: ColumnLayout {
+    id: formatForm
+    property string token: ""
+    property var check: null
+    property string warning: ""
+    readonly property string label: formLabelField.text
+    readonly property string typed: formConfirmField.text
+    readonly property bool confirmed: token !== "" && Model.normaliseLabel(typed) === token
+    readonly property bool ready: check !== null && check.ok && confirmed
+    readonly property int room: Model.labelRemaining(Model.formatTarget(root.formatType), label)
+    signal commit()
+    signal cancel()
+
+    spacing: Style.space(4)
+
+    function reset() {
+      formLabelField.text = ""
+      formConfirmField.text = ""
+      Qt.callLater(function() { formConfirmField.forceActiveFocus() })
+    }
+
+    onVisibleChanged: if (visible) reset()
+
+    Flow {
+      Layout.fillWidth: true
+      spacing: Style.space(8)
+
+      Repeater {
+        model: Model.formatTypes(drives.fsCapabilities)
+
+        Text {
+          id: formTypeChip
+          required property var modelData
+          textFormat: Text.PlainText
+          text: Model.formatFsType(formTypeChip.modelData)
+          color: root.formatType === formTypeChip.modelData ? root.foreground : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: root.formatType === formTypeChip.modelData
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.formatType = formTypeChip.modelData
+          }
+        }
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        text: root.formatQuick ? "· Quick" : "· Zero first"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.formatQuick = !root.formatQuick
+        }
+      }
+    }
+
+    RowLayout {
+      Layout.fillWidth: true
+      spacing: Style.space(6)
+
+      TextField {
+        id: formLabelField
+        Layout.fillWidth: true
+        foreground: root.foreground
+        verticalPadding: Style.space(2)
+        placeholderText: "Filesystem label"
+        Keys.onEscapePressed: formatForm.cancel()
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        text: formatForm.room
+        color: formatForm.room < 0 ? root.urgent : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        Layout.alignment: Qt.AlignVCenter
+      }
+    }
+
+    RowLayout {
+      Layout.fillWidth: true
+      spacing: Style.space(6)
+
+      TextField {
+        id: formConfirmField
+        Layout.fillWidth: true
+        foreground: root.foreground
+        verticalPadding: Style.space(2)
+        placeholderText: formatForm.token !== "" ? "Type " + formatForm.token + " to erase" : ""
+        onAccepted: if (formatForm.ready) formatForm.commit()
+        Keys.onEscapePressed: formatForm.cancel()
+      }
+
+      PanelActionButton {
+        iconText: Model.GLYPH_ERASER
+        tooltipText: "Erase"
+        foreground: formatForm.ready ? root.urgent : root.dim
+        hoverColor: root.urgent
+        fontFamily: root.fontFamily
+        enabled: !drives.busy && formatForm.ready
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: formatForm.commit()
+      }
+    }
+
+    Text {
+      textFormat: Text.PlainText
+      Layout.fillWidth: true
+      text: formatForm.check && !formatForm.check.ok
+        ? formatForm.check.reason
+        : formatForm.warning + " Esc cancels."
+      color: root.urgent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+  }
+
   // ------------------------------------------------------------ StorageCard Component
   component StorageCard: Rectangle {
     id: storageCardRoot
@@ -2900,7 +3461,17 @@ Panel {
     property int deviceIndex: 0
 
     readonly property bool isExpanded: root.expandedDevicePath === (device ? device.path : "")
+      || formattingDrive
     readonly property bool isSystem: device && device.isSystem === true
+    readonly property bool ejectable: Model.isEjectable(device)
+    readonly property bool anyMounted: device && device.mountedCount > 0
+    readonly property var link: device ? drives.linkFor(device) : ({})
+    readonly property bool formattingDrive: device && root.formattingDevicePath === device.path
+    readonly property var driveFormatCheck: formattingDrive
+      ? Model.validateDriveFormat(drives.fsCapabilities, device,
+                                  { path: device.path, fstype: root.formatType,
+                                    label: driveFormatForm.label, quick: root.formatQuick })
+      : null
 
     readonly property bool selected: root.cursorActive && root.currentRow
       && root.currentRow.kind === "device" && root.currentRow.device === deviceIndex
@@ -3075,13 +3646,18 @@ Panel {
                 text: {
                   if (!storageCardRoot.device) return ""
                   var parts = []
+                  if (storageCardRoot.device.kindLabel) parts.push(storageCardRoot.device.kindLabel)
                   if (storageCardRoot.device.sizeText !== "") parts.push(storageCardRoot.device.sizeText)
-                  if (storageCardRoot.device.tran !== "") parts.push(storageCardRoot.device.tran.toUpperCase())
+                  var conn = Model.connectionShort(storageCardRoot.device, storageCardRoot.link)
+                  if (conn !== "") parts.push(conn)
                   if (storageCardRoot.device.volumes.length === 0 && !storageCardRoot.isSystem) parts.push("No media inserted")
                   if (storageCardRoot.activity !== "") parts.push(storageCardRoot.activity)
                   return parts.join(" · ")
                 }
-                color: storageCardRoot.activity !== "" ? root.urgent : root.dim
+                // Activity on a drive that cannot be pulled is information,
+                // not a warning: the system disk writes all the time.
+                color: storageCardRoot.activity !== "" && storageCardRoot.ejectable ? root.urgent : root.dim
+                Layout.fillWidth: true
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
@@ -3173,9 +3749,22 @@ Panel {
               onClicked: root.toggleDeviceTools(storageCardRoot.device.path)
             }
 
+            // An internal data disk is unmounted, not ejected: it is not
+            // coming out, and powering it off is not what anyone asked for.
+            PanelActionButton {
+              visible: !storageCardRoot.isSystem && !storageCardRoot.ejectable && storageCardRoot.anyMounted
+              iconText: Model.GLYPH_UNMOUNT
+              tooltipText: "Unmount every volume on this drive"
+              foreground: root.foreground
+              hoverColor: root.urgent
+              fontFamily: root.fontFamily
+              enabled: !drives.busy
+              onClicked: drives.unmountAll(storageCardRoot.device)
+            }
+
             // Quick Eject Button
             PanelActionButton {
-              visible: !storageCardRoot.isSystem
+              visible: storageCardRoot.ejectable
               iconText: Model.GLYPH_EJECT
               tooltipText: storageCardRoot.ejectPending
                 ? "Waiting for writes to finish — click to cancel"
@@ -3429,9 +4018,19 @@ Panel {
               onClicked: root.beginRename(storageCardRoot.device)
             }
 
+            // Unmount every volume without powering off — the step before a
+            // whole-drive wipe, and the way to free an internal data disk.
+            ActionChip {
+              visible: !storageCardRoot.isSystem && storageCardRoot.anyMounted
+              iconText: Model.GLYPH_UNMOUNT
+              label: "Unmount All"
+              tooltipText: "Unmount every volume on this drive, without powering it off"
+              onClicked: drives.unmountAll(storageCardRoot.device)
+            }
+
             // Flash Bootable ISO chip (only for removable / non-system drives)
             ActionChip {
-              visible: !storageCardRoot.isSystem
+              visible: storageCardRoot.ejectable && drives.hasTool("omarchy-drive-flash")
               iconText: Model.GLYPH_SPEEDOMETER
               label: "Flash Bootable ISO"
               tooltipText: "Write a bootable operating system ISO image to this USB drive"
@@ -3440,21 +4039,45 @@ Panel {
 
             // Recovery & Diagnostics chip (available for all drives)
             ActionChip {
+              visible: drives.hasTool("omarchy-drive-recover")
               iconText: Model.GLYPH_STETHOSCOPE
               label: "Recover & Inspect"
               tooltipText: "Launch TUI storage diagnostics, S.M.A.R.T. queries & recovery tool"
               onClicked: root.runRecovery(storageCardRoot.device.path)
             }
 
-            // Format entire drive chip (strictly not allowed on system drives)
+            // Whole-drive wipe, built in over udisks: a fresh GPT table and
+            // one partition. Removable, non-system drives only.
             ActionChip {
-              visible: !storageCardRoot.isSystem
+              visible: storageCardRoot.ejectable && !storageCardRoot.formattingDrive
               iconText: Model.GLYPH_ERASER
               label: "Format Entire Drive"
               danger: true
-              tooltipText: "Erase all partitions and create a clean partition table"
-              onClicked: root.launchFormat(storageCardRoot.device.path)
+              tooltipText: "Erase every partition and create one new volume filling the drive"
+              onClicked: root.beginDriveFormat(storageCardRoot.device)
             }
+          }
+
+          FormatForm {
+            id: driveFormatForm
+            visible: storageCardRoot.formattingDrive
+            Layout.fillWidth: true
+            token: storageCardRoot.device ? storageCardRoot.device.name : ""
+            check: storageCardRoot.driveFormatCheck
+            warning: Model.driveFormatWarning(storageCardRoot.device)
+            onCancel: root.finishDriveFormat()
+            onCommit: {
+              if (!Model.driveFormatConfirmed(storageCardRoot.device, driveFormatForm.typed)) return
+              drives.formatDrive(storageCardRoot.device, root.formatType, driveFormatForm.label, root.formatQuick)
+              root.finishDriveFormat()
+            }
+          }
+
+          InfoGrid {
+            Layout.fillWidth: true
+            Layout.topMargin: Style.space(4)
+            heading: "DRIVE INFO"
+            rows: storageCardRoot.device ? drives.deviceInfoFor(storageCardRoot.device) : []
           }
         }
       }
@@ -3504,6 +4127,12 @@ Panel {
       && (volume.mounted || Model.isMountable(volume) || (volume.encrypted && !volume.unlocked))
     readonly property bool working: volume && drives.busyPath === volume.fsPath
     readonly property real trashBytes: volume ? drives.trashSizeFor(volume) : 0
+    readonly property var device: volume ? drives.deviceOfVolume(volume) : null
+    // Read-only comes from /proc/mounts, not the lsblk tree — the volume
+    // object never carries it, which is why this pill used to never show.
+    readonly property bool readOnly: volume ? drives.readOnlyFor(volume) : false
+    readonly property bool nearlyFull: volume ? Model.nearlyFull(volume, drives.fullWarnPct) : false
+    readonly property bool isNtfs: volume && (volume.fstype === "ntfs" || volume.fstype === "ntfs3")
 
     readonly property bool renamingLabel: volume && root.renamingLabelPath === volume.fsPath
     readonly property bool unlocking: volume && root.unlockingPath === volume.fsPath
@@ -3622,7 +4251,7 @@ Panel {
 
             // Read-Only Pill
             Rectangle {
-              visible: !!(volumeItemRoot.volume && volumeItemRoot.volume.mounted && volumeItemRoot.volume.readOnly)
+              visible: !!(volumeItemRoot.volume && volumeItemRoot.volume.mounted && volumeItemRoot.readOnly)
               implicitWidth: roPillText.implicitWidth + Style.space(8)
               implicitHeight: roPillText.implicitHeight + Style.space(2)
               radius: Style.space(3)
@@ -3709,8 +4338,7 @@ Panel {
                 ? Model.formatBytes(volumeItemRoot.volume.fssize) + " · Unmounted"
                 : "Unmounted"
             }
-            color: volumeItemRoot.volume && volumeItemRoot.volume.mounted && Model.usedFraction(volumeItemRoot.volume) > 0.9
-              ? root.urgent : root.dim
+            color: volumeItemRoot.nearlyFull ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
@@ -3729,8 +4357,8 @@ Panel {
               width: Math.max(parent.width > 0 && fraction > 0 ? 2 : 0, parent.width * fraction)
               height: parent.height
               radius: parent.radius
-              color: fraction > 0.9 ? root.urgent : root.foreground
-              opacity: fraction > 0.9 ? 1.0 : 0.65
+              color: volumeItemRoot.nearlyFull ? root.urgent : root.foreground
+              opacity: volumeItemRoot.nearlyFull ? 1.0 : 0.65
 
               Behavior on width {
                 NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
@@ -3751,28 +4379,32 @@ Panel {
               && volumeItemRoot.volume.mountpoint !== "[SWAP]"
               && (volumeItemRoot.volume.mounted
                   || (!volumeItemRoot.volume.isSystem && (Model.isMountable(volumeItemRoot.volume) || volumeItemRoot.volume.encrypted)))
+            // The NTFS repair hand-off only applies where the helper exists;
+            // without it the button mounts, and a failed mount is answered by
+            // the built-in check → repair path in the drawer.
+            readonly property bool ntfsRepair: volumeItemRoot.isNtfs && !volumeItemRoot.volume.mounted
+              && drives.hasTool("omarchy-ntfs-fix")
             iconText: {
               if (!volumeItemRoot.volume) return ""
               if (volumeItemRoot.volume.mounted) return Model.GLYPH_FOLDER
               if (volumeItemRoot.volume.encrypted && !volumeItemRoot.volume.unlocked) return Model.GLYPH_LOCKED
-              if ((volumeItemRoot.volume.fstype === "ntfs" || volumeItemRoot.volume.fstype === "ntfs3") && !volumeItemRoot.volume.mounted) return Model.GLYPH_WRENCH
+              if (ntfsRepair) return Model.GLYPH_WRENCH
               return Model.GLYPH_MOUNT
             }
             tooltipText: {
               if (!volumeItemRoot.volume) return ""
               if (volumeItemRoot.volume.mounted) return "Open in file manager"
               if (Model.canUnlock(volumeItemRoot.volume)) return "Unlock encrypted container"
-              if ((volumeItemRoot.volume.fstype === "ntfs" || volumeItemRoot.volume.fstype === "ntfs3") && !volumeItemRoot.volume.mounted) return "Repair & Mount NTFS"
+              if (ntfsRepair) return "Repair & Mount NTFS"
               return "Mount volume"
             }
-            foreground: volumeItemRoot.volume && (volumeItemRoot.volume.fstype === "ntfs" || volumeItemRoot.volume.fstype === "ntfs3") && !volumeItemRoot.volume.mounted
-              ? root.urgent : root.foreground
+            foreground: ntfsRepair ? root.urgent : root.foreground
             fontFamily: root.fontFamily
             enabled: !drives.busy
             onClicked: {
               if (volumeItemRoot.volume.mounted) drives.openVolume(volumeItemRoot.volume)
               else if (Model.canUnlock(volumeItemRoot.volume)) root.beginUnlock(volumeItemRoot.volume)
-              else if ((volumeItemRoot.volume.fstype === "ntfs" || volumeItemRoot.volume.fstype === "ntfs3") && !volumeItemRoot.volume.mounted) root.runNtfsFix(volumeItemRoot.volume.fsPath)
+              else if (ntfsRepair) root.runNtfsFix(volumeItemRoot.volume.fsPath)
               else drives.toggleMount(volumeItemRoot.volume, root.openOnMount)
             }
           }
@@ -3817,7 +4449,7 @@ Panel {
 
           // 1. Disk Usage (dua)
           ActionChip {
-            visible: volumeItemRoot.volume && volumeItemRoot.volume.mounted
+            visible: volumeItemRoot.volume && volumeItemRoot.volume.mounted && drives.hasTool("dua")
             iconText: Model.GLYPH_PIE
             label: "Disk Usage"
             tooltipText: "Analyze disk space with dua in floating terminal"
@@ -3835,7 +4467,7 @@ Panel {
 
           // 3. Speed Test
           ActionChip {
-            visible: !!(volumeItemRoot.volume && volumeItemRoot.volume.mounted)
+            visible: !!(volumeItemRoot.volume && volumeItemRoot.volume.mounted) && drives.hasTool("omarchy-disk-speedtest")
             iconText: Model.GLYPH_SPEEDOMETER
             label: "Speed Test"
             tooltipText: "Run live read/write performance benchmark with omarchy-disk-speedtest"
@@ -3845,15 +4477,18 @@ Panel {
           // 4. Btrfs Scrub
           ActionChip {
             visible: !!(volumeItemRoot.volume && volumeItemRoot.volume.mounted && volumeItemRoot.volume.fstype === "btrfs")
+              && drives.hasTool("omarchy-drive-scrub")
             iconText: Model.GLYPH_SHIELD
             label: "Btrfs Scrub"
             tooltipText: "Verify checksums and repair corrupted blocks via btrfs scrub"
             onClicked: root.runBtrfsScrub(volumeItemRoot.volume.mountpoint)
           }
 
-          // 5. Trim SSD
+          // 5. Trim SSD — only where the drive actually accepts discards; a
+          // thumb drive with DISC-MAX 0 would just print an error.
           ActionChip {
             visible: !!(volumeItemRoot.volume && volumeItemRoot.volume.mounted)
+              && drives.supportsTrim(volumeItemRoot.device) && drives.hasTool("omarchy-drive-trim")
             iconText: Model.GLYPH_WRENCH
             label: "Trim SSD"
             tooltipText: "Reclaim unused storage blocks via fstrim"
@@ -3903,7 +4538,7 @@ Panel {
 
           // 10. NTFS Auto-Fix
           ActionChip {
-            visible: volumeItemRoot.volume && (volumeItemRoot.volume.fstype === "ntfs" || volumeItemRoot.volume.fstype === "ntfs3")
+            visible: volumeItemRoot.isNtfs && drives.hasTool("omarchy-ntfs-fix")
             iconText: Model.GLYPH_WRENCH
             label: "NTFS Fix"
             danger: true
@@ -3913,21 +4548,25 @@ Panel {
 
           // 11. Partition Recovery
           ActionChip {
-            visible: !!(volumeItemRoot.volume && !volumeItemRoot.volume.isSystem)
+            visible: !!(volumeItemRoot.volume && !volumeItemRoot.volume.isSystem) && drives.hasTool("omarchy-drive-recover")
             iconText: Model.GLYPH_STETHOSCOPE
             label: "Recover"
             tooltipText: "Launch TUI partition recovery & deep diagnosis tool"
             onClicked: root.runRecovery(volumeItemRoot.volume.fsPath || volumeItemRoot.volume.path)
           }
 
-          // 12. Format Partition (Strictly forbidden on system volumes!)
+          // 12. Format Partition — the built-in udisks form, with the
+          // volume's kernel name typed out to confirm. Removable drives only.
+          // A mounted volume still shows the chip; clicking it says to
+          // unmount first rather than hiding the option.
           ActionChip {
-            visible: !volumeItemRoot.volume.isSystem
+            visible: !!(volumeItemRoot.volume && !volumeItemRoot.volume.isSystem
+              && Model.isEjectable(volumeItemRoot.device) && !volumeItemRoot.formatting)
             iconText: Model.GLYPH_ERASER
             label: "Format"
             danger: true
-            tooltipText: "Safely format partition with interactive wizard"
-            onClicked: root.launchFormat(volumeItemRoot.volume.fsPath || volumeItemRoot.volume.path)
+            tooltipText: "Erase this volume and create a new filesystem on it"
+            onClicked: root.beginFormat(volumeItemRoot.volume)
           }
 
           // 13. Empty Trash
@@ -4101,8 +4740,17 @@ Panel {
           }
         }
 
-        // Status & Instruction Hint
+        InfoGrid {
+          visible: !volumeItemRoot.unlocking && !volumeItemRoot.renamingLabel && !volumeItemRoot.formatting
+          Layout.fillWidth: true
+          heading: "DETAILS"
+          rows: volumeItemRoot.volume ? drives.volumeInfoFor(volumeItemRoot.volume) : []
+        }
+
+        // Status & Instruction Hint (only while an inline editor is open; the
+        // details grid above says everything the old one-line summary did)
         Text {
+          visible: volumeItemRoot.unlocking || volumeItemRoot.renamingLabel || volumeItemRoot.formatting
           textFormat: Text.PlainText
           Layout.fillWidth: true
           text: {
@@ -4371,6 +5019,7 @@ Panel {
               if (!netCardRoot.share || netCardRoot.share.sizeBytes <= 0) return ""
               var s = netCardRoot.share
               var pct = Math.round(s.usedFraction * 100)
+              if (s.overQuota) return s.usedText + " used of " + s.sizeText + " · over quota"
               return s.usedText + " used of " + s.sizeText + " (" + s.availText + " free, " + pct + "%)"
             }
             color: root.dim

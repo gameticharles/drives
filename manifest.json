@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "storage-drives",
   "name": "Storage Drives",
-  "version": "2.2.0",
+  "version": "2.5.0",
   "author": "Charles Gameti",
   "license": "MIT",
-  "description": "View and manage all storage drives on the machine, monitor stats, format, auto-repair NTFS, multi-cloud sync (Google Drive, Mega, OneDrive), and eject removable media safely.",
+  "description": "View and manage all storage drives (internal, external, and cloud) on the machine, monitor stats, format, auto-repair NTFS, multi-cloud sync (Google Drive, Mega, OneDrive), and eject removable media safely.",
   "kinds": [
     "bar-widget"
   ],
@@ -28,7 +28,11 @@
       "showSystemDrives": true,
       "fileManager": "",
       "refreshIntervalSec": 8,
-      "barLabel": "none"
+      "barLabel": "none",
+      "fullWarnPct": 90,
+      "thumbMaxGb": 256,
+      "healthAlerts": true,
+      "lowSpaceAlerts": true
     },
     "schema": [
       {
@@ -109,6 +113,40 @@
         "step": 1,
         "defaultValue": 8,
         "description": "How often free space is re-read while the panel is open. Drives are detected instantly through udev either way."
+      },
+      {
+        "key": "fullWarnPct",
+        "type": "integer",
+        "label": "Nearly full at (%)",
+        "min": 50,
+        "max": 100,
+        "step": 1,
+        "defaultValue": 90,
+        "description": "A volume's usage bar and free-space line turn the urgent colour at this fill level."
+      },
+      {
+        "key": "healthAlerts",
+        "type": "boolean",
+        "label": "Warn when a drive's health gets worse",
+        "defaultValue": true,
+        "description": "Health is read in the background when drives change and every six hours, and a drive reporting itself failing is announced at once."
+      },
+      {
+        "key": "lowSpaceAlerts",
+        "type": "boolean",
+        "label": "Warn when a drive is nearly full",
+        "defaultValue": true,
+        "description": "Notify once when any mounted volume, the system drive included, crosses the nearly-full level."
+      },
+      {
+        "key": "thumbMaxGb",
+        "type": "integer",
+        "label": "Thumb drive size limit (GB)",
+        "min": 8,
+        "max": 4096,
+        "step": 8,
+        "defaultValue": 256,
+        "description": "USB disks this size or smaller get the thumb-drive icon unless the model name says otherwise. Bigger ones show as external drives."
       }
     ]
   }

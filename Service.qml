@@ -53,11 +53,37 @@ Item {
       }
     }
     if (changed) tempHistory = history
+
+    // A drive whose own health verdict just got worse is told about at
+    // once, panel open or not. The first reading counts: a disk that is
+    // already failing when the shell starts is exactly the one to mention.
+    var verdicts = {}
+    for (var i = 0; i < devices.length; i++) {
+      var device = devices[i]
+      var verdict = Model.smartVerdict(smart[device.path])
+      verdicts[device.path] = verdict
+      // A standing warning (one reallocated sector, years old) is not
+      // repeated at every login: the first read of a session alerts only on
+      // "failing". Getting worse after that alerts at either level.
+      var seen = _healthVerdicts[device.path] !== undefined
+      if (healthAlertsEnabled && Model.healthWorsened(_healthVerdicts[device.path], verdict)
+          && (seen || verdict === "failing")) {
+        notify(verdict === "failing" ? device.title + " reports itself failing" : device.title + " has a health warning",
+               Model.smartHint(smart[device.path]) + (verdict === "failing" ? ". Back up what is on it now." : ""),
+               Model.GLYPH_ALERT, verdict === "failing" ? "critical" : "normal")
+      }
+    }
+    _healthVerdicts = verdicts
   }
 
-  // Network and cloud storage (NFS, CIFS/Samba, SSHFS, Rclone, DAVFS)
+  property var _healthVerdicts: ({})
+
+  // Network and cloud storage (NFS, CIFS/Samba, SSHFS, Rclone, DAVFS). The
+  // visible list leaves out the browse mounts of connected cloud accounts,
+  // which their own cards already show.
   property var networkShares: []
-  readonly property int networkCount: networkShares.length
+  readonly property var visibleNetworkShares: Model.visibleNetworkShares(networkShares, cloudAccounts, homePath)
+  readonly property int networkCount: visibleNetworkShares.length
 
   // Cloud & rclone accounts (Google Drive, Mega, OneDrive, etc.)
   readonly property string homePath: Quickshell.env("HOME") || ""
@@ -65,6 +91,9 @@ Item {
   property var cloudStore: ({ version: 1, accounts: [] })
   readonly property var cloudAccounts: (cloudStore && cloudStore.accounts) ? cloudStore.accounts : []
   readonly property int cloudAccountCount: cloudAccounts.length
+  // remoteName -> why its paths collide with another account's, for accounts
+  // saved before the add form checked.
+  readonly property var cloudConflicts: Model.cloudPathConflicts(cloudAccounts, homePath)
 
   property bool rcloneInstalled: false
   property string rcloneVersion: ""
@@ -102,9 +131,12 @@ Item {
     return decodeURIComponent(value)
   }
 
-  // S.M.A.R.T. and temperature telemetry gating:
-  // When telemetryActive is false (default), background S.M.A.R.T. querying halts completely.
-  // Polling only occurs when at least one drive's telemetry row is explicitly shown.
+  // S.M.A.R.T. reading has two speeds. In the background, health is read once
+  // whenever the set of attached drives changes and every six hours — enough
+  // to notice a drive going bad, never continuous. The minute-by-minute
+  // temperature polling only runs while a drive's telemetry row is open.
+  // (Before, the background read was gated behind the open row too, so a
+  // failing disk was never noticed unless somebody went looking.)
   property bool telemetryActive: false
   readonly property bool smartRefreshing: smartProcess.running
 
@@ -194,22 +226,65 @@ Item {
     return total
   }
 
+  // The drives someone can unplug. Everything that says "do not remove" or
+  // holds an eject back looks only at these: the disk the system runs from is
+  // written to every few seconds, and counting it made the bar icon flash
+  // urgent for journald and held eject-all back indefinitely.
+  readonly property var ejectableDevices: Model.ejectableDevices(devices)
+
   // True while any attached drive still has I/O in flight or is running its
   // connect hook — the state in which pulling the drive is what loses data.
   readonly property bool anyBusy: {
-    for (var i = 0; i < devices.length; i++) {
-      if (isDeviceBusy(devices[i])) return true
+    for (var i = 0; i < ejectableDevices.length; i++) {
+      if (isDeviceBusy(ejectableDevices[i])) return true
     }
     return false
   }
 
   readonly property real totalWriteRate: {
     var total = 0
-    for (var i = 0; i < devices.length; i++) {
-      var entry = activity[devices[i].name]
+    for (var i = 0; i < ejectableDevices.length; i++) {
+      var entry = activity[ejectableDevices[i].name]
       if (entry) total += entry.writeRate
     }
     return total
+  }
+
+  // Data the kernel is still holding for some disk, from /proc/meminfo. It is
+  // system-wide — the kernel does not split it per device without root — so it
+  // is a hint shown beside removable drives, never a verdict on one of them.
+  property real dirtyBytes: 0
+
+  // How each drive is attached, read from sysfs: USB link speed, PCIe link,
+  // SATA link. Keyed by kernel name; re-read only when the set of drives
+  // changes, since none of it moves while a drive stays plugged in.
+  property var links: ({})
+  property string _linkSignature: ""
+
+  // Optional terminal helpers that are installed on this machine. A button
+  // that hands off to one is hidden when it is missing, rather than opening a
+  // terminal that says "command not found".
+  property var tools: ({})
+
+  function hasTool(name) {
+    return tools[name] === true
+  }
+
+  function linkFor(device) {
+    if (!device) return ({})
+    return links[device.name] || ({})
+  }
+
+  function deviceInfoFor(device) {
+    return Model.deviceInfoRows(device, linkFor(device))
+  }
+
+  function volumeInfoFor(volume) {
+    return Model.volumeInfoRows(volume, readOnlyFor(volume))
+  }
+
+  function supportsTrim(device) {
+    return !!(device && device.discardMax !== null && device.discardMax > 0)
   }
 
   readonly property bool notificationsEnabled: setting("notifications", true) === true
@@ -220,14 +295,44 @@ Item {
   property bool showSystemDrives: setting("showSystemDrives", true) === true
   onShowSystemDrivesChanged: refresh()
 
+  readonly property real thumbMaxBytes: intSetting("thumbMaxGb", 256, 1, 65536) * 1024 * 1024 * 1024
+  onThumbMaxBytesChanged: refresh()
+  readonly property int fullWarnPct: intSetting("fullWarnPct", 90, 50, 100)
+  readonly property bool healthAlertsEnabled: setting("healthAlerts", true) === true
+  readonly property bool lowSpaceAlertsEnabled: setting("lowSpaceAlerts", true) === true
+
+  // Volumes already told about for being nearly full; see Model.spaceAlerts.
+  property var _spaceAlerted: ({})
+
+  function checkSpace() {
+    var step = Model.spaceAlerts(devices, _spaceAlerted, fullWarnPct)
+    _spaceAlerted = step.alerted
+    if (!lowSpaceAlertsEnabled) return
+    for (var i = 0; i < step.alerts.length; i++) {
+      notify("Running out of space", Model.spaceAlertText(step.alerts[i]), Model.GLYPH_ALERT, "normal")
+    }
+  }
+
   function setShowSystemDrives(value) {
     showSystemDrives = value
   }
 
+  // A volume Windows left hibernated or dirty refuses to mount read-write. The
+  // fix needs root, and a detached process has no terminal to ask for a
+  // password in — so it used to fail silently here. Mount it if it will mount;
+  // if not, say so, and leave the repair to a click that opens a terminal.
+  readonly property string ntfsMountScript: [
+    'set -u',
+    'udisksctl mount --no-user-interaction -b "$1" >/dev/null 2>&1 && exit 0',
+    '[ "$2" = 1 ] || exit 0',
+    'omarchy-notification-send -g "$3" "NTFS volume needs a repair" ' +
+      '"$4 did not mount — Windows may have left it hibernated or dirty. Open Storage Drives to fix it." || true'
+  ].join("\n")
+
   function autoMountNtfs(volume) {
     if (!volume || volume.mounted) return
-    var cmd = "udisksctl mount -b " + quote(volume.fsPath) + " 2>/dev/null || omarchy-ntfs-fix " + quote(volume.fsPath)
-    Quickshell.execDetached(["bash", "-c", cmd])
+    Quickshell.execDetached(["bash", "-c", ntfsMountScript, "storage-drives", volume.fsPath,
+                             notificationsEnabled ? "1" : "0", Model.GLYPH_ALERT, Model.plain(volume.title)])
   }
 
   property string _successMessage: ""
@@ -319,14 +424,16 @@ Item {
   function rescan() {
     forgetCapabilities()
     _smartSignature = ""
+    _linkSignature = ""
     refresh()
     refreshPortables()
+    probeTools()
   }
 
   function applySnapshot(raw) {
     var next = []
     try {
-      next = Model.parse(raw, root.showSystemDrives)
+      next = Model.parse(raw, root.showSystemDrives, root.thumbMaxBytes)
     } catch (e) {
       lastError = "Could not read the block device list"
       refreshing = false
@@ -348,7 +455,9 @@ Item {
 
     if (watchClosely) probeTrash()
     probeCapabilities()
-    if (telemetryActive) probeSmart()
+    probeLinks()
+    probeSmart()
+    checkSpace()
     updateSuspendTargets()
 
     // A mount requested with "open after mounting" only knows where the
@@ -418,9 +527,15 @@ Item {
 
   // ------------------------------------------------------------- activity
 
+  // The meminfo lines ride along on the same process: one fork a second
+  // rather than two, and parseBlockStats skips anything that is not under a
+  // stat header.
+  readonly property string statsScript:
+    'head -v -n 1 -- "$@" 2>/dev/null; grep -E "^(Dirty|Writeback):" /proc/meminfo'
+
   function sampleActivity() {
     if (statsProcess.running || devices.length === 0) return
-    var command = ["head", "-v", "-n", "1"]
+    var command = ["bash", "-c", statsScript, "storage-drives"]
     for (var i = 0; i < devices.length; i++) {
       command.push("/sys/block/" + devices[i].name + "/stat")
     }
@@ -432,6 +547,7 @@ Item {
     var built = Model.buildActivity(_statSamples, Model.parseBlockStats(raw), Date.now())
     activity = built.activity
     _statSamples = built.samples
+    dirtyBytes = Model.parseDirtyBytes(raw)
 
     // Rebuilt from the live device list, so a drive that has gone takes its
     // tally with it rather than lingering as a name nobody looks up.
@@ -474,7 +590,7 @@ Item {
 
   function pendingEjectTargets() {
     if (pendingEjectPath === "") return []
-    if (pendingEjectPath === "*") return devices
+    if (pendingEjectPath === "*") return ejectableDevices
     var device = deviceByPath(pendingEjectPath)
     return device ? [device] : []
   }
@@ -666,14 +782,14 @@ Item {
   }
 
   function ejectAll() {
-    if (busy || devices.length === 0) return
+    if (busy || ejectableDevices.length === 0) return
     if (anyBusy) {
       pendingEjectPath = "*"
       _quietTicks = 0
       actionStatus = "Waiting for writes to finish…"
       return
     }
-    runEject(devices)
+    runEject(ejectableDevices)
   }
 
   // Unmount everything, re-lock anything that was unlocked, then cut power.
@@ -685,12 +801,17 @@ Item {
     if (!list || list.length === 0 || busy) return
     var script = "set -e\n"
     var titles = []
+    var internalTitles = []
     var ejectCount = 0
     for (var d = 0; d < list.length; d++) {
       var device = list[d]
       if (device.isSystem) continue
       ejectCount++
-      titles.push(device.title)
+      // An internal data disk is unmounted, never powered off: it is not
+      // coming out of the machine, and spinning it down behind the kernel's
+      // back is not what "unmount everything" asked for.
+      if (device.removable) titles.push(device.title)
+      else internalTitles.push(device.title)
       for (var v = 0; v < device.volumes.length; v++) {
         var volume = device.volumes[v]
         if (volume.isSystem) continue
@@ -703,6 +824,7 @@ Item {
         if (volume.mounted) script += "udisksctl unmount --no-user-interaction -b " + quote(volume.fsPath) + "\n"
         if (volume.encrypted && volume.unlocked) script += "udisksctl lock --no-user-interaction -b " + quote(volume.path) + "\n"
       }
+      if (!device.removable) continue
       script += "udisksctl power-off --no-user-interaction -b " + quote(device.path) + " || true\n"
 
       // Remember that this one is meant to disappear, so its removal is not
@@ -712,8 +834,28 @@ Item {
       _expectedRemovals = expected
     }
     if (ejectCount === 0) return
-    runAction(["bash", "-c", script], list.length === 1 ? list[0].path : "*", "eject",
-              "Safe to remove " + titles.join(", "))
+    var message = titles.length > 0
+      ? "Safe to remove " + titles.join(", ")
+      : "Unmounted " + internalTitles.join(", ")
+    runAction(["bash", "-c", script], list.length === 1 ? list[0].path : "*",
+              titles.length > 0 ? "eject" : "unmount", message)
+  }
+
+  // Every mounted volume on one drive, without powering it off: what wiping
+  // the whole drive asks for first, and what an internal data disk's eject
+  // button means.
+  function unmountAll(device) {
+    if (!device || device.isSystem || busy) return
+    var script = "set -e\n"
+    var any = false
+    for (var v = 0; v < device.volumes.length; v++) {
+      var volume = device.volumes[v]
+      if (volume.isSystem || !volume.mounted) continue
+      script += "udisksctl unmount --no-user-interaction -b " + quote(volume.fsPath) + "\n"
+      any = true
+    }
+    if (!any) return
+    runAction(["bash", "-c", script], device.path, "unmount", "Unmounted every volume on " + device.title)
   }
 
   function openVolume(volume) {
@@ -789,8 +931,77 @@ Item {
     cloudStoreWriter.running = true
   }
 
+  function cloudAccount(remoteName) {
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === remoteName) return cloudAccounts[i]
+    }
+    return null
+  }
+
+  // Saves fields onto an existing account and nothing else. Changing the sync
+  // interval used to go through addCloudAccount, which also re-enabled the
+  // browse mount every time.
+  function updateCloudAccount(remoteName, fields) {
+    var acc = cloudAccount(remoteName)
+    if (!acc) return
+    saveCloudStore(Model.withCloudAccount(cloudStore, Object.assign({}, acc, fields)))
+  }
+
+  function setCloudInterval(remoteName, minutes) {
+    var st = cloudStatuses[remoteName]
+    updateCloudAccount(remoteName, { syncIntervalMin: minutes })
+    if (st && st.timerEnabled) setCloudAutoSync(remoteName, true, minutes)
+  }
+
+  // Moving the browse mount: unmount at the old path, save, mount at the new
+  // one. The unit files are rewritten on the way, since they name the path.
+  function changeCloudMount(remoteName, newPath) {
+    var acc = cloudAccount(remoteName)
+    if (!acc) return "unknown account"
+    var next = Object.assign({}, acc, { browseMountPath: String(newPath || "").trim() })
+    var check = Model.validateCloudAccount(cloudAccounts, next, homePath, remoteName)
+    if (!check.ok) {
+      noteCloud(check.reason)
+      return check.reason
+    }
+    var folderP = expandHome(acc.folderPath || "~/Cloud")
+    var st = cloudStatuses[remoteName]
+    var wasOn = !!(st && (st.browseEnabled || st.browseMounted))
+    noteCloud("Moving the browse folder…")
+    runCloudControl(["python3", cloudHelperPath, "browse", "--remote", remoteName, "--folder", folderP,
+                     "--mount", expandHome(acc.browseMountPath || "~/Cloud-Browse"), "--disable"], function() {
+      saveCloudStore(Model.withCloudAccount(cloudStore, next))
+      if (wasOn || acc.autoMount !== false) {
+        runCloudControl(["python3", cloudHelperPath, "browse", "--remote", remoteName, "--folder", folderP,
+                         "--mount", expandHome(next.browseMountPath), "--enable"], function() {
+          refreshCloudStatus(remoteName)
+        })
+      } else {
+        refreshCloudStatus(remoteName)
+      }
+    })
+    return "ok"
+  }
+
+  // The sync log, in a pager at its end — where the error that failed the
+  // last run is. rclone writes its reasons there rather than to stderr.
+  function openCloudLog(remoteName) {
+    var st = cloudStatuses[remoteName]
+    var path = st && st.logPath ? String(st.logPath) : ""
+    if (path === "") {
+      noteCloud("No sync log yet")
+      return
+    }
+    launchRcloneTerminal("less +G " + quote(path))
+  }
+
   function addCloudAccount(account) {
-    if (!account || !account.remoteName) return
+    if (!account || !account.remoteName) return "Enter the rclone remote name"
+    var check = Model.validateCloudAccount(cloudAccounts, account, homePath, "")
+    if (!check.ok) {
+      noteCloud(check.reason)
+      return check.reason
+    }
     var next = Model.withCloudAccount(cloudStore, account)
     saveCloudStore(next)
     refreshCloudStatus(account.remoteName)
@@ -803,6 +1014,7 @@ Item {
         refreshCloudStatus(account.remoteName)
       })
     }
+    return "ok"
   }
 
   function removeCloudAccount(remoteName, purgeRcloneRemote) {
@@ -838,8 +1050,22 @@ Item {
     }
   }
 
-  function refreshCloudStatus(remoteName) {
-    if (!remoteName || cloudStatusProcess.running) return
+  // One status process at a time, and every request after the first waits its
+  // turn. Returning early instead — what this did before — meant that looping
+  // over every account refreshed the first and silently dropped the rest, so a
+  // second Google Drive account never left "Checking…".
+  property var _cloudStatusQueue: []
+
+  // `first` puts the request at the head of the queue: the account someone
+  // just opened should not wait behind every other account's refresh.
+  function refreshCloudStatus(remoteName, first) {
+    if (!remoteName) return
+    if (cloudStatusProcess.running) {
+      if (cloudStatusProcess.targetRemote === remoteName) return
+      var rest = _cloudStatusQueue.filter(function(r) { return r !== remoteName })
+      _cloudStatusQueue = first === true ? [remoteName].concat(rest) : rest.concat([remoteName])
+      return
+    }
     var acc = null
     for (var i = 0; i < cloudAccounts.length; i++) {
       if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
@@ -1041,11 +1267,34 @@ Item {
     return false
   }
 
+  // Same reasoning as the status queue. Setting a new command on a process
+  // that is still running does not start it, but did overwrite the callback,
+  // so an auto-mount landing mid-sync lost the sync's follow-up refresh.
   property var _onCloudControlDone: null
+  property var _cloudControlQueue: []
+
   function runCloudControl(command, onDone) {
+    if (cloudControlProcess.running) {
+      _cloudControlQueue = _cloudControlQueue.concat([{ command: command, onDone: onDone || null }])
+      return
+    }
     _onCloudControlDone = onDone || null
     cloudControlProcess.command = command
     cloudControlProcess.running = true
+  }
+
+  function nextCloudControl() {
+    if (_cloudControlQueue.length === 0 || cloudControlProcess.running) return
+    var next = _cloudControlQueue[0]
+    _cloudControlQueue = _cloudControlQueue.slice(1)
+    runCloudControl(next.command, next.onDone)
+  }
+
+  function nextCloudStatus() {
+    if (_cloudStatusQueue.length === 0 || cloudStatusProcess.running) return
+    var next = _cloudStatusQueue[0]
+    _cloudStatusQueue = _cloudStatusQueue.slice(1)
+    refreshCloudStatus(next)
   }
 
   // ------------------------------------------------------- sleep guard
@@ -1714,6 +1963,185 @@ Item {
     return "ok"
   }
 
+  // Wiping the whole drive: a fresh GPT table, then one partition filling it,
+  // formatted in the same call. Both steps are udisks methods on the
+  // allow_active path, so this needs no root and no helper package — unlike
+  // the parted/wipefs route, which needs both.
+  //
+  // The partition table interface appears on the disk object a moment after
+  // Format("gpt") returns, once udisks has re-read the device, so the second
+  // call waits for it rather than racing it. It is called exactly once: a
+  // retry after a half-finished call would stack a second partition behind
+  // the first.
+  readonly property string formatDriveScript: [
+    'set -u',
+    'dev=$1',
+    'fstype=$2',
+    'label=$3',
+    'erase=$4',
+    'ptype=$5',
+    'raw=$(busctl call org.freedesktop.UDisks2 /org/freedesktop/UDisks2/Manager' +
+      ' org.freedesktop.UDisks2.Manager ResolveDevice "a{sv}a{sv}" 1 path s "$dev" 0) || exit 1',
+    'obj=/${raw#*/}',
+    'obj=${obj%?}',
+    'case "$obj" in',
+    '  /org/freedesktop/UDisks2/block_devices/*) ;;',
+    '  *) echo "udisks does not recognise $dev" >&2; exit 1 ;;',
+    'esac',
+    'if [ "$erase" = 1 ]; then',
+    '  busctl --timeout=86400 call org.freedesktop.UDisks2 "$obj"' +
+      ' org.freedesktop.UDisks2.Block Format "sa{sv}" gpt 1 erase s zero || exit 1',
+    'else',
+    '  busctl --timeout=600 call org.freedesktop.UDisks2 "$obj"' +
+      ' org.freedesktop.UDisks2.Block Format "sa{sv}" gpt 0 || exit 1',
+    'fi',
+    'tries=0',
+    'until busctl get-property org.freedesktop.UDisks2 "$obj" org.freedesktop.UDisks2.PartitionTable Type >/dev/null 2>&1; do',
+    '  tries=$((tries + 1))',
+    '  if [ "$tries" -ge 40 ]; then echo "udisks never saw the new partition table on $dev" >&2; exit 1; fi',
+    '  sleep 0.25',
+    'done',
+    'count=1',
+    'set -- take-ownership b true',
+    'if [ -n "$label" ]; then count=$((count + 1)); set -- "$@" label s "$label"; fi',
+    'busctl --timeout=86400 call org.freedesktop.UDisks2 "$obj"' +
+      ' org.freedesktop.UDisks2.PartitionTable CreatePartitionAndFormat "ttssa{sv}sa{sv}"' +
+      ' 1048576 0 "$ptype" "" 0 "$fstype" "$count" "$@" >/dev/null'
+  ].join("\n")
+
+  function formatDrive(device, fstype, label, quick) {
+    if (!device) return "unknown device"
+    if (busy) return refuse("Another action is still running")
+    var plan = {
+      path: device.path,
+      fstype: Model.clean(fstype),
+      label: Model.normaliseLabel(label),
+      quick: quick !== false
+    }
+    var checked = Model.validateDriveFormat(fsCapabilities, device, plan)
+    if (!checked.ok) return refuse(checked.reason)
+    if (isDeviceBusy(device) || Model.sustainedBusy(_busyTicks[device.name])) {
+      return refuse(device.title + " is still being written to — try again once it settles")
+    }
+    _openAfterPath = ""
+    runAction(["bash", "-c", formatDriveScript, "storage-drives",
+               plan.path, plan.fstype, plan.label, plan.quick ? "0" : "1",
+               Model.partitionTypeFor(plan.fstype)],
+              plan.path, "format", Model.describeDriveFormat(device, plan.fstype))
+    return "ok"
+  }
+
+  // sysfs is read with plain cat, a few directories up from each block
+  // device: the USB device's negotiated speed, the NVMe controller's PCIe
+  // link, the SATA port's link. Nothing here needs root.
+  readonly property string linkScript: [
+    'set -u',
+    'for name; do',
+    '  echo "==> $name <=="',
+    '  d=$(readlink -f "/sys/block/$name/device" 2>/dev/null) || continue',
+    '  [ -n "$d" ] || continue',
+    '  n=$d',
+    '  while [ -n "$n" ] && [ "$n" != / ] && [ "$n" != /sys ]; do',
+    '    if [ -r "$n/speed" ] && [ -r "$n/idVendor" ]; then',
+    '      echo "usbSpeed=$(cat "$n/speed" 2>/dev/null)"',
+    '      echo "usbVersion=$(cat "$n/version" 2>/dev/null)"',
+    '      echo "usbId=$(cat "$n/idVendor" 2>/dev/null):$(cat "$n/idProduct" 2>/dev/null)"',
+    '      break',
+    '    fi',
+    '    case "${n##*/}" in',
+    '      ata[0-9]*)',
+    '        for s in "$n"/link*/ata_link/link*/sata_spd; do',
+    '          if [ -r "$s" ]; then echo "sataSpeed=$(cat "$s" 2>/dev/null)"; break; fi',
+    '        done',
+    '        break ;;',
+    '    esac',
+    '    n=${n%/*}',
+    '  done',
+    '  p=$d/device',
+    '  if [ -r "$p/current_link_speed" ]; then',
+    '    echo "pcieSpeed=$(cat "$p/current_link_speed" 2>/dev/null)"',
+    '    echo "pcieWidth=$(cat "$p/current_link_width" 2>/dev/null)"',
+    '    echo "pcieMaxSpeed=$(cat "$p/max_link_speed" 2>/dev/null)"',
+    '    echo "pcieMaxWidth=$(cat "$p/max_link_width" 2>/dev/null)"',
+    '  fi',
+    'done'
+  ].join("\n")
+
+  function probeLinks() {
+    if (linkProcess.running) return
+    var names = []
+    for (var i = 0; i < devices.length; i++) {
+      if (devices[i].kind !== "swap") names.push(devices[i].name)
+    }
+    names.sort()
+    var signature = names.join(",")
+    if (signature === _linkSignature) return
+    _linkSignature = signature
+    if (names.length === 0) {
+      links = ({})
+      return
+    }
+    linkProcess.command = ["bash", "-c", linkScript, "storage-drives"].concat(names)
+    linkProcess.running = true
+  }
+
+  function probeTools() {
+    if (toolsProcess.running) return
+    toolsProcess.command = ["bash", "-c",
+                            'for t; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done',
+                            "storage-drives"].concat(Model.OPTIONAL_TOOLS)
+    toolsProcess.running = true
+  }
+
+  // Info rows are click-to-copy: a UUID or a serial is copied far more often
+  // than it is read.
+  function copyText(label, value) {
+    var text = String(value === undefined || value === null ? "" : value)
+    if (text === "") return
+    Quickshell.execDetached(["bash", "-c", 'printf %s "$1" | wl-copy', "storage-drives", text])
+    actionStatus = "Copied " + Model.plain(label)
+  }
+
+  // The other half of naming who holds a busy mount: asking them to let go.
+  // SIGTERM only, so programs get to save, and only for the pids fuser
+  // listed — which can only ever be this user's own processes, since kill
+  // refuses anyone else's. The shell itself is never on the list: the script's
+  // parent is the shell, and it is skipped by pid.
+  property string _blockedAction: ""
+  property string _blockedPath: ""
+
+  readonly property string closeBlockersScript: [
+    'set -u',
+    'for pid; do',
+    '  case "$pid" in ""|*[!0-9]*) continue ;; esac',
+    '  [ "$pid" = "$PPID" ] && continue',
+    '  kill -TERM "$pid" 2>/dev/null || true',
+    'done',
+    'sleep 2'
+  ].join("\n")
+
+  function closeBlockersAndRetry() {
+    if (blockers.length === 0 || closeBlockersProcess.running || busy) return
+    var command = ["bash", "-c", closeBlockersScript, "storage-drives"]
+    for (var i = 0; i < blockers.length; i++) command.push(String(blockers[i].pid))
+    actionStatus = "Asking " + Model.describeBlockers(blockers) + " to close…"
+    closeBlockersProcess.command = command
+    closeBlockersProcess.running = true
+  }
+
+  function retryBlocked() {
+    var action = _blockedAction
+    var path = _blockedPath
+    if (action === "eject") {
+      if (path === "*") ejectAll()
+      else eject(deviceByPath(path))
+      return
+    }
+    var volume = volumeByPath(path)
+    if (volume) unmount(volume, false)
+    else if (deviceByPath(path)) unmountAll(deviceByPath(path))
+  }
+
   // Same bargain as the gvfs hint: a plugin may not install anything, so it
   // names the package udisks went looking for and opens Omarchy's installer.
   function installCheckTools(volume) {
@@ -1833,13 +2261,14 @@ Item {
   property double _lastSmartProbeTime: 0
 
   function probeSmart(force) {
-    if (!telemetryActive && force !== true) return
     if (smartProcess.running) return
     var now = Date.now()
     if (force === true && (now - _lastSmartProbeTime < 4000)) return
 
     var paths = []
-    for (var i = 0; i < devices.length; i++) paths.push(devices[i].path)
+    for (var i = 0; i < devices.length; i++) {
+      if (devices[i].kind !== "swap") paths.push(devices[i].path)
+    }
     paths.sort()
     var signature = paths.join(",")
     if (force !== true && signature === _smartSignature) return
@@ -2005,7 +2434,7 @@ Item {
   Process {
     id: lsblkProcess
     command: ["lsblk", "-J", "-b", "-o",
-              "NAME,PATH,LABEL,PARTLABEL,FSTYPE,SIZE,FSSIZE,FSAVAIL,FSUSED,MOUNTPOINT,MOUNTPOINTS,RM,HOTPLUG,TYPE,TRAN,VENDOR,MODEL,UUID,SERIAL"]
+              "NAME,PATH,LABEL,PARTLABEL,FSTYPE,FSVER,SIZE,FSSIZE,FSAVAIL,FSUSED,MOUNTPOINT,MOUNTPOINTS,RM,HOTPLUG,RO,ROTA,TYPE,TRAN,VENDOR,MODEL,REV,UUID,PARTUUID,PARTTYPENAME,PTTYPE,DISC-MAX,SERIAL"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applySnapshot(text)
@@ -2058,6 +2487,30 @@ Item {
   }
 
   Process {
+    id: closeBlockersProcess
+    onExited: {
+      root.blockers = []
+      root.retryBlocked()
+    }
+  }
+
+  Process {
+    id: linkProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.links = Model.parseLinkReport(text)
+    }
+  }
+
+  Process {
+    id: toolsProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.tools = Model.parseToolList(text)
+    }
+  }
+
+  Process {
     id: actionProcess
     // Only the unlock script ever reads stdin; for everything else the pipe is
     // opened and never written, which no command here notices.
@@ -2080,7 +2533,10 @@ Item {
       // A filesystem that was renamed and then failed to mount back is still
       // renamed, so the verdict and the success message stand — but the drive
       // is gone from the file manager, and that is the part worth shouting.
-      if (exitCode === 0 || exitCode === Model.EXIT_REMOUNT_FAILED) {
+      // Omarchy's udiskie auto-mounts too, and whichever of the two is second
+      // gets AlreadyMounted. The volume is mounted, which is what was asked.
+      var alreadyMounted = exitCode !== 0 && action === "mount" && Model.isAlreadyMounted(root._stderr)
+      if (exitCode === 0 || exitCode === Model.EXIT_REMOUNT_FAILED || alreadyMounted) {
         root.actionStatus = root._successMessage
         if (action === "eject") {
           root.notify("Safe to remove",
@@ -2105,6 +2561,8 @@ Item {
         // "Target is busy" is only half an answer; go find the other half.
         if (/busy/i.test(root.lastError)) {
           root.blockedFsPath = ""
+          root._blockedAction = action
+          root._blockedPath = path
           root.probeBlockers(root.mountedPathsFor(path))
         }
         root.notify("Removable drives", root.lastError, Model.GLYPH_ALERT, "normal")
@@ -2280,6 +2738,15 @@ Item {
     onTriggered: root.probeSmart(true)
   }
 
+  // Background health read: rare on purpose. SmartUpdate asks ATA drives not
+  // to wake (nowakeup), so a parked disk is not spun up for this.
+  Timer {
+    interval: 6 * 60 * 60 * 1000
+    running: root.devices.length > 0
+    repeat: true
+    onTriggered: root.probeSmart(true)
+  }
+
   // Backstop for a machine where udevadm is unavailable or its stream dies
   // quietly: never more than a minute stale.
   Timer {
@@ -2343,13 +2810,17 @@ Item {
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      Qt.callLater(root.nextCloudStatus)
       if (!targetRemote || targetRemote === "") return
       var parsed = Model.parseCloudStatus(String(cloudStatusStdout.text || ""), targetRemote)
       var copy = Object.assign({}, root.cloudStatuses)
       copy[targetRemote] = parsed
       root.cloudStatuses = copy
 
-      if (parsed.authenticated && !parsed.browseMounted && !parsed.browseEnabled && parsed.mountPath) {
+      // Not while the path is someone else's: the mount would fail, and this
+      // runs on every status refresh, so it would fail every few seconds.
+      if (parsed.authenticated && !parsed.browseMounted && !parsed.browseEnabled && parsed.mountPath
+          && !parsed.browseConflict && !root.cloudConflicts[targetRemote]) {
         var acc = null
         for (var i = 0; i < cloudAccounts.length; i++) {
           if (cloudAccounts[i].remoteName === targetRemote) { acc = cloudAccounts[i]; break }
@@ -2413,6 +2884,7 @@ Item {
       var cb = root._onCloudControlDone
       root._onCloudControlDone = null
       if (cb) Qt.callLater(cb)
+      Qt.callLater(root.nextCloudControl)
     }
   }
 
@@ -2453,5 +2925,6 @@ Item {
     refresh()
     refreshPortables()
     refreshCloud()
+    probeTools()
   }
 }

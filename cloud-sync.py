@@ -592,7 +592,7 @@ Documentation=https://rclone.org/commands/rclone_mount/
 Type=oneshot
 RemainAfterExit=yes
 ExecStart={python} {helper} mount --remote {systemd_quote(remote)} --mount {systemd_quote(str(mount))}
-ExecStop={python} {helper} unmount --mount {systemd_quote(str(mount))}
+ExecStop={python} {helper} unmount --remote {systemd_quote(remote)} --mount {systemd_quote(str(mount))}
 TimeoutStartSec=180
 
 [Install]
@@ -616,8 +616,33 @@ def ensure_units(remote: str, folder: Path, mount: Path) -> bool:
     run(["systemctl", "--user", "daemon-reload"], timeout=30)
   rclone = rclone_bin()
   label = get_account_display_label(rclone, remote)
-  add_gtk_bookmark(folder, f"{label} (Offline Sync)")
+  # A bookmark to a folder that does not exist shows in the file manager's
+  # sidebar and cannot be opened, which is what every new account used to
+  # get until its first sync created the folder.
+  if ensure_sync_folder(remote, folder):
+    add_gtk_bookmark(folder, f"{label} (Offline Sync)")
+  else:
+    remove_gtk_bookmark(folder)
   return changed
+
+
+def ensure_sync_folder(remote: str, folder: Path) -> bool:
+  """Create an account's sync folder if it has never synced; True if it exists.
+
+  Same rule as do_run: before the first baseline an empty folder is the
+  correct starting state. After it, a missing folder means it was moved or
+  deleted, and quietly recreating it would set up a sync that reads as
+  "delete everything in the cloud" — so it is left missing for the panel to
+  report."""
+  if folder.is_dir():
+    return True
+  if folder.exists() or load_state(remote_paths(remote)).get("baseline") is True:
+    return False
+  try:
+    open_owned_dir_close(folder)
+  except (OSError, RuntimeError):
+    return False
+  return folder.is_dir()
 
 
 GTK_BOOKMARKS_FILE = Path.home() / ".config" / "gtk-3.0" / "bookmarks"
@@ -942,6 +967,29 @@ def user_identity(rclone: str, remote: str, rtype: str, cache: dict[str, Any] | 
     except Exception:
       pass
 
+  # rclone has no userinfo for Dropbox, so the account card showed a folder
+  # path where every other provider shows an email. Dropbox's own API answers
+  # with the token rclone already holds.
+  if not email and rtype == "dropbox":
+    try:
+      code, dump, _ = run([rclone, "config", "dump"], timeout=6)
+      if code == 0 and dump:
+        cfg = json.loads(dump)
+        token = json.loads(cfg.get(remote, {}).get("token", "{}"))
+        access_token = token.get("access_token")
+        if access_token:
+          req = urllib.request.Request("https://api.dropboxapi.com/2/users/get_current_account",
+                                       data=b"null", method="POST", headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+          })
+          with urllib.request.urlopen(req, timeout=5) as resp:
+            info = json.loads(resp.read(MAX_ITEM_BYTES).decode())
+            email = str(info.get("email") or "")
+            name = str((info.get("name") or {}).get("display_name") or "")
+    except Exception:
+      pass
+
   result = {"email": email, "name": name}
   if cache is not None:
     cache["identity"] = {"remote": remote, "email": email, "name": name, "ts": int(time.time())}
@@ -1029,6 +1077,31 @@ def mount_info(path: Path) -> tuple[bool, bool, str, bool]:
   return True, by_rclone, fs_type, path_is_live(path) if by_rclone else True
 
 
+def mount_source(path: Path) -> str:
+  """SOURCE of the mount at exactly `path` ("gdrive:"), or "" if none."""
+  findmnt = shutil.which("findmnt")
+  if not findmnt:
+    return ""
+  code, out, _ = run([findmnt, "-n", "-M", str(path), "-o", "SOURCE"], timeout=8)
+  if code != 0 or not out:
+    return ""
+  return out.splitlines()[0].strip()
+
+
+def mounted_remote(path: Path) -> str:
+  """Remote name ("gdrive") serving an rclone mount at `path`, or ""."""
+  source = mount_source(path)
+  return source.split(":", 1)[0] if ":" in source else ""
+
+
+def browse_owned_by(path: Path, remote: str) -> bool:
+  """An rclone mount at `path` counts as this remote's browse view only if it
+  is serving this remote. Two accounts pointed at the same folder used to
+  share one mount: the second reported itself mounted while showing the first
+  account's files, and removing it unmounted the first."""
+  return mounted_remote(path) == remote
+
+
 def detach_stale_mount(path: Path) -> bool:
   fusermount = shutil.which("fusermount3") or shutil.which("fusermount")
   if not fusermount:
@@ -1047,6 +1120,9 @@ def mount_browse(remote: str, mount_path: Path) -> None:
     raise RuntimeError(f"rclone remote '{remote}' is not configured")
 
   mounted, by_rclone, fs_type, alive = mount_info(mount_path)
+  if by_rclone and not browse_owned_by(mount_path, remote):
+    other = mounted_remote(mount_path) or "another remote"
+    raise RuntimeError(f"{mount_path} is already the browse folder for '{other}'; give '{remote}' its own path")
   if by_rclone and alive:
     label = get_account_display_label(rclone, remote)
     add_gtk_bookmark(mount_path, f"{label} (Cloud)")
@@ -1100,13 +1176,16 @@ def mount_browse(remote: str, mount_path: Path) -> None:
   raise RuntimeError("rclone started but browse mount did not appear")
 
 
-def unmount_browse(mount_path: Path) -> None:
+def unmount_browse(mount_path: Path, remote: str = "") -> None:
   mounted, by_rclone, fs_type, _ = mount_info(mount_path)
   if not mounted:
     remove_gtk_bookmark(mount_path)
     return
   if not by_rclone:
     raise RuntimeError(f"Refusing to unmount {mount_path}; it is {fs_type}, not rclone")
+  # Never take down another account's mount that happens to sit on this path.
+  if remote and not browse_owned_by(mount_path, remote):
+    return
   fusermount = shutil.which("fusermount3") or shutil.which("fusermount")
   if not fusermount:
     raise RuntimeError("fusermount is not installed")
@@ -1188,11 +1267,25 @@ def do_run(remote_value: str, folder_value: str, resync: bool) -> int:
   selection = load_selection(paths)
   sync_filters_file(paths, selection)
 
+  # bisync aborts on a local folder that does not exist, which is exactly the
+  # state of a freshly added account. Create it — but only before the first
+  # baseline. Once a baseline exists, a missing folder means it was moved or
+  # deleted, and syncing an empty folder against that baseline reads as
+  # "delete everything in the cloud". Refuse instead.
+  # A resync is the way out: it merges both sides and deletes nothing.
+  if not folder.exists():
+    if load_state(paths).get("baseline") is True and not resync:
+      patch_state(paths, syncing=False, lastResult="error", finishedTs=int(time.time()),
+                  lastError=f"Sync folder {folder} is missing. Restore it, or resync to start over.")
+      return 1
+    open_owned_dir_close(folder)
+
   paths["workdir"].mkdir(parents=True, exist_ok=True, mode=0o700)
   clear_stale_bisync_lock(paths)
   rotate_log(paths["log_path"])
 
   start_ts = int(time.time())
+  previous = str(load_state(paths).get("lastResult") or "")
   patch_state(paths, syncing=True, startTs=start_ts)
 
   cmd = bisync_command(rclone, remote, folder, resync, rtype, paths)
@@ -1202,6 +1295,7 @@ def do_run(remote_value: str, folder_value: str, resync: bool) -> int:
   if code == 0:
     patch_state(paths, syncing=False, lastResult="ok", lastError="", finishedTs=int(time.time()),
                 durationSec=round(duration, 1), baseline=True)
+    announce_recovery(remote, previous)
     return 0
   elif code in RCLONE_RESYNC_CODES:
     # Bisync requires a resync baseline run
@@ -1211,15 +1305,87 @@ def do_run(remote_value: str, folder_value: str, resync: bool) -> int:
     if code2 == 0:
       patch_state(paths, syncing=False, lastResult="ok", lastError="", finishedTs=int(time.time()),
                   durationSec=round(duration2, 1), baseline=True)
+      announce_recovery(remote, previous)
       return 0
     else:
-      patch_state(paths, syncing=False, lastResult="error", lastError=clean_text(err2 or out2 or "Resync failed"),
-                  finishedTs=int(time.time()), durationSec=round(duration2, 1))
+      record_failure(paths, remote, last_log_error(paths["log_path"]) or clean_text(err2 or out2 or "Resync failed"),
+                     duration2, previous)
       return 1
   else:
-    patch_state(paths, syncing=False, lastResult="error", lastError=clean_text(err or out or "Sync failed"),
-                finishedTs=int(time.time()), durationSec=round(duration, 1))
+    record_failure(paths, remote, last_log_error(paths["log_path"]) or clean_text(err or out or "Sync failed"),
+                   duration, previous)
     return 1
+
+
+# A sync that failed because the machine is offline is not a sync that failed:
+# it is recorded as "offline" (the panel says "Waiting for network") and never
+# notified, or every timer tick on a train would raise an alert.
+NETWORK_ERRORS = re.compile(
+  r"no such host|dial tcp|network is unreachable|connection refused|i/o timeout|"
+  r"temporary failure in name resolution|tls handshake timeout|connection reset|"
+  r"context deadline exceeded|couldn't connect|no route to host", re.I)
+
+
+def is_network_error(reason: str) -> bool:
+  return bool(NETWORK_ERRORS.search(reason or ""))
+
+
+def notify(summary: str, body: str, critical: bool = False) -> None:
+  """Best effort: syncs run from a systemd timer, with no panel open to show
+  a failure, so a notification is the only way it is ever seen."""
+  sender = shutil.which("omarchy-notification-send") or shutil.which("notify-send")
+  if not sender:
+    return
+  command = [sender, "-u", "critical" if critical else "normal", clean_text(summary, 120), clean_text(body, 300)]
+  try:
+    subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=5, check=False)
+  except (OSError, subprocess.TimeoutExpired):
+    pass
+
+
+def record_failure(paths: dict[str, Any], remote: str, reason: str, duration: float, previous: str) -> None:
+  result = "offline" if is_network_error(reason) else "error"
+  patch_state(paths, syncing=False, lastResult=result, lastError=reason,
+              finishedTs=int(time.time()), durationSec=round(duration, 1))
+  # Said once when it starts failing, not on every timer tick while it does.
+  if result == "error" and previous != "error":
+    notify(f"Cloud sync failed: {remote}", reason or "See the sync log in Storage Drives")
+
+
+def announce_recovery(remote: str, previous: str) -> None:
+  if previous == "error":
+    notify(f"Cloud sync working again: {remote}", "The last sync finished cleanly.")
+
+
+def open_owned_dir_close(path: Path) -> None:
+  os.close(open_owned_dir(path))
+
+
+LOG_ERROR = re.compile(r"\bERROR\s*:\s*(.+)$")
+
+
+def last_log_error(log_path: Path) -> str:
+  """The first real ERROR line of the latest run. rclone sends its reasons to
+  the log file rather than stderr, so the panel used to say only "Resync
+  failed" while the log said "directory not found". The first error is the
+  cause; the ones after it are "bisync aborted" restating it."""
+  text = tail_bytes(log_path, LOG_TAIL_BYTES)
+  lines = text.splitlines()
+  # Only the latest run: rclone starts each with a "Bisync" or "Synching" line.
+  for i in range(len(lines) - 1, -1, -1):
+    if "Synching Path1" in lines[i] or "Bisyncing" in lines[i] or "Starting bisync" in lines[i]:
+      lines = lines[i:]
+      break
+  for line in lines:
+    m = LOG_ERROR.search(ANSI.sub("", line))
+    if m and "Bisync aborted" not in m.group(1) and "critical error" not in m.group(1):
+      return clean_text(m.group(1), 240)
+  for line in lines:
+    m = LOG_ERROR.search(ANSI.sub("", line))
+    if m:
+      return clean_text(m.group(1), 240)
+  return ""
 
 
 # ---------------------------------------------------------------- payloads
@@ -1309,6 +1475,9 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
     "baseline": state.get("baseline") is True,
     "warning": "",
     "lastError": str(state.get("lastError") or ""),
+    "browseConflict": "",
+    "logPath": str(paths["log_path"]),
+    "mountLogPath": str(paths["mount_log_path"]),
   }
 
   if not rclone:
@@ -1319,12 +1488,18 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
   payload["remoteType"] = remotes.get(remote, "")
   payload["authenticated"] = (remote in remotes) and is_remote_authenticated(rclone, remote, payload["remoteType"])
   browse_state = mount_info(mount_path)
-  payload["browseMounted"] = browse_state[1] and browse_state[3]
-  payload["browseStale"] = browse_state[1] and not browse_state[3]
+  owned = browse_state[1] and browse_owned_by(mount_path, remote)
+  payload["browseMounted"] = owned and browse_state[3]
+  payload["browseStale"] = owned and not browse_state[3]
+  if browse_state[1] and not owned:
+    payload["browseConflict"] = mounted_remote(mount_path)
   payload["browseEnabled"] = unit_enabled(paths["browse_service_name"])
   payload["timerEnabled"] = timer_enabled(paths["timer_name"])
   payload["unitsInstalled"] = (UNIT_DIR / paths["service_name"]).exists() and (UNIT_DIR / paths["timer_name"]).exists()
   payload["syncing"] = service_active(paths["service_name"]) or bisync_running(paths)
+
+  if payload["authenticated"]:
+    ensure_sync_folder(remote, folder)
 
   cache = load_cache(paths)
   cached = cache.get("localBytes") if isinstance(cache.get("localBytes"), dict) else None
@@ -1469,7 +1644,7 @@ def cmd_browse(args: argparse.Namespace) -> None:
   if code != 0:
     raise RuntimeError(clean_text(err or out or "Could not change the browse service"))
   state = mount_info(mount_path)
-  print(json.dumps({"ok": True, "browseMounted": state[1] and state[3]}))
+  print(json.dumps({"ok": True, "browseMounted": state[1] and state[3] and browse_owned_by(mount_path, remote)}))
 
 
 def cmd_timer(args: argparse.Namespace) -> None:
@@ -1513,8 +1688,17 @@ def cmd_remove_account(args: argparse.Namespace) -> None:
   if args.mount:
     try:
       mount_p = normalize_path(args.mount, "~/Cloud-Browse")
-      unmount_browse(mount_p)
-      remove_gtk_bookmark(mount_p)
+      if browse_owned_by(mount_p, remote) or not mount_info(mount_p)[0]:
+        unmount_browse(mount_p, remote)
+        remove_gtk_bookmark(mount_p)
+        # The browse folder only ever held the mount; once it is off, an empty
+        # folder named "… (Cloud)" in $HOME is litter. rmdir refuses anything
+        # that is not empty, so this cannot remove a file.
+        if not mount_info(mount_p)[0]:
+          try:
+            mount_p.rmdir()
+          except OSError:
+            pass
     except Exception:
       pass
 
@@ -1632,6 +1816,7 @@ def parser() -> argparse.ArgumentParser:
 
   unmount = commands.add_parser("unmount")
   unmount.add_argument("--mount", default="~/Cloud-Browse")
+  unmount.add_argument("--remote", default="")
 
   browse = commands.add_parser("browse")
   browse_group = browse.add_mutually_exclusive_group(required=True)
@@ -1688,7 +1873,8 @@ def main() -> int:
     elif args.command == "mount":
       mount_browse(normalize_remote(args.remote), normalize_path(args.mount, "~/Cloud-Browse"))
     elif args.command == "unmount":
-      unmount_browse(normalize_path(args.mount, "~/Cloud-Browse"))
+      unmount_browse(normalize_path(args.mount, "~/Cloud-Browse"),
+                     normalize_remote(args.remote) if args.remote else "")
     elif args.command == "browse":
       cmd_browse(args)
     elif args.command == "timer":

@@ -5,8 +5,13 @@ USB sticks, SD cards, phones, external HDDs/SSDs, internal system storage, and m
 ## Advanced Features in Storage Drives
 
 - **Multi-Cloud Drive Integration**: Add multiple Google Drive, Mega, OneDrive, Dropbox, and Nextcloud/WebDAV accounts via rclone directly in the Network & Cloud tab. Features selective folder syncing (keep only chosen folders on disk), root files syncing, stale file detection/cleanup, auto-sync timers via systemd, and read-only on-demand browsing (`rclone mount`) without consuming local disk space.
-- **Whole-Disk & Partition Formatter**: Format an entire physical drive (e.g. `/dev/sda`) or single partitions directly from the UI. Automatically cleans old signatures (`wipefs`), re-creates a clean GPT partition table via `parted`, provisions filesystems (`exfat`, `ntfs`, `ext4`, `btrfs`, `vfat`), fixes ownership/permissions, and mounts via `udisksctl`. Features built-in safeguards to strictly block system NVMe/root drives from accidental destruction.
-- **NTFS Dirty-Bit Auto-Fix**: Automatically detects NTFS volumes unmountable due to Windows hibernation or dirty flags. One click runs targeted repair via `omarchy-ntfs-fix` in a presentation terminal and re-mounts the drive.
+- **Cloud account tiles**: One full-width row per account, each with a status dot (synced, syncing, needs a look, failed), the signed-in email (Google Drive, OneDrive and now Dropbox), a quota bar that turns urgent when nearly full or over quota, and the last sync time. Sync, open and browse are one click from the tile; the detail view's chips wrap instead of squeezing.
+- **Accounts cannot trip over each other**: The add form checks, as you type, that the new account's sync and browse folders are not used by — or nested inside — another account's. Accounts saved before that check are flagged on their tile, and the browse folder can be moved from the account's Config drawer. A browse mount only counts as an account's if rclone is serving that account there, so a second account can no longer report "mounted" while showing the first one's files, or unmount it on removal.
+- **Sync failures say why**: The status line quotes rclone's own error from the sync log rather than "Resync failed", and Config has View sync log and Resync. A brand-new account's local folder is created on its first sync; once an account has synced, a missing folder stops the sync instead of being treated as "delete everything".
+- **Disconnect and delete ask twice**: Both need a second click within four seconds.
+- **Drive Info**: Open a drive's settings drawer (cog, or `i`) for its full spec sheet — kind (thumb drive, external, SD card, internal, system), model, serial, firmware revision, how it is attached and how fast (`USB 2.0 (480 Mb/s)`, `NVMe · PCIe 3.0 ×4`, `SATA · 6.0 Gb/s`), solid state or spinning, partition table, TRIM support, hardware write-protect and the exact size in bytes. A volume's drawer has the same for the filesystem: type and version (FAT16 is no longer called FAT32), label, UUID, partition type, PARTUUID, the LUKS mapper behind it, access and mount point. Click any value to copy it. A USB 3 drive that ended up on a USB 2 link is called out, since that is a tenfold slowdown nothing else on screen explains.
+- **Whole-Drive & Partition Formatter, built in**: Wipe an entire removable drive or a single volume from the panel, over udisks — no root, no extra packages. A whole-drive wipe writes a fresh GPT table and one partition filling the drive, typed as Microsoft basic data for exFAT/NTFS/FAT32 (so Windows sees it) or Linux data for ext4/Btrfs. Both are confirmed by typing the drive's kernel name, and both refuse system drives, mounted volumes and unlocked containers outright.
+- **NTFS Dirty-Bit Handling**: NTFS volumes that will not mount because Windows hibernated or left them dirty are flagged in the panel. Auto-mount tries a normal mount and, if that fails, sends a notification rather than failing silently; the built-in check → repair flow fixes them over udisks, and if `omarchy-ntfs-fix` is installed a one-click repair in a terminal is offered too.
 - **Disk Usage Inspector (`dua`)**: Click the pie chart icon (or press `d`) on any mounted volume to inspect space utilization interactively via `dua i` in a floating terminal.
 - **Terminal at Mountpoint**: Click the terminal icon (or press `t`) on any mounted volume to immediately launch a terminal in that volume's directory.
 - **System Storage Visibility Toggle**: Click the disk icon in the header (or press `s`) to toggle display of internal NVMe storage, Btrfs subvolumes, and root partitions alongside external drives.
@@ -67,7 +72,7 @@ USB sticks, SD cards, phones, external HDDs/SSDs, internal system storage, and m
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/Wian47/omarchy-removable-drives.git --enable
+omarchy plugin add https://github.com/gameticharles/drives.git --enable
 ```
 
 Needs Omarchy 4 (Quattro) and `udisks2`, both standard. It calls `lsblk`,
@@ -77,12 +82,32 @@ own `omarchy-*` helpers. Nothing runs as root.
 To remove it:
 
 ```bash
-omarchy plugin remove wian47.removable-drives
+omarchy plugin remove storage-drives
 rm ~/.local/state/omarchy/removable-drives.json   # optional: forget nicknames
 ```
 
 It never writes to `shell.json` or your Hyprland config; the bar entry belongs
 to Omarchy's plugin commands and nicknames live in the file above.
+
+### Optional terminal helpers
+
+A few buttons hand work to a terminal helper instead of doing it in the panel,
+because the job needs elevated rights or an interactive tool. The plugin does
+not ship these. It checks for each one at startup and on rescan, and hides the
+button when the helper is not on your `PATH`:
+
+| Helper | Button |
+|---|---|
+| `dua` | Disk Usage |
+| `omarchy-disk-speedtest` | Speed Test (ships with Omarchy) |
+| `omarchy-drive-trim` | Trim SSD (also needs a drive that accepts discards) |
+| `omarchy-drive-scrub` | Btrfs Scrub |
+| `omarchy-ntfs-fix` | NTFS Fix, and the one-click repair on an unmounted NTFS volume |
+| `omarchy-drive-flash` | Flash Bootable ISO |
+| `omarchy-drive-recover` | Recover & Inspect |
+
+Formatting, checking, repairing, renaming, unlocking and the drive info never
+depend on these: they go through udisks.
 
 ### Phones
 
@@ -108,6 +133,9 @@ camera roll can read as empty, because the originals are not on the device.
 | Mount / open / unmount icons | mount · open · unmount that volume |
 | Rename / check icons | rename the volume · check it for errors |
 | Eraser icon | format an unmounted volume: erase it and create a filesystem |
+| Format Entire Drive | wipe the whole drive: new partition table and one volume |
+| Info values | click any value in a Drive Info or Details grid to copy it |
+| Close-apps icon | on a busy unmount: ask the programs holding it to close, then retry |
 | Read-only / repair icons | after a failed check: mount read-only · repair |
 | Lock icon | locked: type the passphrase to unlock · open: lock it again |
 | Health icon | on drives that report health: hover for the reading, click to re-read |
@@ -124,7 +152,7 @@ Keyboard, while the panel is open:
 | `o` | open | `y` | copy its path |
 | `n` | nickname the drive | `r` `Esc` | rescan · close |
 | `l` | rename the volume | `c` | check it for errors |
-| `f` | format the volume | | |
+| `f` | format the volume, or the whole drive on a drive row | `i` | open the info drawer |
 
 ## Settings
 
@@ -143,6 +171,10 @@ Setup > Plugins.
 | `fileManager` | `""` | Command used to open a mount point; empty means `xdg-open` |
 | `barLabel` | `"none"` | Text beside the icon: `none`, `free`, `name`, `count` |
 | `refreshIntervalSec` | `8` | How often free space is re-read while the panel is open |
+| `fullWarnPct` | `90` | Fill level at which a volume's bar and free-space line turn urgent |
+| `thumbMaxGb` | `256` | USB disks this size or smaller show as thumb drives unless the model says otherwise |
+| `healthAlerts` | `true` | Read drive health in the background and notify when it gets worse |
+| `lowSpaceAlerts` | `true` | Notify once when a mounted volume crosses `fullWarnPct` |
 
 Per-drive settings live in `~/.local/state/omarchy/removable-drives.json`, keyed
 by serial and watched for changes, which is also how you attach a command to a
@@ -206,9 +238,12 @@ and hours powered on in the tooltip and any concern written out in the row
 itself. It comes from udisks over D-Bus, which does the privileged read for
 us — no `smartctl`, no `smartmontools`, nothing running as root.
 
-The reading is taken when the drive appears and when you rescan, not
-continuously, so the temperature is a snapshot from that moment rather than a
-live thermometer. Clicking the health icon takes a fresh one.
+The reading is taken when the set of drives changes, on a rescan, and every
+six hours in the background — never continuously — so the temperature is a
+snapshot rather than a live thermometer; open a drive's telemetry row for
+minute-by-minute readings. With `healthAlerts` on, a drive whose verdict gets
+worse is announced in a notification even with the panel closed, and a drive
+that reports itself failing is announced at the first reading of a session.
 
 **Most USB sticks report nothing at all**, and that is the ordinary case rather
 than a fault: a thumb drive carries neither SMART interface, so the icon simply
@@ -248,13 +283,18 @@ omarchy-shell storage-drives expandDevice /dev/sdb         # expand drive settin
 omarchy-shell storage-drives expandVolume /dev/sdb1        # expand volume drawer
 omarchy-shell storage-drives toggleTelemetry /dev/sdb      # toggle telemetry row
 omarchy-shell storage-drives setTab network                # switch to "local" or "network"
+omarchy-shell storage-drives info /dev/sdb                 # drive or volume details, as JSON
+omarchy-shell storage-drives openCloud gdrive              # open a cloud account's detail view
+omarchy-shell storage-drives unmountAll /dev/sdb           # unmount every volume, no power-off
+omarchy-shell storage-drives formatDrive /dev/sdb exfat Photos # wipes the whole drive
 ```
 
-`format` destroys what is on the volume. It takes the same refusals the panel
-does — a mounted volume, a drive still being written to, or a filesystem udisks
-will not create are all turned away with the reason — but naming the node, the
-type and the label in one line is the whole confirmation, so there is no second
-question the way there is in the panel.
+`format` destroys what is on the volume, and `formatDrive` destroys everything
+on the drive. Both take the same refusals the panel does — a mounted volume, a
+drive still being written to, a system drive, or a filesystem udisks will not
+create are all turned away with the reason — but naming the node, the type and
+the label in one line is the whole confirmation, so there is no second question
+the way there is in the panel.
 
 `status` reports `busy: true` while the kernel still has I/O in flight **or a
 connect hook is still running**, so a backup script can wait for the drive to
@@ -325,7 +365,7 @@ candidate of a mounted removable volume. The tests assert it refuses `/`,
 `$HOME`, the mount root, and drives it is not tracking.
 
 ```bash
-node test/model.test.js       # 237 tests, no compositor required
+node test/model.test.js       # 288 tests, no compositor required
 omarchy plugin validate .     # the same check the shell applies
 ```
 

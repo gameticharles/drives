@@ -2302,5 +2302,364 @@ test("parseCloudRemotes parses remote list with authentication status", () => {
   assert.strictEqual(remotes[1].authenticated, false)
 })
 
+// A machine shaped like the one this was found on: swap on zram, / and /home
+// on LUKS+btrfs on an NVMe, /boot beside it, and one USB stick. With internal
+// storage on show, the sleep guard used to try to unmount all of it.
+function laptopTree() {
+  return tree([
+    disk({ name: "sda", path: "/dev/sda", size: 2004877312, vendor: "VendorCo", model: "ProductCode",
+           fstype: "vfat", fsver: "FAT16", mountpoint: "/run/media/me/disk",
+           mountpoints: ["/run/media/me/disk"], rev: "2.00", "disc-max": 0, rota: true, children: [] }),
+    { name: "zram0", path: "/dev/zram0", type: "disk", rm: false, hotplug: false, size: 67108864000,
+      fstype: "swap", mountpoint: "[SWAP]", mountpoints: ["[SWAP]"], children: [] },
+    { name: "nvme0n1", path: "/dev/nvme0n1", type: "disk", rm: false, hotplug: false, size: 512110190592,
+      tran: "nvme", model: "SAMSUNG MZVLQ512HBLU-00BTW", serial: "S123", rev: "FXM7201Q",
+      pttype: "gpt", rota: false, "disc-max": 2199023255040, children: [
+        { name: "nvme0n1p1", path: "/dev/nvme0n1p1", type: "part", size: 2147483648, fstype: "vfat",
+          fsver: "FAT32", parttypename: "EFI System", mountpoint: "/boot", mountpoints: ["/boot"], children: [] },
+        { name: "nvme0n1p2", path: "/dev/nvme0n1p2", type: "part", size: 509961011200, fstype: "crypto_LUKS",
+          children: [{ name: "root", path: "/dev/mapper/root", type: "crypt", fstype: "btrfs",
+                       mountpoint: "/home", mountpoints: ["/home", "/var/log", "/"], children: [] }] }
+      ] }
+  ])
+}
+
+console.log("\nwhich drives the safety machinery watches")
+
+test("the sleep guard never targets the system disk, its boot partition, or zram swap", () => {
+  const devices = api.parse(laptopTree(), true)
+  assert.strictEqual(devices.length, 3, "all three show with internal storage on")
+  assert.deepStrictEqual(api.suspendTargets(devices), ["/dev/sda"])
+})
+
+test("an internal data disk that is not the system disk is not a sleep target either", () => {
+  const devices = api.parse(tree([
+    { name: "sdb", path: "/dev/sdb", type: "disk", rm: false, hotplug: false, tran: "sata", size: 1e12,
+      children: [part({ name: "sdb1", path: "/dev/sdb1", rm: false, hotplug: false, mountpoint: "/mnt/data" })] }
+  ]), true)
+  assert.strictEqual(devices.length, 1)
+  assert.strictEqual(devices[0].isSystem, false)
+  assert.deepStrictEqual(api.suspendTargets(devices), [], "nobody unplugs an internal SATA disk mid-sleep")
+})
+
+test("ejectable means removable and not holding the system", () => {
+  const devices = api.parse(laptopTree(), true)
+  assert.deepStrictEqual(api.ejectableDevices(devices).map(d => d.path), ["/dev/sda"])
+  assert.strictEqual(api.isEjectable(null), false)
+})
+
+console.log("\ndrive kinds")
+
+test("a USB stick is told apart from a portable disk by model, then by size", () => {
+  const kind = overrides => api.parse(tree([disk(overrides)]))[0].kind
+  assert.strictEqual(kind({ model: "Cruzer Blade", size: 512e9 }), "thumb", "the model name wins over size")
+  assert.strictEqual(kind({ model: "Generic Disk", size: 64e9 }), "thumb")
+  assert.strictEqual(kind({ model: "Generic Disk", size: 2e12 }), "external")
+  assert.strictEqual(api.parse(tree([disk({ model: "Generic Disk", size: 64e9 })]), false, 32 * 1024 ** 3)[0].kind,
+    "external", "the size limit is a setting")
+})
+
+test("SD cards, internal disks and the system disk each get their own kind and glyph", () => {
+  const sd = api.parse(tree([disk({ name: "mmcblk0", path: "/dev/mmcblk0", tran: "", model: "" })]))[0]
+  assert.strictEqual(sd.kind, "sd")
+  assert.strictEqual(sd.glyph, api.GLYPH_SD)
+  const devices = api.parse(laptopTree(), true)
+  assert.strictEqual(devices[0].kind, "thumb")
+  assert.strictEqual(devices[0].glyph, api.GLYPH_USB)
+  assert.strictEqual(devices[1].kind, "swap")
+  assert.strictEqual(devices[2].kind, "system")
+  assert.strictEqual(devices[2].kindLabel, "System drive")
+  assert.strictEqual(devices[2].glyph, api.GLYPH_INTERNAL)
+})
+
+test("the new lsblk columns land on devices and volumes", () => {
+  const devices = api.parse(laptopTree(), true)
+  const nvme = devices[2]
+  assert.strictEqual(nvme.rev, "FXM7201Q")
+  assert.strictEqual(nvme.partTable, "gpt")
+  assert.strictEqual(nvme.rotational, false)
+  assert.strictEqual(nvme.discardMax, 2199023255040)
+  assert.strictEqual(nvme.volumes[0].partTypeName, "EFI System")
+  assert.strictEqual(nvme.volumes[0].fsver, "FAT32")
+  assert.strictEqual(devices[0].discardMax, 0, "zero is an answer: no TRIM")
+  assert.strictEqual(api.parse(tree([disk({})]))[0].discardMax, null, "a column lsblk left out stays unknown")
+})
+
+console.log("\ndrive info")
+
+test("USB, NVMe and SATA links are named the way people know them", () => {
+  const links = api.parseLinkReport([
+    "==> sda <==", "usbSpeed=480", "usbVersion=2.00", "usbId=346d:5678",
+    "==> nvme0n1 <==", "pcieSpeed=8.0 GT/s PCIe", "pcieWidth=4", "pcieMaxSpeed=16.0 GT/s PCIe", "pcieMaxWidth=4",
+    "==> sdb <==", "sataSpeed=6.0 Gbps", "bogus=1"
+  ].join("\n"))
+  assert.deepStrictEqual(Object.keys(links), ["sda", "nvme0n1", "sdb"])
+  assert.strictEqual(links.sdb.bogus, undefined, "only known keys are kept")
+  assert.strictEqual(api.connectionText({ tran: "usb", name: "sda" }, links.sda), "USB 2.0 (480 Mb/s)")
+  assert.strictEqual(api.connectionText({ tran: "nvme", name: "nvme0n1" }, links.nvme0n1),
+    "NVMe · PCIe 3.0 ×4 (capable of PCIe 4.0 ×4)")
+  assert.strictEqual(api.connectionText({ tran: "sata", name: "sdb" }, links.sdb), "SATA · 6.0 Gb/s")
+  assert.strictEqual(api.connectionText({ tran: "sata", name: "sdb" }, { sataSpeed: "<unknown>" }), "SATA")
+  assert.strictEqual(api.connectionText({ tran: "usb", name: "sdc" }, {}), "USB", "no probe yet still says USB")
+  assert.strictEqual(api.usbSpeedLabel("5000"), "USB 3.0 (5 Gb/s)")
+  assert.strictEqual(api.pcieLabel("32.0 GT/s PCIe", "4"), "PCIe 5.0 ×4")
+  assert.strictEqual(api.pcieLabel("Unknown", "4"), "")
+})
+
+test("a USB 3 device stuck on a USB 2 link is hinted at, a plain USB 2 stick is not", () => {
+  assert.strictEqual(api.slowUsbLink({ usbSpeed: "480", usbVersion: "2.10" }), true)
+  assert.strictEqual(api.slowUsbLink({ usbSpeed: "480", usbVersion: "2.00" }), false)
+  assert.strictEqual(api.slowUsbLink({ usbSpeed: "5000", usbVersion: "3.20" }), false)
+  const rows = api.deviceInfoRows(api.parse(tree([disk({})]))[0], { usbSpeed: "480", usbVersion: "2.10" })
+  const connection = rows.find(r => r[0] === "Connection")
+  assert.ok(/USB 2 port/.test(connection[1]))
+})
+
+test("device info rows say what is known and drop what is not", () => {
+  const nvme = api.parse(laptopTree(), true)[2]
+  const rows = Object.fromEntries(api.deviceInfoRows(nvme, { pcieSpeed: "8.0 GT/s PCIe", pcieWidth: "4" }))
+  assert.strictEqual(rows.Type, "System drive")
+  assert.strictEqual(rows.Model, "SAMSUNG MZVLQ512HBLU-00BTW")
+  assert.strictEqual(rows.Firmware, "FXM7201Q")
+  assert.strictEqual(rows.Connection, "NVMe · PCIe 3.0 ×4")
+  assert.strictEqual(rows.Media, "Solid state (NVMe)")
+  assert.strictEqual(rows.Partitions, "GPT")
+  assert.strictEqual(rows.TRIM, "Supported")
+  assert.strictEqual(rows.Size, "477 GB (512,110,190,592 bytes)")
+  assert.strictEqual(rows["USB ID"], undefined, "an empty row is dropped, not printed blank")
+
+  const stick = api.parse(laptopTree(), true)[0]
+  const stickRows = Object.fromEntries(api.deviceInfoRows(stick, {}))
+  assert.strictEqual(stickRows.Media, undefined, "a USB bridge's rotational flag is not repeated as fact")
+  assert.strictEqual(stickRows.TRIM, "Not supported")
+  assert.strictEqual(stickRows.Partitions, "None — the filesystem fills the whole disk")
+})
+
+test("device-chosen strings in info rows cannot carry markup", () => {
+  const device = api.parse(tree([disk({ model: "<img src=http://x>", serial: "<b>1</b>" })]))[0]
+  for (const [, value] of api.deviceInfoRows(device, { usbId: "<x>:1" })) {
+    assert.ok(!/[<>]/.test(value), value)
+  }
+})
+
+test("volume info rows name the variant, the partition and the mapper", () => {
+  const devices = api.parse(laptopTree(), true)
+  const stickRows = Object.fromEntries(api.volumeInfoRows(devices[0].volumes[0], false))
+  assert.strictEqual(stickRows.Filesystem, "FAT16", "a FAT16 stick is not called FAT32")
+  assert.strictEqual(stickRows.Access, "Read-write")
+  assert.strictEqual(stickRows["Mounted at"], "/run/media/me/disk")
+  const root = Object.fromEntries(api.volumeInfoRows(devices[2].volumes[1], true))
+  assert.strictEqual(root.Device, "/dev/nvme0n1p2 → /dev/mapper/root")
+  assert.strictEqual(root.Encryption, "LUKS · unlocked")
+  assert.strictEqual(root.Access, "Read-only")
+  const locked = { encrypted: true, unlocked: false, path: "/dev/sdb1", fsPath: "/dev/sdb1", sizeBytes: 1024 }
+  assert.strictEqual(Object.fromEntries(api.volumeInfoRows(locked, false)).Filesystem, "LUKS (locked)")
+})
+
+test("exact sizes group their digits instead of going exponential", () => {
+  assert.strictEqual(api.groupDigits(124584722432), "124,584,722,432")
+  assert.strictEqual(api.exactSize(0), "")
+  assert.strictEqual(api.exactSize(2004877312), "1.9 GB (2,004,877,312 bytes)")
+})
+
+console.log("\nwiping a whole drive")
+
+function wipeCaps() {
+  return { check: {}, repair: {}, format: ["exfat", "vfat", "ntfs", "ext4", "btrfs"] }
+}
+
+test("only an unmounted removable drive can be wiped", () => {
+  const caps = wipeCaps()
+  const devices = api.parse(laptopTree(), true)
+  assert.ok(/system mount/.test(api.canFormatDrive(caps, devices[2])))
+  assert.ok(/Unmount every volume/.test(api.canFormatDrive(caps, devices[0])))
+  const idle = api.parse(tree([disk({ children: [part({})] })]))[0]
+  assert.strictEqual(api.canFormatDrive(caps, idle), null)
+  assert.ok(/write-protected/.test(api.canFormatDrive(caps, api.parse(tree([disk({ ro: true })]))[0])))
+  assert.ok(/udisks has not said/.test(api.canFormatDrive({ format: [] }, idle)))
+  const internal = api.parse(tree([{ name: "sdb", path: "/dev/sdb", type: "disk", rm: false, hotplug: false,
+                                     tran: "sata", size: 1e12, children: [] }]), true)[0]
+  assert.ok(/Only removable/.test(api.canFormatDrive(caps, internal)))
+})
+
+test("an unlocked container blocks the wipe until it is locked", () => {
+  const device = api.parse(tree([disk({ children: [part({ fstype: "crypto_LUKS", children: [
+    { name: "luks-x", path: "/dev/mapper/luks-x", type: "crypt", fstype: "ext4", children: [] }] })] })]))[0]
+  assert.ok(/^Lock /.test(api.canFormatDrive(wipeCaps(), device)))
+})
+
+test("a wipe plan is checked whole, against the drive it names", () => {
+  const caps = wipeCaps()
+  const device = api.parse(tree([disk({ children: [part({})] })]))[0]
+  const plan = { path: "/dev/sdb", fstype: "exfat", label: "PHOTOS", quick: true }
+  assert.deepStrictEqual(api.validateDriveFormat(caps, device, plan), { ok: true, reason: "" })
+  assert.ok(/different drive/.test(api.validateDriveFormat(caps, device, Object.assign({}, plan, { path: "/dev/sdc" })).reason))
+  assert.ok(/cannot be created/.test(api.validateDriveFormat(caps, device, Object.assign({}, plan, { fstype: "xfs" })).reason))
+  assert.ok(/at most 11/.test(api.validateDriveFormat(caps, device, Object.assign({}, plan, { label: "A VERY LONG NAME" })).reason))
+  assert.ok(/whether to erase/.test(api.validateDriveFormat(caps, device, Object.assign({}, plan, { quick: "yes" })).reason))
+})
+
+test("Windows-readable filesystems get the Microsoft basic data partition type", () => {
+  assert.strictEqual(api.partitionTypeFor("exfat"), api.MS_BASIC_DATA_GUID)
+  assert.strictEqual(api.partitionTypeFor("ntfs"), api.MS_BASIC_DATA_GUID)
+  assert.strictEqual(api.partitionTypeFor("ext4"), api.LINUX_DATA_GUID)
+  assert.strictEqual(api.partitionTypeFor("swap"), "")
+})
+
+test("the wipe is confirmed by typing the drive's kernel name", () => {
+  const device = api.parse(tree([disk({})]))[0]
+  assert.strictEqual(api.driveFormatConfirmed(device, "sdb"), true)
+  assert.strictEqual(api.driveFormatConfirmed(device, " sdb "), true)
+  assert.strictEqual(api.driveFormatConfirmed(device, "sdb1"), false)
+  assert.strictEqual(api.driveFormatConfirmed(null, ""), false)
+  assert.ok(/Nothing brings it back/.test(api.driveFormatWarning(device)))
+})
+
+console.log("\nsmall readings")
+
+test("nearly full follows the setting and refuses silly values", () => {
+  const volume = { mounted: true, fssize: 100, fsused: 85 }
+  assert.strictEqual(api.nearlyFull(volume, 90), false)
+  assert.strictEqual(api.nearlyFull(volume, 80), true)
+  assert.strictEqual(api.fullThreshold(5), 0.5, "clamped up to 50%")
+  assert.strictEqual(api.fullThreshold("junk"), 0.9)
+  assert.strictEqual(api.nearlyFull({ mounted: false, fssize: 100, fsused: 100 }, 50), false)
+})
+
+test("unflushed writes are read from Dirty and Writeback only", () => {
+  const raw = "==> /sys/block/sda/stat <==\n1 2 3 4 5 6 7 8 0 0 0\nDirty:            2048 kB\nWriteback:         512 kB\n"
+  assert.strictEqual(api.parseDirtyBytes(raw), 2560 * 1024)
+  assert.deepStrictEqual(Object.keys(api.parseBlockStats(raw)), ["sda"], "meminfo lines do not confuse the stat parser")
+})
+
+test("only the optional tools this plugin knows about are recorded", () => {
+  assert.deepStrictEqual(api.parseToolList("dua\nomarchy-ntfs-fix\nrm\n"), { "dua": true, "omarchy-ntfs-fix": true })
+})
+
+console.log("\ncloud account paths")
+
+const HOME = "/home/me"
+function acct(name, folder, mount) {
+  return { remoteName: name, type: "drive", folderPath: folder, browseMountPath: mount }
+}
+
+test("home-relative paths compare after expansion", () => {
+  assert.strictEqual(api.expandHomePath("~/Google Drive/", HOME), "/home/me/Google Drive")
+  assert.strictEqual(api.expandHomePath("/home/me//Cloud", HOME), "/home/me/Cloud")
+  assert.strictEqual(api.expandHomePath("~", HOME), "/home/me")
+})
+
+test("a second account cannot reuse another's browse folder", () => {
+  const accounts = [acct("gdrive", "~/Google Drive", "~/Google Drive (Cloud)")]
+  const check = api.validateCloudAccount(accounts, acct("gdrive2", "~/Google Drive 2", "/home/me/Google Drive (Cloud)"), HOME)
+  assert.strictEqual(check.ok, false)
+  assert.ok(/browse folder is already used by 'gdrive'/.test(check.reason), check.reason)
+})
+
+test("nesting counts as sharing, and sync and browse folders stay apart", () => {
+  const accounts = [acct("gdrive", "~/Google Drive", "~/GD (Cloud)")]
+  assert.ok(/sync folder is already used/.test(
+    api.validateCloudAccount(accounts, acct("x", "~/Google Drive/Work", "~/X (Cloud)"), HOME).reason))
+  assert.ok(/must be separate/.test(
+    api.validateCloudAccount([], acct("x", "~/X", "~/X/browse"), HOME).reason))
+  assert.ok(/inside your home/.test(api.validateCloudAccount([], acct("x", "~", "~/X (Cloud)"), HOME).reason))
+  assert.ok(/inside your home/.test(api.validateCloudAccount([], acct("x", "/mnt/x", "~/X (Cloud)"), HOME).reason))
+})
+
+test("names are checked for duplicates and characters, but an account may keep its own", () => {
+  const accounts = [acct("gdrive", "~/G", "~/G (Cloud)")]
+  assert.ok(/already connected/.test(api.validateCloudAccount(accounts, acct("gdrive", "~/H", "~/H (Cloud)"), HOME).reason))
+  assert.ok(/letters, numbers/.test(api.validateCloudAccount([], acct("bad;name", "~/H", "~/H (Cloud)"), HOME).reason))
+  assert.strictEqual(api.validateCloudAccount(accounts, accounts[0], HOME, "gdrive").ok, true)
+})
+
+test("existing collisions are reported per account", () => {
+  const conflicts = api.cloudPathConflicts([
+    acct("gdrive", "~/Google Drive", "~/Google Drive (Cloud)"),
+    acct("gdrive2", "~/Google Drive 2", "~/Google Drive (Cloud)"),
+    acct("dropbox", "~/Dropbox", "~/Dropbox (Cloud)")
+  ], HOME)
+  assert.deepStrictEqual(Object.keys(conflicts), ["gdrive2"], "only the account that moved in is flagged")
+})
+
+test("the tab header counts accounts and the ones needing attention", () => {
+  const base = api.defaultCloudStatus("")
+  const statuses = {
+    a: Object.assign({}, base, { authenticated: true, baseline: true }),
+    b: Object.assign({}, base, { authenticated: true, lastResult: "error" }),
+    c: Object.assign({}, base, { authenticated: true, syncing: true })
+  }
+  const accounts = [{ remoteName: "a" }, { remoteName: "b" }, { remoteName: "c" }]
+  assert.strictEqual(api.cloudOverview(accounts, statuses, {}, 1), "3 cloud drives · 1 syncing · 1 needs attention · 1 network share")
+  assert.strictEqual(api.cloudOverview([], {}, {}, 0), "No cloud drives or network shares")
+})
+
+test("an account's own browse mount is not listed again as a network share", () => {
+  const shares = [{ mountpoint: "/home/me/Google Drive (Cloud)" }, { mountpoint: "/mnt/nas" }]
+  const visible = api.visibleNetworkShares(shares, [acct("gdrive", "~/Google Drive", "~/Google Drive (Cloud)")], HOME)
+  assert.deepStrictEqual(visible.map(s => s.mountpoint), ["/mnt/nas"])
+})
+
+test("an over-quota mount reports no free space instead of a wrapped number", () => {
+  const raw = JSON.stringify({ filesystems: [{ target: "/home/me/OneDrive (Cloud)", source: "onedrive:", fstype: "fuse.rclone",
+    options: "ro", size: 5368709120, used: 6549827584, avail: 18446744072528433152 }] })
+  const share = api.parseNetworkMounts(raw)[0]
+  assert.strictEqual(share.availBytes, 0)
+  assert.strictEqual(share.overQuota, true)
+  assert.strictEqual(share.availText, "0 B")
+})
+
+test("an account's tone says what needs attention", () => {
+  const base = api.defaultCloudStatus("g")
+  assert.strictEqual(api.cloudTone(Object.assign({}, base, { authenticated: true, syncing: true })), "busy")
+  assert.strictEqual(api.cloudTone(Object.assign({}, base, { authenticated: true, lastResult: "error" })), "error")
+  assert.strictEqual(api.cloudTone(Object.assign({}, base, { authenticated: true, baseline: true })), "ok")
+  assert.strictEqual(api.cloudTone(Object.assign({}, base, { authenticated: true, baseline: true }), "shared path"), "warn")
+  assert.strictEqual(api.cloudTone(Object.assign({}, base, { authenticated: true, quotaKnown: true, quotaBytes: 5, usedBytes: 6 })), "warn")
+  assert.strictEqual(api.cloudTone(base), "idle", "still checking is not a warning")
+  assert.strictEqual(api.cloudUsageFraction({ quotaKnown: true, quotaBytes: 100, usedBytes: 250 }), 1)
+})
+
+console.log("\nbackground alerts")
+
+test("a health alert fires when the verdict gets worse, including a first bad reading", () => {
+  assert.strictEqual(api.healthWorsened(undefined, "failing"), true)
+  assert.strictEqual(api.healthWorsened("healthy", "warning"), true)
+  assert.strictEqual(api.healthWorsened("warning", "failing"), true)
+  assert.strictEqual(api.healthWorsened("failing", "warning"), false, "getting better is not news")
+  assert.strictEqual(api.healthWorsened("warning", "warning"), false, "said once, not every read")
+  assert.strictEqual(api.healthWorsened("healthy", "unsupported"), false)
+})
+
+function fullDevice(used, extra) {
+  return [{ title: "Stick", volumes: [Object.assign({ title: "STICK", mounted: true, uuid: "AB-12", fsPath: "/dev/sdb1",
+    mountpoint: "/run/media/me/STICK", fstype: "exfat", fssize: 100, fsused: used, fsavail: 100 - used }, extra || {})] }]
+}
+
+test("low space alerts once on crossing, and re-arms only well below the line", () => {
+  let step = api.spaceAlerts(fullDevice(91), {}, 90)
+  assert.strictEqual(step.alerts.length, 1)
+  step = api.spaceAlerts(fullDevice(95), step.alerted, 90)
+  assert.strictEqual(step.alerts.length, 0, "still full: no second alert")
+  step = api.spaceAlerts(fullDevice(88), step.alerted, 90)
+  assert.strictEqual(step.alerts.length, 0)
+  assert.ok(step.alerted["uuid:AB-12"], "hovering just under the line stays alerted")
+  step = api.spaceAlerts(fullDevice(85), step.alerted, 90)
+  assert.deepStrictEqual(step.alerted, {}, "well below re-arms")
+  assert.strictEqual(api.spaceAlerts(fullDevice(92), step.alerted, 90).alerts.length, 1)
+})
+
+test("images, swap and unmounted volumes never raise a space alert", () => {
+  assert.strictEqual(api.spaceAlerts(fullDevice(100, { fstype: "iso9660" }), {}, 90).alerts.length, 0)
+  assert.strictEqual(api.spaceAlerts(fullDevice(100, { mounted: false }), {}, 90).alerts.length, 0)
+  const alert = api.spaceAlerts(fullDevice(97, { mountpoint: "/" }), {}, 90).alerts[0]
+  assert.ok(/^The system drive \(\/\) is 97% full/.test(api.spaceAlertText(alert)), api.spaceAlertText(alert))
+})
+
+test("udisks' already-mounted answer is recognised", () => {
+  assert.strictEqual(api.isAlreadyMounted("Error mounting /dev/sda1: GDBus.Error:org.freedesktop.UDisks2.Error.AlreadyMounted: Device /dev/sda1 is already mounted at `/run/media/x'."), true)
+  assert.strictEqual(api.isAlreadyMounted("Error mounting: wrong fs type"), false)
+})
+
 console.log(failures === 0 ? "\nAll tests passed." : `\n${failures} test(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

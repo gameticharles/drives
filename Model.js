@@ -64,6 +64,9 @@ var GLYPH_PLUS = codepoint(0xF0415)           // md-plus
 var GLYPH_ARROW_LEFT = codepoint(0xF004D)     // md-arrow_left
 var GLYPH_NETWORK = codepoint(0xF0318)     // md-lan
 var GLYPH_THERMOMETER = codepoint(0xF050F) // md-thermometer
+var GLYPH_INTERNAL = codepoint(0xF0A0)      // fa-hdd_o
+var GLYPH_INFO = codepoint(0xF02FD)         // md-information_outline
+var GLYPH_CLOSE = codepoint(0xF0156)        // md-close
 
 // ------------------------------------------------------------ formatting
 
@@ -257,6 +260,10 @@ function buildVolume(part, index, isSystem) {
     title: title,
     fstype: fstype,
     fstypeLabel: formatFsType(fstype),
+    fsver: clean(fsNode.fsver),
+    partTypeName: clean(part.parttypename),
+    partLabel: clean(part.partlabel),
+    partUuid: exact(part.partuuid),
     sizeBytes: Number(part.size || 0),
     mountpoint: mountpoint,
     mounted: mountpoint !== "",
@@ -269,6 +276,67 @@ function buildVolume(part, index, isSystem) {
   }
 }
 
+// ---------------------------------------------------------------- drive kind
+//
+// "USB disk" covers a thumb drive and a 4 TB portable alike, and the two want
+// different icons and different expectations. The bridge chip's ROTA flag is
+// no help — most flash bridges report rotational — so the model string decides
+// first, and size decides the rest: sticks rarely pass 256 GB and portable
+// drives rarely come under it.
+var THUMB_MODEL = /flash|cruzer|datatraveler|ultra fit|ultra usb|jumpdrive|thumb|pen ?drive|stick|ufd|dt ?[0-9]|traveler|blade|fit plus|u disk|udisk/i
+var SD_MODEL = /\bsd\b|sd\/mmc|mmc|card ?reader|microsd|sdxc|sdhc|multi-card/i
+var DEFAULT_THUMB_MAX_BYTES = 256 * 1024 * 1024 * 1024
+
+var KIND_LABELS = {
+  thumb: "Thumb drive",
+  external: "External drive",
+  sd: "SD card",
+  internal: "Internal drive",
+  system: "System drive",
+  swap: "Compressed swap"
+}
+
+function driveKind(node, isSystem, thumbMaxBytes) {
+  if (!node) return "internal"
+  var name = String(node.name || "")
+  if (name.indexOf("zram") === 0) return "swap"
+  if (isSystem === true) return "system"
+  var tran = clean(node.tran).toLowerCase()
+  var model = clean(clean(node.vendor) + " " + clean(node.model))
+  if (/^mmcblk/.test(name) || tran === "mmc" || SD_MODEL.test(model)) return "sd"
+  if (!isCandidateDisk(node)) return "internal"
+  if (THUMB_MODEL.test(model)) return "thumb"
+  var limit = Number(thumbMaxBytes)
+  if (!isFinite(limit) || limit <= 0) limit = DEFAULT_THUMB_MAX_BYTES
+  return Number(node.size || 0) <= limit ? "thumb" : "external"
+}
+
+function kindLabel(kind) {
+  return KIND_LABELS[kind] || "Drive"
+}
+
+function kindGlyph(kind) {
+  if (kind === "thumb") return GLYPH_USB
+  if (kind === "sd") return GLYPH_SD
+  if (kind === "external") return GLYPH_DISK
+  return GLYPH_INTERNAL
+}
+
+// lsblk prints `null` for a column the kernel left empty and a number or
+// boolean otherwise. Unknown has to stay distinguishable from false here: a
+// drive whose discard limit nobody reported is not a drive without TRIM.
+function optionalNumber(value) {
+  if (value === null || value === undefined || value === "") return null
+  var n = Number(value)
+  return isFinite(n) ? n : null
+}
+
+function optionalBool(value) {
+  if (value === true || value === "1" || value === 1) return true
+  if (value === false || value === "0" || value === 0) return false
+  return null
+}
+
 function isMountable(volume) {
   if (!volume) return false
   if (volume.mounted) return false
@@ -277,7 +345,7 @@ function isMountable(volume) {
   return UNMOUNTABLE.indexOf(volume.fstype) === -1
 }
 
-function buildDevice(node, isSystem) {
+function buildDevice(node, isSystem, thumbMaxBytes) {
   var sysDisk = isSystem === true || holdsSystemMount(node)
   var volumes = []
   var kids = node.children || []
@@ -298,6 +366,8 @@ function buildDevice(node, isSystem) {
     if (volumes[v].mounted) mounted++
   }
 
+  var kind = driveKind(node, sysDisk, thumbMaxBytes)
+
   return {
     path: exact(node.path),
     name: exact(node.name),
@@ -307,8 +377,17 @@ function buildDevice(node, isSystem) {
     title: deviceTitle(node),
     nickname: "",
     key: "",
-    glyph: !isCandidateDisk(node) || sysDisk ? GLYPH_DISK : deviceGlyph(node),
+    kind: kind,
+    kindLabel: kindLabel(kind),
+    glyph: kindGlyph(kind),
     tran: clean(node.tran),
+    vendor: clean(node.vendor),
+    model: clean(node.model),
+    rev: clean(node.rev),
+    rotational: optionalBool(node.rota),
+    readOnly: optionalBool(node.ro) === true,
+    partTable: clean(node.pttype),
+    discardMax: optionalNumber(node["disc-max"]),
     sizeBytes: Number(node.size || 0),
     sizeText: formatBytes(node.size),
     volumes: volumes,
@@ -316,7 +395,9 @@ function buildDevice(node, isSystem) {
   }
 }
 
-function parse(raw, showSystemDrives) {
+// `thumbMaxBytes` only decides which icon a USB disk gets; it changes nothing
+// about what may be mounted or ejected.
+function parse(raw, showSystemDrives, thumbMaxBytes) {
   var devices = []
   var json = JSON.parse(String(raw || "{}"))
   var nodes = json.blockdevices || []
@@ -327,7 +408,7 @@ function parse(raw, showSystemDrives) {
     var isSystem = holdsSystemMount(node)
     if (!isCandidate && !showSystemDrives) continue
     if (isSystem && !showSystemDrives) continue
-    devices.push(buildDevice(node, isSystem))
+    devices.push(buildDevice(node, isSystem, thumbMaxBytes))
   }
   return devices
 }
@@ -742,13 +823,37 @@ function canLock(volume) {
 // nothing mounted there, or finds a filesystem udisks refuses to unmount
 // without asking, which --no-user-interaction turns into a failure rather
 // than a surprise.
+//
+// Only drives that can actually be pulled out. With internal storage on show,
+// the device list also carries the disk the machine runs from, and asking
+// udisks to unmount / and /boot on the way into every suspend fails — loudly,
+// as a "still mounted going into sleep" alert about a disk nobody can unplug.
 function suspendTargets(devices) {
   var out = []
-  for (var d = 0; d < (devices || []).length; d++) {
-    var volumes = devices[d].volumes || []
+  var list = ejectableDevices(devices)
+  for (var d = 0; d < list.length; d++) {
+    var volumes = list[d].volumes || []
     for (var v = 0; v < volumes.length; v++) {
+      if (volumes[v].isSystem) continue
       if (volumes[v].mounted && exact(volumes[v].fsPath) !== "") out.push(exact(volumes[v].fsPath))
     }
+  }
+  return out
+}
+
+// The drives the safety machinery is about: the ones a person can unplug.
+// Write activity on the NVMe the system runs from is not a reason to say "do
+// not remove", and it must never hold back an eject-all of the USB sticks
+// beside it — that disk is written to every few seconds and would hold the
+// eject forever.
+function isEjectable(device) {
+  return !!(device && device.removable === true && device.isSystem !== true)
+}
+
+function ejectableDevices(devices) {
+  var out = []
+  for (var i = 0; i < (devices || []).length; i++) {
+    if (isEjectable(devices[i])) out.push(devices[i])
   }
   return out
 }
@@ -1698,6 +1803,361 @@ function describeFormat(volume, fstype) {
   return "Formatted " + name + (fs !== "" ? " as " + fs : "")
 }
 
+// --------------------------------------------- wiping a whole drive
+//
+// The volume format above keeps whatever partition table the stick came with.
+// A drive with a broken table, a leftover ISO image, or six partitions from an
+// old installer needs the whole thing replaced, and udisks does that without
+// root as well: Block.Format("gpt") on the disk, then one partition filling it
+// via PartitionTable.CreatePartitionAndFormat — both `modify-device`, the same
+// allow_active path as everything else here.
+//
+// Same rules as a volume format, one level up: a plan validated whole, a
+// mounted volume refused rather than taken offline, and the kernel name typed
+// out before anything runs.
+
+// Windows ignores a GPT partition typed as Linux data, so a stick formatted
+// exFAT for a Windows machine has to carry the Microsoft basic data GUID or it
+// shows up there as an empty slot. ext4 and btrfs get the Linux one.
+var MS_BASIC_DATA_GUID = "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"
+var LINUX_DATA_GUID = "0fc63daf-8483-4772-8e79-3d69d8477de4"
+
+function partitionTypeFor(fstype) {
+  var fs = clean(fstype)
+  if (fs === "exfat" || fs === "vfat" || fs === "ntfs") return MS_BASIC_DATA_GUID
+  if (fs === "ext4" || fs === "btrfs") return LINUX_DATA_GUID
+  return ""
+}
+
+function canFormatDrive(caps, device) {
+  if (!device) return "No drive selected"
+  if (device.isSystem || holdsSystemMount(device)) return "That drive is holding a system mount"
+  if (!isEjectable(device) || isVirtual(device.name)) {
+    return "Only removable drives can be wiped from here"
+  }
+  if (device.readOnly === true) return device.title + " is write-protected"
+  var volumes = device.volumes || []
+  for (var i = 0; i < volumes.length; i++) {
+    if (volumes[i].encrypted && volumes[i].unlocked) {
+      return "Lock " + volumes[i].title + " before wiping the drive"
+    }
+    if (volumes[i].mounted) return "Unmount every volume on " + device.title + " first"
+  }
+  if (formatTypes(caps).length === 0) {
+    return "udisks has not said which filesystems it can create"
+  }
+  return null
+}
+
+function validateDriveFormat(caps, device, plan) {
+  var refusal = canFormatDrive(caps, device)
+  if (refusal !== null) return { ok: false, reason: refusal }
+  if (!plan) return { ok: false, reason: "No format was planned" }
+  if (exact(plan.path) !== exact(device.path)) {
+    return { ok: false, reason: "That format was planned for a different drive" }
+  }
+  if (plan.quick !== true && plan.quick !== false) {
+    return { ok: false, reason: "A format has to say whether to erase the drive first" }
+  }
+  var fstype = clean(plan.fstype)
+  if (fstype === "") return { ok: false, reason: "Choose a filesystem to create" }
+  if (formatTypes(caps).indexOf(fstype) === -1 || partitionTypeFor(fstype) === "") {
+    return { ok: false, reason: formatFsType(fstype) + " cannot be created here" }
+  }
+  var label = validateLabel(formatTarget(fstype), plan.label)
+  if (!label.ok) return { ok: false, reason: label.message }
+  return { ok: true, reason: "" }
+}
+
+function driveFormatConfirmed(device, typed) {
+  var token = exact(device ? device.name : "")
+  if (token === "") return false
+  return normaliseLabel(typed) === token
+}
+
+function driveFormatWarning(device) {
+  if (!device) return ""
+  var size = formatBytes(device.sizeBytes)
+  var count = (device.volumes || []).length
+  var what = count === 0 ? "everything" : (count === 1 ? "its only volume" : "all " + count + " volumes")
+  return "Wipes " + what + " on " + device.title + (size !== "" ? " — " + size : "") +
+         " (" + exact(device.path) + ") and writes a new partition table. Nothing brings it back."
+}
+
+function describeDriveFormat(device, fstype) {
+  var name = device ? device.title : "the drive"
+  var fs = formatFsType(fstype)
+  return "Wiped " + name + (fs !== "" ? " and created one " + fs + " volume" : "")
+}
+
+// ------------------------------------------------------------- drive info
+//
+// How a drive is attached decides how fast it can ever be, and it is the first
+// thing to check when a copy crawls: a USB 3 stick in a USB 2 port runs at a
+// tenth of its speed and nothing else on screen says so. sysfs has the answer
+// without root, a few directories up from the block device for each bus.
+
+var USB_SPEEDS = {
+  "1.5": "USB 1.0 (1.5 Mb/s)", "12": "USB 1.1 (12 Mb/s)", "480": "USB 2.0 (480 Mb/s)",
+  "5000": "USB 3.0 (5 Gb/s)", "10000": "USB 3.1 (10 Gb/s)", "20000": "USB 3.2 (20 Gb/s)",
+  "40000": "USB4 (40 Gb/s)", "80000": "USB4 v2 (80 Gb/s)"
+}
+
+function usbSpeedLabel(speed) {
+  var s = clean(speed)
+  if (s === "") return ""
+  return USB_SPEEDS[s] || ("USB (" + plain(s) + " Mb/s)")
+}
+
+// `current_link_speed` reads "8.0 GT/s PCIe"; the generation is what people
+// know a slot by.
+var PCIE_GENERATIONS = { "2.5": "1.0", "5.0": "2.0", "8.0": "3.0", "16.0": "4.0", "32.0": "5.0", "64.0": "6.0" }
+
+function pcieLabel(speed, width) {
+  var m = clean(speed).match(/^([\d.]+)\s*GT\/s/)
+  if (!m) return ""
+  var gen = PCIE_GENERATIONS[m[1]]
+  var text = gen ? "PCIe " + gen : "PCIe " + m[1] + " GT/s"
+  var w = clean(width)
+  if (/^\d+$/.test(w) && w !== "0") text += " ×" + w
+  return text
+}
+
+// A USB 3 device that ends up on a USB 2 link has to describe itself as
+// version 2.10 there, while a device that only ever spoke USB 2 says 2.00. It
+// is a hint rather than proof — a few USB 2 parts report 2.10 too — so it is
+// worded as one.
+function slowUsbLink(link) {
+  var l = link || {}
+  return clean(l.usbSpeed) === "480" && clean(l.usbVersion) === "2.10"
+}
+
+// The link probe prints a header per drive, then key=value lines:
+//
+//   ==> sda <==
+//   usbSpeed=480
+//   usbVersion=2.00
+//   usbId=346d:5678
+//   ==> nvme0n1 <==
+//   pcieSpeed=8.0 GT/s PCIe
+//   pcieWidth=4
+//
+// Values come from sysfs files a device's firmware fills in, so they are
+// cleaned like any other device string.
+var LINK_KEYS = ["usbSpeed", "usbVersion", "usbId", "pcieSpeed", "pcieWidth", "pcieMaxSpeed", "pcieMaxWidth", "sataSpeed"]
+
+function parseLinkReport(raw) {
+  var out = {}
+  var lines = String(raw || "").split("\n")
+  var name = ""
+  for (var i = 0; i < lines.length; i++) {
+    var header = lines[i].match(/^==>\s*(\S+)\s*<==\s*$/)
+    if (header) {
+      name = header[1]
+      out[name] = {}
+      continue
+    }
+    if (name === "") continue
+    var pair = lines[i].match(/^([A-Za-z]+)=(.*)$/)
+    if (!pair || LINK_KEYS.indexOf(pair[1]) === -1) continue
+    out[name][pair[1]] = plain(pair[2])
+  }
+  return out
+}
+
+function connectionText(device, link) {
+  if (!device) return ""
+  var l = link || {}
+  var tran = clean(device.tran).toLowerCase()
+  if (tran === "usb" || clean(l.usbSpeed) !== "") return usbSpeedLabel(l.usbSpeed) || "USB"
+  if (tran === "nvme") {
+    var pcie = pcieLabel(l.pcieSpeed, l.pcieWidth)
+    var best = pcieLabel(l.pcieMaxSpeed, l.pcieMaxWidth)
+    var text = "NVMe" + (pcie !== "" ? " · " + pcie : "")
+    if (pcie !== "" && best !== "" && best !== pcie) text += " (capable of " + best + ")"
+    return text
+  }
+  if (tran === "sata" || tran === "ata") {
+    var sata = clean(l.sataSpeed)
+    if (!/^[\d.]+\s*Gbps$/.test(sata)) return "SATA"
+    return "SATA · " + sata.replace(/\s*Gbps$/, " Gb/s")
+  }
+  if (tran === "mmc" || /^mmcblk/.test(String(device.name || ""))) return "SD/MMC"
+  if (tran === "scsi") return "SCSI"
+  return tran.toUpperCase()
+}
+
+// The subtitle form: "USB 2.0", "NVMe · PCIe 3.0 ×4" — the parenthetical
+// detail belongs to the info grid, not a one-line summary.
+function connectionShort(device, link) {
+  return connectionText(device, link).replace(/\s*\([^)]*\)\s*$/, "")
+}
+
+// ROTA from a USB bridge describes the bridge's guess, not the drive, so it is
+// left unsaid there rather than calling every thumb drive a spinning disk.
+function mediaText(device) {
+  if (!device) return ""
+  var tran = clean(device.tran).toLowerCase()
+  if (tran === "usb") return ""
+  if (tran === "nvme") return "Solid state (NVMe)"
+  if (tran === "mmc" || device.kind === "sd") return "Flash memory"
+  if (device.rotational === true) return "Spinning hard disk"
+  if (device.rotational === false) return "Solid state"
+  return ""
+}
+
+function partTableText(device) {
+  if (!device) return ""
+  var pt = clean(device.partTable).toLowerCase()
+  if (pt === "gpt") return "GPT"
+  if (pt === "dos") return "MBR (DOS)"
+  if (pt !== "") return pt.toUpperCase()
+  var volumes = device.volumes || []
+  if (volumes.length === 1 && exact(volumes[0].path) === exact(device.path)) {
+    return "None — the filesystem fills the whole disk"
+  }
+  return ""
+}
+
+// 124584722432 -> "124,584,722,432". QML's toLocaleString goes exponential on
+// numbers this size, and an exact byte count is the point of the row.
+function groupDigits(n) {
+  return String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ",")
+}
+
+function exactSize(bytes) {
+  var n = Number(bytes)
+  if (!isFinite(n) || n <= 0) return ""
+  return formatBytes(n) + " (" + groupDigits(n) + " bytes)"
+}
+
+// lsblk reports FAT12/16/32 as "vfat" with the variant in FSVER, and the panel
+// has called every one of them FAT32 until now. Where the version is the more
+// precise name, it is the name.
+function filesystemText(volume) {
+  if (!volume) return ""
+  var fs = clean(volume.fstypeLabel) || formatFsType(volume.fstype)
+  var ver = clean(volume.fsver)
+  if (fs === "") return ""
+  if (ver === "") return fs
+  if (/^FAT\d+$/i.test(ver)) return ver.toUpperCase()
+  return fs + " " + ver
+}
+
+function joinModel(device) {
+  if (!device) return ""
+  var vendor = clean(device.vendor)
+  var model = clean(device.model)
+  if (vendor !== "" && model.toLowerCase().indexOf(vendor.toLowerCase()) === -1) return clean(vendor + " " + model)
+  return model
+}
+
+// [label, value] rows for a drive's info grid; rows with nothing to say are
+// dropped rather than printed as blanks. Every value is plain()ed: these are
+// device-chosen strings headed for a tooltip and the clipboard alike.
+function deviceInfoRows(device, link) {
+  if (!device) return []
+  var l = link || {}
+  var trim = ""
+  if (device.discardMax !== null && device.discardMax !== undefined) {
+    trim = device.discardMax > 0 ? "Supported" : "Not supported"
+  }
+  var connection = connectionText(device, l)
+  if (slowUsbLink(l)) connection += " — may be a USB 3 device in a USB 2 port"
+  // zram is memory: a partition table, a medium and TRIM say nothing about it.
+  var ram = device.kind === "swap"
+  var rows = [
+    ["Type", device.kindLabel || ""],
+    ["Model", joinModel(device)],
+    ["Serial", device.serial],
+    ["Firmware", device.rev],
+    ["Connection", connection],
+    ["USB ID", l.usbId || ""],
+    ["Media", ram ? "Compressed RAM" : mediaText(device)],
+    ["Partitions", ram ? "" : partTableText(device)],
+    ["TRIM", ram ? "" : trim],
+    ["Write lock", device.readOnly === true ? "On — the device is read-only" : ""],
+    ["Device", device.path],
+    ["Size", exactSize(device.sizeBytes)]
+  ]
+  return rows
+    .map(function(r) { return [r[0], plain(r[1])] })
+    .filter(function(r) { return r[1] !== "" })
+}
+
+function volumeInfoRows(volume, readOnly) {
+  if (!volume) return []
+  var device = exact(volume.path)
+  if (exact(volume.fsPath) !== "" && exact(volume.fsPath) !== device) device += " → " + exact(volume.fsPath)
+  var usage = ""
+  if (volume.mounted && volume.fssize > 0) {
+    usage = formatBytes(volume.fsused) + " used of " + formatBytes(volume.fssize) +
+            " (" + Math.round(usedFraction(volume) * 100) + "%)"
+  }
+  var rows = [
+    ["Filesystem", volume.encrypted && !volume.unlocked ? "LUKS (locked)" : filesystemText(volume)],
+    ["Label", volume.label],
+    ["UUID", volume.uuid],
+    ["Partition", volume.partTypeName],
+    ["Part. name", volume.partLabel !== volume.label ? volume.partLabel : ""],
+    ["PARTUUID", volume.partUuid],
+    ["Device", device],
+    ["Encryption", volume.encrypted ? "LUKS · " + (volume.unlocked ? "unlocked" : "locked") : ""],
+    ["Access", volume.mounted ? (readOnly === true ? "Read-only" : "Read-write") : ""],
+    ["Mounted at", volume.mounted ? volume.mountpoint : ""],
+    ["Usage", usage],
+    ["Size", exactSize(volume.sizeBytes)]
+  ]
+  return rows
+    .map(function(r) { return [r[0], plain(r[1])] })
+    .filter(function(r) { return r[1] !== "" })
+}
+
+// "Nearly full" was a hard-coded 90%. It is a setting now, clamped so a typo
+// cannot paint every drive urgent or none of them ever.
+function fullThreshold(pct) {
+  var n = Number(pct)
+  if (!isFinite(n)) n = 90
+  return Math.max(50, Math.min(100, Math.round(n))) / 100
+}
+
+function nearlyFull(volume, pct) {
+  if (!volume || !volume.mounted || !(volume.fssize > 0)) return false
+  return usedFraction(volume) >= fullThreshold(pct)
+}
+
+// Dirty + Writeback from /proc/meminfo: data programs have "written" that the
+// kernel has not flushed to any disk yet. The kernel only reports it for the
+// whole system, so it is shown as a hint beside a removable drive, never as a
+// verdict about that drive.
+function parseDirtyBytes(raw) {
+  var total = 0
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(/^(Dirty|Writeback):\s+(\d+)\s*kB/)
+    if (m) total += Number(m[2]) * 1024
+  }
+  return total
+}
+
+// Optional helpers this plugin can hand work to when they are installed — and
+// hides the buttons for when they are not, rather than offering a click that
+// opens a terminal saying "command not found".
+var OPTIONAL_TOOLS = [
+  "omarchy-ntfs-fix", "omarchy-drive-trim", "omarchy-drive-scrub",
+  "omarchy-drive-flash", "omarchy-drive-recover", "omarchy-disk-speedtest", "dua"
+]
+
+function parseToolList(raw) {
+  var out = {}
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var name = clean(lines[i])
+    if (OPTIONAL_TOOLS.indexOf(name) !== -1) out[name] = true
+  }
+  return out
+}
+
 // ------------------------------------------------------------ drive health
 //
 // smartctl is the reflex and it is the wrong tool here: it wants root for most
@@ -1892,6 +2352,73 @@ function smartHint(smart) {
   return parts.join(" · ")
 }
 
+// ------------------------------------------------------------ background alerts
+//
+// The panel is closed nearly all the time, so the two problems that do not
+// wait to be looked at — a disk reporting itself failing, and a disk filling
+// up — have to be said in a notification. Both are edge-triggered: said once
+// when the state is entered, not on every refresh while it lasts.
+
+var HEALTH_RANK = { unsupported: 0, healthy: 0, warning: 1, failing: 2 }
+
+// Whether a health verdict got worse. A first reading that is already bad
+// counts — that is the case this exists for — while a drive going from
+// failing back to warning is not news worth interrupting someone with.
+function healthWorsened(previous, next) {
+  var before = HEALTH_RANK[previous] || 0
+  var after = HEALTH_RANK[next] || 0
+  return after > 0 && after > before
+}
+
+// Filesystems that are full by design: a read-only image is always 100%.
+var NO_SPACE_ALERT_FS = ["iso9660", "udf", "squashfs", "erofs", "swap"]
+
+function spaceAlertKey(volume) {
+  return exact(volume.uuid) !== "" ? "uuid:" + exact(volume.uuid) : "path:" + exact(volume.fsPath)
+}
+
+// Volumes that just crossed the nearly-full line, and the new set of volumes
+// already alerted for. One stays alerted until it drops three points below
+// the line, so a volume hovering at the threshold does not alert on every
+// refresh as a few megabytes come and go.
+function spaceAlerts(devices, alerted, pct) {
+  var line = fullThreshold(pct)
+  var next = {}
+  var alerts = []
+  for (var d = 0; d < (devices || []).length; d++) {
+    var volumes = devices[d].volumes || []
+    for (var v = 0; v < volumes.length; v++) {
+      var vol = volumes[v]
+      if (!vol.mounted || !(vol.fssize > 0)) continue
+      if (NO_SPACE_ALERT_FS.indexOf(clean(vol.fstype)) !== -1) continue
+      var key = spaceAlertKey(vol)
+      var used = usedFraction(vol)
+      var was = !!(alerted && alerted[key])
+      if (used >= line) {
+        next[key] = true
+        if (!was) alerts.push({ device: devices[d], volume: vol, fraction: used })
+      } else if (was && used > line - 0.03) {
+        next[key] = true
+      }
+    }
+  }
+  return { alerts: alerts, alerted: next }
+}
+
+function spaceAlertText(alert) {
+  var vol = alert.volume
+  var name = vol.mountpoint === "/" ? "The system drive (/)" : vol.title
+  return name + " is " + Math.round(alert.fraction * 100) + "% full — " +
+         (formatBytes(vol.fsavail) || "0 B") + " left"
+}
+
+// udisks answers a mount of something already mounted with AlreadyMounted.
+// With Omarchy's udiskie auto-mounting too, that is the normal outcome of
+// plugging a drive in, not an error to notify about.
+function isAlreadyMounted(stderr) {
+  return /AlreadyMounted|is already mounted/i.test(String(stderr || ""))
+}
+
 function hasUnmountedNtfs(devices) {
   if (!devices) return false
   for (var d = 0; d < devices.length; d++) {
@@ -2045,6 +2572,11 @@ function parseNetworkMounts(rawInput) {
         var sizeB = Number(item.size || 0)
         var usedB = Number(item.used || 0)
         var availB = Number(item.avail || 0)
+        // An account over its quota has negative free space, which statfs
+        // hands back as a wrapped unsigned number — "16384 PB free" on a
+        // 5 GB OneDrive. Free space beyond the size is not free space.
+        var overQuota = sizeB > 0 && usedB > sizeB
+        if (availB > sizeB) availB = Math.max(0, sizeB - usedB)
 
         var server = ""
         var remotePath = ""
@@ -2086,9 +2618,10 @@ function parseNetworkMounts(rawInput) {
           sizeBytes: sizeB,
           usedBytes: usedB,
           availBytes: availB,
+          overQuota: overQuota,
           sizeText: formatBytes(sizeB),
           usedText: formatBytes(usedB),
-          availText: formatBytes(availB),
+          availText: formatBytes(availB) || "0 B",
           usedFraction: sizeB > 0 ? Math.max(0, Math.min(1, usedB / sizeB)) : 0
         })
       }
@@ -2150,6 +2683,7 @@ function parseNetworkMounts(rawInput) {
       sizeBytes: 0,
       usedBytes: 0,
       availBytes: 0,
+      overQuota: false,
       sizeText: "",
       usedText: "",
       availText: "",
@@ -2462,6 +2996,155 @@ function cloudRootFilesMeta(count, bytes) {
   var n = Number(count || 0)
   if (n <= 0) return "Files that sit in no folder"
   return n + (n === 1 ? " file" : " files") + " · " + formatCloudBytes(bytes)
+}
+
+// ------------------------------------------------- cloud account paths
+//
+// Every account owns two folders: the one it syncs into and the one its
+// read-only browse mount appears at. Two accounts sharing either is a quiet
+// disaster — two bisync jobs fighting over one folder, or one rclone mount
+// answering for two accounts (which is exactly how gdrive2 ended up showing
+// gdrive's files). So paths are compared after expansion, and nesting counts
+// as sharing: a sync folder inside another account's sync folder is synced
+// twice.
+
+function expandHomePath(path, home) {
+  var value = String(path === undefined || path === null ? "" : path).replace(/^\s+|\s+$/g, "")
+  var h = String(home || "").replace(/\/+$/, "")
+  if (value === "~") value = h
+  else if (value.indexOf("~/") === 0) value = h + value.substring(1)
+  value = value.replace(/\/{2,}/g, "/")
+  if (value.length > 1) value = value.replace(/\/+$/, "")
+  return value
+}
+
+function pathsOverlap(a, b) {
+  if (a === "" || b === "") return false
+  return a === b || a.indexOf(b + "/") === 0 || b.indexOf(a + "/") === 0
+}
+
+// The same character set cloud-sync.py accepts, so the form refuses what the
+// helper would refuse anyway — before anything has been saved.
+var CLOUD_REMOTE_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._@\/-]*$/
+
+function validateCloudAccount(accounts, account, home, editingRemote) {
+  if (!account) return { ok: false, reason: "Nothing to save" }
+  var remote = clean(account.remoteName).replace(/:$/, "")
+  if (remote === "") return { ok: false, reason: "Enter the rclone remote name" }
+  if (!CLOUD_REMOTE_NAME.test(remote)) {
+    return { ok: false, reason: "Remote names use letters, numbers, spaces, dots, dashes and underscores" }
+  }
+  var folder = expandHomePath(account.folderPath, home)
+  var mount = expandHomePath(account.browseMountPath, home)
+  var h = expandHomePath(home, home)
+  if (folder === "") return { ok: false, reason: "Choose a local sync folder" }
+  if (mount === "") return { ok: false, reason: "Choose a browse mount folder" }
+  if (h !== "") {
+    if (folder === h || folder.indexOf(h + "/") !== 0) {
+      return { ok: false, reason: "The sync folder has to be inside your home folder" }
+    }
+    if (mount === h || mount.indexOf(h + "/") !== 0) {
+      return { ok: false, reason: "The browse folder has to be inside your home folder" }
+    }
+  }
+  if (pathsOverlap(folder, mount)) {
+    return { ok: false, reason: "The sync folder and the browse folder must be separate" }
+  }
+  for (var i = 0; i < (accounts || []).length; i++) {
+    var other = accounts[i]
+    if (!other || other.remoteName === editingRemote) continue
+    if (other.remoteName === remote) return { ok: false, reason: "'" + remote + "' is already connected" }
+    var otherFolder = expandHomePath(other.folderPath, home)
+    var otherMount = expandHomePath(other.browseMountPath, home)
+    if (pathsOverlap(folder, otherFolder) || pathsOverlap(folder, otherMount)) {
+      return { ok: false, reason: "That sync folder is already used by '" + plain(other.remoteName) + "'" }
+    }
+    if (pathsOverlap(mount, otherMount) || pathsOverlap(mount, otherFolder)) {
+      return { ok: false, reason: "That browse folder is already used by '" + plain(other.remoteName) + "'" }
+    }
+  }
+  return { ok: true, reason: "" }
+}
+
+// Accounts saved before validation existed can already collide. Each
+// colliding account gets the reason, so its card can say what to fix rather
+// than quietly mounting the wrong drive.
+//
+// Only the later of two colliding accounts is flagged: the first one was
+// there first and is working, and the fix belongs to the one that moved in.
+function cloudPathConflicts(accounts, home) {
+  var out = {}
+  var list = accounts || []
+  for (var i = 0; i < list.length; i++) {
+    var check = validateCloudAccount(list.slice(0, i), list[i], home, list[i].remoteName)
+    if (!check.ok) out[list[i].remoteName] = check.reason
+  }
+  return out
+}
+
+// The header line for the network tab: how many accounts, and how many want
+// attention — which is what someone opening the tab is looking for.
+function cloudOverview(accounts, statuses, conflicts, shareCount) {
+  var list = accounts || []
+  var parts = []
+  if (list.length > 0) {
+    var attention = 0
+    var syncing = 0
+    for (var i = 0; i < list.length; i++) {
+      var name = list[i].remoteName
+      var tone = cloudTone((statuses || {})[name], (conflicts || {})[name])
+      if (tone === "error" || tone === "warn") attention++
+      if (tone === "busy") syncing++
+    }
+    parts.push(list.length + (list.length === 1 ? " cloud drive" : " cloud drives"))
+    if (syncing > 0) parts.push(syncing + " syncing")
+    if (attention > 0) parts.push(attention + " need" + (attention === 1 ? "s" : "") + " attention")
+  }
+  if (shareCount > 0) parts.push(shareCount + (shareCount === 1 ? " network share" : " network shares"))
+  return parts.length > 0 ? parts.join(" · ") : "No cloud drives or network shares"
+}
+
+// A browse mount that belongs to a connected account is already drawn on that
+// account's card; listing it again as a "network share" doubled every cloud
+// drive on the tab.
+function isAccountBrowseMount(accounts, mountpoint, home) {
+  var target = expandHomePath(mountpoint, home)
+  for (var i = 0; i < (accounts || []).length; i++) {
+    if (expandHomePath(accounts[i].browseMountPath, home) === target) return true
+  }
+  return false
+}
+
+function visibleNetworkShares(shares, accounts, home) {
+  var out = []
+  for (var i = 0; i < (shares || []).length; i++) {
+    if (!isAccountBrowseMount(accounts, shares[i].mountpoint, home)) out.push(shares[i])
+  }
+  return out
+}
+
+function cloudUsageFraction(status) {
+  if (!status || !status.quotaKnown || !(status.quotaBytes > 0)) return 0
+  return Math.max(0, Math.min(1, Number(status.usedBytes || 0) / status.quotaBytes))
+}
+
+// One word for the state of an account, for the dot on its tile and the
+// colour of its status tag: error and warn ask for attention, busy is a sync
+// in progress, ok is synced, idle is everything else.
+function cloudTone(status, conflict) {
+  if (!status) return "idle"
+  if (conflict) return "warn"
+  if (status.syncing) return "busy"
+  if (status.lastResult === "error" || status.ok === false) return "error"
+  if (!status.authenticated && status.statusText !== "Checking…") return "warn"
+  if (status.browseStale || status.browseConflict) return "warn"
+  if (status.quotaKnown && status.quotaBytes > 0 && status.usedBytes > status.quotaBytes) return "warn"
+  if (status.baseline || status.lastResult === "ok") return "ok"
+  return "idle"
+}
+
+function cloudOverQuota(status) {
+  return !!(status && status.quotaKnown && status.quotaBytes > 0 && status.usedBytes > status.quotaBytes)
 }
 
 function shortHomePath(path, home) {
