@@ -241,6 +241,12 @@ Item {
     return false
   }
 
+  // The storage being written right now - any drive, the system disk
+  // included, or a syncing cloud account - for the bar icon and the header.
+  // Unlike anyBusy it never holds an eject back. See Model.writingNow.
+  readonly property var writing: Model.writingNow(devices, activity, _busyTicks,
+                                                  cloudAccounts, cloudStatuses)
+
   readonly property real totalWriteRate: {
     var total = 0
     for (var i = 0; i < ejectableDevices.length; i++) {

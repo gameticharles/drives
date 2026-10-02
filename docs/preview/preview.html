@@ -1,0 +1,118 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<!-- Rendered to ../../preview.png with headless chromium at 1500x1124. -->
+<style>
+  :root {
+    --bg: #0b0b0d;
+    --line: #26262a;
+    --text: #e4e4e6;
+    --muted: #9a9aa2;
+    --accent: #e68e0d;
+    --urgent: #e06c6c;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1500px; height: 1124px; }
+  body {
+    font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace;
+    color: var(--text);
+    padding: 50px 60px 0;
+    background:
+      radial-gradient(800px 380px at 10% -12%, rgba(230, 142, 13, 0.18), transparent 70%),
+      radial-gradient(700px 360px at 95% 105%, rgba(224, 108, 108, 0.10), transparent 70%),
+      var(--bg);
+  }
+
+  /* Header: name and promise on the left, what it covers on the right. */
+  header { display: flex; justify-content: space-between; align-items: center; gap: 40px; }
+  .brand { display: flex; align-items: center; gap: 22px; }
+  .icon {
+    width: 88px; height: 88px; flex: none; border: 3px solid var(--accent); border-radius: 20px;
+    display: grid; place-items: center; font-size: 50px; color: var(--accent);
+    background: rgba(230, 142, 13, 0.08);
+  }
+  h1 { font-size: 54px; font-weight: 800; letter-spacing: -1.5px; line-height: 1; }
+  h1 span { color: var(--accent); }
+  .tagline { margin-top: 12px; font-size: 19px; line-height: 1.4; color: var(--muted); }
+  .tagline b { color: var(--text); font-weight: 600; }
+  .pills { display: grid; grid-template-columns: repeat(3, auto); gap: 9px; }
+  .pill { font-size: 15px; padding: 7px 12px; border: 1.5px solid var(--line); border-radius: 7px;
+          color: var(--muted); background: rgba(255, 255, 255, 0.02); white-space: nowrap; text-align: center; }
+  .pill.hot { color: var(--urgent); border-color: rgba(224, 108, 108, 0.55); background: rgba(224, 108, 108, 0.08); }
+
+  /* Three panels, columns ending level. */
+  .shots { display: grid; grid-template-columns: repeat(3, 430px); justify-content: space-between; margin-top: 36px; }
+  .cap { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; white-space: nowrap; }
+  .cap b { font-size: 18px; letter-spacing: 3px; color: var(--accent); }
+  .cap b.urgent { color: var(--urgent); }
+  .cap span { font-size: 15px; color: var(--muted); }
+  .shot { display: block; width: 430px; border-radius: 4px;
+          box-shadow: 0 24px 48px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.04); }
+
+  /* Under the shorter panel: the bar icon itself, bright and dim. */
+  .strip { margin-top: 14px; height: 64px; display: flex; align-items: center; gap: 10px;
+           padding: 0 12px 0 6px; border: 1.5px solid rgba(224, 108, 108, 0.45); border-radius: 8px;
+           background: rgba(224, 108, 108, 0.06); }
+  .strip img { display: block; height: 44px; border-radius: 5px; }
+  .strip p { font-size: 14px; line-height: 1.35; color: var(--muted); white-space: nowrap; }
+  .strip p b { color: var(--urgent); font-weight: 600; }
+
+  /* Features across the full width. */
+  .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px 40px;
+              margin-top: 38px; padding-top: 30px; border-top: 1.5px solid var(--line); }
+  .f { display: flex; gap: 14px; }
+  .f i { font-style: normal; color: var(--accent); font-size: 24px; flex: 0 0 30px; text-align: center; line-height: 1.2; }
+  .f b { display: block; font-size: 18px; margin-bottom: 4px; }
+  .f p { font-size: 15px; line-height: 1.4; color: var(--muted); }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="icon">󰋊</div>
+      <div>
+        <h1>Storage <span>Drives</span></h1>
+        <p class="tagline">Every drive in the Omarchy bar: mount, inspect, format,<br>sync and <b>eject safely</b>, without leaving the desktop.</p>
+      </div>
+    </div>
+    <div class="pills">
+      <span class="pill">USB &amp; SD</span>
+      <span class="pill">Internal disks</span>
+      <span class="pill">Phones</span>
+      <span class="pill">Google Drive</span>
+      <span class="pill">OneDrive · Mega</span>
+      <span class="pill hot">● Live writes</span>
+    </div>
+  </header>
+
+  <section class="shots">
+    <figure>
+      <div class="cap"><b class="urgent">WRITING</b><span>live speed, any drive</span></div>
+      <img class="shot" src="drives-writing.png">
+      <div class="strip">
+        <img src="bar-a-small.png">
+        <img src="bar-b-small.png">
+        <p><b>Pulses red</b><br>in the bar</p>
+      </div>
+    </figure>
+    <figure>
+      <div class="cap"><b>DRIVE INFO</b><span>spec sheet, click to copy</span></div>
+      <img class="shot" src="info.png">
+    </figure>
+    <figure>
+      <div class="cap"><b>CLOUD</b><span>multi-account rclone sync</span></div>
+      <img class="shot" src="network-safe.png">
+    </figure>
+  </section>
+
+  <section class="features">
+    <div class="f"><i>󰕓</i><div><b>Safe eject</b><p>Held until the kernel has finished writing, then fired.</p></div></div>
+    <div class="f"><i>󰅟</i><div><b>Multi-cloud sync</b><p>Google Drive, Mega, OneDrive, Dropbox; selective folders.</p></div></div>
+    <div class="f"><i>󰋽</i><div><b>Drive Info</b><p>Model, serial, link speed, TRIM, filesystem details.</p></div></div>
+    <div class="f"><i>󰆴</i><div><b>Format</b><p>A volume or a whole drive, confirmed by its name.</p></div></div>
+    <div class="f"><i>󰁨</i><div><b>NTFS repair &amp; health</b><p>Dirty-bit check and repair; drive health readings.</p></div></div>
+    <div class="f"><i>󰄜</i><div><b>Phones &amp; cameras</b><p>Android over MTP, iPhone over AFC and PTP.</p></div></div>
+  </section>
+</body>
+</html>

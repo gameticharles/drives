@@ -315,11 +315,18 @@ Panel {
   readonly property int barSize: bar ? bar.barSize : Style.bar.sizeHorizontal
   readonly property string labelMode: vertical ? "none" : String(setting("barLabel", "none"))
   readonly property string barLabel: Model.barLabelText(devices, labelMode)
-  readonly property string barTooltip: drives.anyBusy
+  // A removable drive still busy says "do not remove"; any other write - the
+  // system disk, an internal drive, a cloud sync - says what is being written
+  // and how fast. Either way the bar icon turns urgent and pulses, and shows
+  // the icon of the storage being written.
+  readonly property bool writingActive: drives.anyBusy || drives.writing !== null
+  readonly property string statusLine: drives.anyBusy
     ? (Model.formatRate(drives.totalWriteRate) !== ""
         ? "Writing " + Model.formatRate(drives.totalWriteRate) + " — do not remove"
         : "Busy — do not remove")
-    : Model.summary(devices)
+    : (drives.writing ? Model.writingText(drives.writing) : Model.summary(devices))
+  readonly property string barTooltip: statusLine
+  readonly property string barIcon: drives.writing ? drives.writing.glyph : Model.barGlyph(devices)
 
   // Key of the drive whose nickname is being edited inline, "" when none is.
   property string renamingKey: ""
@@ -740,6 +747,17 @@ Panel {
       return "ok"
     }
 
+    // Opens the panel on one drive with its details (Drive Info) open:
+    // `omarchy-shell storage-drives showDrive /dev/sda`.
+    function showDrive(path: string): string {
+      var device = drives.deviceByPath(path)
+      if (!device) return "unknown device: " + path
+      root.activeTab = "local"
+      root.expandedDevicePath = device.path
+      root.open()
+      return "ok"
+    }
+
     function setTab(tab: string): string {
       if (tab === "local" || tab === "network") {
         root.activeTab = tab
@@ -755,6 +773,8 @@ Panel {
         mounted: drives.mountedCount,
         busy: drives.anyBusy,
         writeRate: Math.round(drives.totalWriteRate),
+        writing: drives.writing ? { kind: drives.writing.kind, name: drives.writing.name,
+                                    rate: Math.round(drives.writing.rate) } : null,
         pendingEject: drives.pendingEjectPath,
         working: drives.busy,
         checked: drives.checkedFsPath,
@@ -769,6 +789,15 @@ Panel {
     id: button
     anchors.fill: parent
     sourceComponent: root.labelMode !== "none" && root.barLabel !== "" ? labelledButton : iconButton
+
+    // A slow pulse while storage is being written, back to steady after.
+    SequentialAnimation on opacity {
+      running: root.writingActive
+      loops: Animation.Infinite
+      NumberAnimation { to: 0.35; duration: 700; easing.type: Easing.InOutSine }
+      NumberAnimation { to: 1; duration: 700; easing.type: Easing.InOutSine }
+      onRunningChanged: if (!running) button.opacity = 1
+    }
   }
 
   Component {
@@ -777,12 +806,12 @@ Panel {
     BarIconButton {
       anchors.fill: parent
       bar: root.bar
-      text: Model.barGlyph(root.devices)
+      text: root.barIcon
       tooltipText: root.hasUnmountedNtfs
         ? root.barTooltip + " · Unmounted NTFS partitions detected (click to manage/fix)"
         : root.barTooltip
-      active: drives.anyBusy || root.hasUnmountedNtfs
-      activeColor: drives.anyBusy ? root.urgent : (bar && "activeColor" in bar ? bar.activeColor : root.foreground)
+      active: root.writingActive || root.hasUnmountedNtfs
+      activeColor: root.writingActive ? root.urgent : (bar && "activeColor" in bar ? bar.activeColor : root.foreground)
       useActiveColor: true
       onPressed: function(buttonCode) { root.handleBarPress(buttonCode) }
     }
@@ -794,12 +823,12 @@ Panel {
     WidgetButton {
       anchors.fill: parent
       bar: root.bar
-      text: Model.barGlyph(root.devices) + "  " + root.barLabel
+      text: root.barIcon + "  " + root.barLabel
       tooltipText: root.hasUnmountedNtfs
         ? root.barTooltip + " · Unmounted NTFS partitions detected (click to manage/fix)"
         : root.barTooltip
-      active: drives.anyBusy || root.hasUnmountedNtfs
-      activeColor: drives.anyBusy ? root.urgent : (bar && "activeColor" in bar ? bar.activeColor : root.foreground)
+      active: root.writingActive || root.hasUnmountedNtfs
+      activeColor: root.writingActive ? root.urgent : (bar && "activeColor" in bar ? bar.activeColor : root.foreground)
       useActiveColor: true
       onPressed: function(buttonCode) { root.handleBarPress(buttonCode) }
     }
@@ -891,18 +920,16 @@ Panel {
             title: root.activeTab === "network" ? "Network Storage" : "Storage Drives"
             meta: root.activeTab === "network"
               ? Model.cloudOverview(drives.cloudAccounts, drives.cloudStatuses, drives.cloudConflicts, drives.networkCount)
-              : (drives.anyBusy
-                  ? (Model.formatRate(drives.totalWriteRate) !== ""
-                      ? "Writing " + Model.formatRate(drives.totalWriteRate) + " — do not remove"
-                      : "Busy — do not remove")
-                  : Model.summary(root.devices))
+              : root.statusLine
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
               Text {
                 textFormat: Text.PlainText
-                text: root.activeTab === "network" ? Model.GLYPH_SERVER : Model.barGlyph(root.devices)
-                color: root.foreground
+                text: root.activeTab === "network"
+                  ? (drives.writing && drives.writing.kind === "cloud" ? drives.writing.glyph : Model.GLYPH_SERVER)
+                  : root.barIcon
+                color: root.writingActive ? root.urgent : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.display
               }
@@ -3651,16 +3678,30 @@ Panel {
                   var conn = Model.connectionShort(storageCardRoot.device, storageCardRoot.link)
                   if (conn !== "") parts.push(conn)
                   if (storageCardRoot.device.volumes.length === 0 && !storageCardRoot.isSystem) parts.push("No media inserted")
-                  if (storageCardRoot.activity !== "") parts.push(storageCardRoot.activity)
                   return parts.join(" · ")
                 }
-                // Activity on a drive that cannot be pulled is information,
-                // not a warning: the system disk writes all the time.
-                color: storageCardRoot.activity !== "" && storageCardRoot.ejectable ? root.urgent : root.dim
+                color: root.dim
                 Layout.fillWidth: true
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
+              }
+
+              // The activity on its own, so a long line of drive details
+              // (kind, size, link speed) elides instead of it. Urgent on a
+              // drive that can be pulled, and on the one the bar shows as
+              // being written; the system disk's small background writes stay
+              // quiet - they are information, not a warning.
+              Text {
+                visible: storageCardRoot.activity !== ""
+                textFormat: Text.PlainText
+                text: "· " + storageCardRoot.activity
+                color: storageCardRoot.ejectable
+                       || (drives.writing && storageCardRoot.device
+                           && drives.writing.name === storageCardRoot.device.name)
+                       ? root.urgent : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
               }
 
               Text {

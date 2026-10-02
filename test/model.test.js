@@ -2661,5 +2661,45 @@ test("udisks' already-mounted answer is recognised", () => {
   assert.strictEqual(api.isAlreadyMounted("Error mounting: wrong fs type"), false)
 })
 
+// ------------------------------------------------------------ writing now
+
+const wSys = { name: "nvme0n1", kind: "system", removable: false, isSystem: true, title: "SAMSUNG MZVLQ512", glyph: api.GLYPH_INTERNAL }
+const wStick = { name: "sdb", kind: "thumb", removable: true, isSystem: false, title: "SanDisk Ultra", glyph: api.GLYPH_USB }
+const wZram = { name: "zram0", kind: "swap", removable: false, isSystem: true, title: "Compressed Swap", glyph: api.GLYPH_INTERNAL }
+const MB = 1024 * 1024
+
+test("the system disk writing counts once the write is real", () => {
+  const w = api.writingNow([wSys], { nvme0n1: { writeRate: 1.3 * MB } }, { nvme0n1: 2 }, [], {})
+  assert.strictEqual(w.kind, "internal")
+  assert.strictEqual(w.glyph, api.GLYPH_INTERNAL)
+  assert.strictEqual(api.writingText(w), "Writing 1.3 MB/s · SAMSUNG MZVLQ512")
+})
+
+test("journald-sized writes and a single busy sample do not", () => {
+  assert.strictEqual(api.writingNow([wSys], { nvme0n1: { writeRate: 40 * 1024 } }, { nvme0n1: 5 }, [], {}), null)
+  assert.strictEqual(api.writingNow([wSys], { nvme0n1: { writeRate: 8 * MB } }, { nvme0n1: 1 }, [], {}), null)
+})
+
+test("swap is never the drive being written", () => {
+  assert.strictEqual(api.writingNow([wZram], { zram0: { writeRate: 50 * MB } }, { zram0: 9 }, [], {}), null)
+})
+
+test("a removable drive wins over a faster internal one, and says do not remove", () => {
+  const w = api.writingNow([wSys, wStick], { nvme0n1: { writeRate: 90 * MB }, sdb: { writeRate: 2 * MB } },
+                           { nvme0n1: 3, sdb: 3 }, [], {})
+  assert.strictEqual(w.name, "sdb")
+  assert.strictEqual(w.glyph, api.GLYPH_USB)
+  assert.ok(/— do not remove$/.test(api.writingText(w)), api.writingText(w))
+})
+
+test("a syncing cloud account shows with its provider when no drive is writing", () => {
+  const accounts = [{ remoteName: "gdrive", type: "drive" }]
+  const w = api.writingNow([wSys], {}, {}, accounts, { gdrive: { syncing: true } })
+  assert.strictEqual(w.kind, "cloud")
+  assert.strictEqual(w.glyph, api.cloudProviderGlyph("drive"))
+  assert.strictEqual(api.writingText(w), "Syncing " + api.cloudProviderLabel("drive"))
+  assert.strictEqual(api.writingNow([wSys], {}, {}, accounts, { gdrive: { syncing: false } }), null)
+})
+
 console.log(failures === 0 ? "\nAll tests passed." : `\n${failures} test(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

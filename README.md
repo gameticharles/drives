@@ -2,6 +2,8 @@
 
 USB sticks, SD cards, phones, external HDDs/SSDs, internal system storage, and multi-cloud accounts (Google Drive, Mega, OneDrive, Dropbox) in the Omarchy bar: mount, open, inspect, format, auto-repair NTFS dirty bits, two-way selective sync, and safely eject without leaving the desktop.
 
+![Storage Drives: the drive being written pulsing red in the bar, Drive Info, and cloud accounts](preview.png)
+
 ## Advanced Features in Storage Drives
 
 - **Multi-Cloud Drive Integration**: Add multiple Google Drive, Mega, OneDrive, Dropbox, and Nextcloud/WebDAV accounts via rclone directly in the Network & Cloud tab. Features selective folder syncing (keep only chosen folders on disk), root files syncing, stale file detection/cleanup, auto-sync timers via systemd, and read-only on-demand browsing (`rclone mount`) without consuming local disk space.
@@ -22,10 +24,16 @@ USB sticks, SD cards, phones, external HDDs/SSDs, internal system storage, and m
 - **Mount, open, and eject** any removable volume without a password, because
   udisks2 already lets the logged-in session do it. Ejecting unmounts every
   volume on the drive, re-locks anything encrypted, then powers it down.
-- **Knows when the drive is still being written to.** The icon turns urgent
-  while the kernel has I/O in flight and the panel shows the live rate, because
-  a copy dialog reaching 100% is not the moment a stick is safe to pull. An
-  eject asked for mid-copy is held, then fires once the drive goes quiet.
+- **Shows what is being written, and how fast.** While any drive is being
+  written — a USB stick, an internal disk or the system drive — or a cloud
+  account is syncing, the bar icon becomes that drive's own icon and pulses
+  red, and the panel header shows the live speed. Small background writes to
+  the system disk (the journal, caches) are left out, so it only pulses for a
+  real write.
+- **Knows when a removable drive is still being written to.** Only a drive
+  that can be unplugged says "do not remove", because a copy dialog reaching
+  100% is not the moment a stick is safe to pull. An eject asked for mid-copy
+  is held, then fires once the drive goes quiet.
 - **Names who is holding a busy mount**, instead of stopping at `target is
   busy`, and offers a lazy unmount as an explicit second choice.
 - **Phones and cameras** get their own section: Android over MTP, iPhone over
@@ -285,6 +293,7 @@ omarchy-shell storage-drives toggleTelemetry /dev/sdb      # toggle telemetry ro
 omarchy-shell storage-drives setTab network                # switch to "local" or "network"
 omarchy-shell storage-drives info /dev/sdb                 # drive or volume details, as JSON
 omarchy-shell storage-drives openCloud gdrive              # open a cloud account's detail view
+omarchy-shell storage-drives showDrive /dev/sda            # open a drive with its Drive Info shown
 omarchy-shell storage-drives unmountAll /dev/sdb           # unmount every volume, no power-off
 omarchy-shell storage-drives formatDrive /dev/sdb exfat Photos # wipes the whole drive
 ```

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "storage-drives",
   "name": "Storage Drives",
-  "version": "2.5.0",
+  "version": "2.5.5",
   "author": "Charles Gameti",
   "license": "MIT",
-  "description": "View and manage all storage drives (internal, external, and cloud) on the machine, monitor stats, format, auto-repair NTFS, multi-cloud sync (Google Drive, Mega, OneDrive), and eject removable media safely.",
+  "description": "Every drive in the Omarchy bar: USB sticks, SD cards, phones, internal disks and cloud drives. Mount, inspect, format, repair NTFS, sync Google Drive, Mega, OneDrive and Dropbox, and eject safely, with a bar icon that pulses red and shows which drive is being written and how fast.",
   "kinds": [
     "bar-widget"
   ],
@@ -149,5 +149,29 @@
         "description": "USB disks this size or smaller get the thumb-drive icon unless the model name says otherwise. Bigger ones show as external drives."
       }
     ]
-  }
+  },
+  "homepage": "https://github.com/gameticharles/drives",
+  "repository": "https://github.com/gameticharles/drives",
+  "keywords": [
+    "storage",
+    "drives",
+    "usb",
+    "sd-card",
+    "removable",
+    "mount",
+    "eject",
+    "udisks",
+    "nvme",
+    "disk-health",
+    "format",
+    "ntfs",
+    "cloud",
+    "rclone",
+    "google-drive",
+    "onedrive",
+    "mega",
+    "dropbox",
+    "sync",
+    "bar-widget"
+  ]
 }

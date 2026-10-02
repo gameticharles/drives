@@ -635,6 +635,73 @@ function activityLabel(entry) {
   return ""
 }
 
+// ----------------------------------------------------------- writing now
+//
+// What the bar icon and the panel header show while storage is being written:
+// the drive (or cloud account) taking the writes, its own icon, and how fast.
+//
+// This is separate from "do not remove", which only ever looks at drives that
+// can be unplugged. The disk the system runs from takes small writes every few
+// seconds (the journal, browser caches), and when it counted toward "do not
+// remove" the icon flashed urgent for journald and eject-all was held back
+// indefinitely. Here it counts, but only once a write is real: fast enough,
+// and still going on the next sample.
+var WRITING_MIN_RATE = 256 * 1024
+var WRITING_TICKS = 2
+
+// The storage being written right now, or null. A removable drive comes first
+// (it is the one that loses data if pulled), then the fastest other drive,
+// then a cloud account that is syncing - which reports no rate.
+function writingNow(devices, activity, ticks, accounts, statuses) {
+  var best = null
+  for (var i = 0; i < (devices || []).length; i++) {
+    var d = devices[i]
+    if (!d || d.kind === "swap") continue
+    var entry = (activity || {})[d.name]
+    var rate = entry ? Number(entry.writeRate) || 0 : 0
+    if (rate < WRITING_MIN_RATE || (Number((ticks || {})[d.name]) || 0) < WRITING_TICKS) continue
+    var removable = isEjectable(d)
+    if (best && (best.removable && !removable)) continue
+    if (best && best.removable === removable && best.rate >= rate) continue
+    best = {
+      kind: removable ? "removable" : "internal",
+      removable: removable,
+      name: String(d.name || ""),
+      title: String(d.title || d.name || "Drive"),
+      glyph: d.glyph || GLYPH_DISK,
+      rate: rate
+    }
+  }
+  if (best) return best
+  for (var j = 0; j < (accounts || []).length; j++) {
+    var account = accounts[j]
+    var status = (statuses || {})[account.remoteName]
+    if (status && status.syncing) {
+      return {
+        kind: "cloud",
+        removable: false,
+        name: String(account.remoteName || ""),
+        title: cloudProviderLabel(account.type),
+        glyph: cloudProviderGlyph(account.type),
+        rate: 0
+      }
+    }
+  }
+  return null
+}
+
+// The header and tooltip line for it. "Do not remove" only for a drive that
+// can be removed.
+function writingText(writing) {
+  if (!writing) return ""
+  if (writing.kind === "cloud") return "Syncing " + writing.title
+  var rate = formatRate(writing.rate)
+  var head = rate !== "" ? "Writing " + rate : "Writing"
+  return writing.removable
+    ? head + " — do not remove"
+    : head + " · " + writing.title
+}
+
 // --------------------------------------------------------------- blockers
 
 // `ps -o pid=,comm= -p <pids>` prints "  4821 nautilus" per line.
