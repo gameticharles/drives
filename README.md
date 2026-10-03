@@ -87,6 +87,11 @@ Needs Omarchy 4 (Quattro) and `udisks2`, both standard. It calls `lsblk`,
 `udevadm`, `udisksctl`, `busctl`, `gio`, `fuser`, `du`, `wl-copy` and Omarchy's
 own `omarchy-*` helpers. Nothing runs as root.
 
+Cloud drives also need `rclone` (and `fuse3` to browse without syncing). The
+plugin never installs them itself: when rclone is missing, the Network & Cloud
+tab copies a search for the Omarchy menu (Super + Space) › Install › Package
+and opens that menu, then notices by itself once rclone is there.
+
 To remove it:
 
 ```bash

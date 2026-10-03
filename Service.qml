@@ -1225,9 +1225,37 @@ Item {
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", c])
   }
 
+  // rclone is installed by the user, through Omarchy's own package picker:
+  // this plugin never runs a package manager. It copies a search that shows
+  // exactly the packages needed ("^rclone$ | ^fuse3$" - in that fzf list a
+  // space would mean "and" and find nothing), opens the Omarchy menu at
+  // Install, then watches for rclone to arrive.
+  readonly property string rcloneSearch: rcloneFuse ? "^rclone$" : "^rclone$ | ^fuse3$"
+  property bool rcloneWaiting: false
+  property real rcloneWaitStarted: 0
+
+  function copyRcloneSearch() {
+    copyText("search for the Omarchy installer", rcloneSearch)
+  }
+
   function installRclone() {
-    var cmd = "omarchy pkg add rclone fuse3"
-    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", cmd])
+    copyRcloneSearch()
+    Quickshell.execDetached(["omarchy-menu", "summon", "install"])
+    rcloneWaitStarted = Date.now()
+    rcloneWaiting = true
+  }
+
+  Timer {
+    interval: 3000
+    repeat: true
+    running: root.rcloneWaiting
+    onTriggered: {
+      if (root.rcloneInstalled || Date.now() - root.rcloneWaitStarted > 15 * 60 * 1000) {
+        root.rcloneWaiting = false
+        return
+      }
+      root.refreshCloud()
+    }
   }
 
   function hasRemote(remoteName) {

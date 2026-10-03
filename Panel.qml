@@ -1523,14 +1523,36 @@ Panel {
                 wrapMode: Text.WordWrap
               }
 
+              // Installed through Omarchy's own package picker, never from here.
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: drives.rcloneWaiting
+                  ? "Waiting for rclone to be installed. This goes away by itself once it is."
+                  : (drives.rcloneFuse
+                     ? "Install it from the Omarchy menu (Super + Space) \u203a Install \u203a Package: paste the copied search, then Enter."
+                     : "Install rclone and fuse3 from the Omarchy menu (Super + Space) \u203a Install \u203a Package: paste the copied search, press Tab on each, then Enter.")
+                color: drives.rcloneWaiting ? root.accent : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
               Flow {
                 Layout.fillWidth: true
                 spacing: Style.space(8)
 
                 ActionChip {
-                  label: "Install rclone (Official)"
+                  label: "Copy search"
+                  iconText: Model.GLYPH_COPY
+                  tooltipText: "Copy " + drives.rcloneSearch + " for the Omarchy package picker"
+                  onClicked: drives.copyRcloneSearch()
+                }
+
+                ActionChip {
+                  label: "Open Install menu"
                   iconText: Model.GLYPH_MOUNT
-                  tooltipText: "Install rclone and fuse3 via Omarchy package manager"
+                  tooltipText: "Copy the search and open the Omarchy menu at Install"
                   danger: true
                   onClicked: drives.installRclone()
                 }
