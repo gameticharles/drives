@@ -1068,6 +1068,13 @@ Item {
     if (!remoteName) return
     if (cloudStatusProcess.running) {
       if (cloudStatusProcess.targetRemote === remoteName) return
+      // A request already waiting keeps its place. Moving it to the back on
+      // every refresh starved the accounts at the end: the 3.5 s poll
+      // re-queued them all faster than ~2 s checks could drain, so the last
+      // accounts never got a status, read as signed out, and kept the poll
+      // (and rclone) running forever.
+      var queued = _cloudStatusQueue.indexOf(remoteName) >= 0
+      if (queued && first !== true) return
       var rest = _cloudStatusQueue.filter(function(r) { return r !== remoteName })
       _cloudStatusQueue = first === true ? [remoteName].concat(rest) : rest.concat([remoteName])
       return
@@ -1296,7 +1303,8 @@ Item {
     for (var i = 0; i < cloudAccounts.length; i++) {
       var r = cloudAccounts[i].remoteName
       var st = cloudStatuses[r]
-      if (!st || !st.authenticated) return true
+      // No status yet means its check is still queued, not signed out.
+      if (st && !st.authenticated) return true
     }
     return false
   }
@@ -1374,7 +1382,7 @@ Item {
     '  [ -r "$guardfile" ] || return 0',
     '  old=$(cat "$guardfile" 2>/dev/null)',
     '  case "$old" in ""|*[!0-9]*) return 0 ;; esac',
-    '  case "$(tr -d \'\\000\' < /proc/$old/cmdline 2>/dev/null)" in',
+    '  case "$(tr -d \'\\000\' 2>/dev/null < /proc/$old/cmdline)" in',
     // The whole group, not just the inhibitor. systemd-inhibit spawns the
     // process that waits for the signal, and killing only the parent leaves
     // that child alive — reparented, still holding a gdbus monitor, blocked
@@ -1383,10 +1391,35 @@ Item {
     '    systemd-inhibit*) kill -- -"$old" 2>/dev/null ;;',
     '  esac',
     '}',
+    // The guard loop itself outlives a shell restart too (and a bar that
+    // rebuilds its widgets destroys the Process without killing it), and an
+    // orphaned loop re-arms a fresh inhibitor and monitor after every resume.
+    // So exactly one guard runs: each records its pid and stops the one before
+    // it, recognised by its exact guard-file argument in /proc. TERM lets that
+    // guard's own cleanup release its inhibitor and monitor.
+    'loopfile="$guardfile.loop"',
+    'reap_loop() {',
+    '  [ -r "$loopfile" ] || return 0',
+    '  old=$(cat "$loopfile" 2>/dev/null)',
+    '  case "$old" in ""|*[!0-9]*) return 0 ;; esac',
+    '  [ "$old" = "$$" ] && return 0',
+    "  tr '\\000' '\\n' 2>/dev/null < /proc/$old/cmdline | grep -qxF -- \"$guardfile\" || return 0",
+    '  kill "$old" 2>/dev/null',
+    // Before the inhibitor is reaped below: an old guard whose inhibitor
+    // vanished first would move on and start a monitor as it was stopped.
+    '  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do',
+    '    kill -0 "$old" 2>/dev/null || break',
+    '    sleep 0.1',
+    '  done',
+    '}',
+    'reap_loop',
     'reap_stale',
+    'printf %s "$$" > "$loopfile"',
     'cleanup() {',
     '  [ -n "${inhibit_pid:-}" ] && kill -- -"$inhibit_pid" 2>/dev/null',
     '  [ -n "${MONITOR_PID:-}" ] && kill "$MONITOR_PID" 2>/dev/null',
+    // And any child not tracked yet (a monitor started as the signal came).
+    '  pkill -TERM -P $$ 2>/dev/null',
     '  exit 0',
     '}',
     'trap cleanup EXIT INT TERM HUP',
@@ -2635,7 +2668,10 @@ Item {
 
   Process {
     id: suspendGuard
-    command: ["bash", "-c", root.suspendScript, "removable-drives",
+    // setpriv: the kernel sends the guard TERM when the shell exits, however
+    // it exits, so its trap releases the inhibitor instead of leaving it
+    // reparented to init.
+    command: ["setpriv", "--pdeathsig", "TERM", "bash", "-c", root.suspendScript, "removable-drives",
               root.suspendTargetsPath, root.suspendTargetsPath + ".guard",
               root.notificationsEnabled ? "1" : "0", Model.GLYPH_ALERT]
     running: root.unmountOnSuspend
@@ -2946,7 +2982,8 @@ Item {
     interval: 3500
     repeat: true
     running: root.cloudAccountCount > 0 && root.hasUnauthenticatedCloudAccount()
-    onTriggered: root.refreshCloud()
+    // Let the checks already in flight finish before queueing another round.
+    onTriggered: if (!cloudStatusProcess.running && root._cloudStatusQueue.length === 0) root.refreshCloud()
   }
 
   onWatchCloselyChanged: if (watchClosely) {
