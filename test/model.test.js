@@ -2228,6 +2228,16 @@ test("parseCloudFolders parses folder lists, stale bytes, and root files", () =>
   assert.strictEqual(folders.rootFileCount, 5)
 })
 
+test("cloud tile: free space over the bar, size on disk beside it", () => {
+  const TB = 1024 ** 4, GB = 1024 ** 3
+  assert.strictEqual(api.cloudSpaceText({ usedBytes: 0.3 * TB, quotaBytes: 5 * TB, quotaKnown: true }), "4.7 TB free of 5.0 TB (6% used)")
+  assert.strictEqual(api.cloudSpaceText({ usedBytes: 6 * TB, quotaBytes: 5 * TB, quotaKnown: true }), "6.0 TB used of 5.0 TB · over quota")
+  assert.strictEqual(api.cloudSpaceText({ usedBytes: 2 * GB, quotaBytes: 0, quotaKnown: false }), "2.0 GB used")
+  assert.strictEqual(api.cloudSpaceText({ usedBytes: 0, quotaKnown: false }), "")
+  assert.strictEqual(api.cloudOnDiskText({ localBytes: 4.1 * GB }), "4.1 GB on disk")
+  assert.strictEqual(api.cloudOnDiskText({ localBytes: 4.1 * GB, localBytesApprox: true }), "≈ 4.1 GB on disk")
+})
+
 test("cloud formatters: relativeTime, formatCloudBytes, cloudUsageText, shortHomePath", () => {
   assert.strictEqual(api.formatCloudBytes(0), "0 B")
   assert.strictEqual(api.formatCloudBytes(1048576), "1.0 MB")

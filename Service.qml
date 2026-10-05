@@ -102,6 +102,8 @@ Item {
   property var cloudStatuses: ({})
 
   property string selectedCloudRemote: ""
+  // Another account (or none): back to its top folders.
+  onSelectedCloudRemoteChanged: { cloudSubPath = ""; cloudSubfolders = []; cloudSubState = ""; cloudSubError = "" }
   readonly property var selectedCloudAccount: {
     for (var i = 0; i < cloudAccounts.length; i++) {
       if (cloudAccounts[i].remoteName === selectedCloudRemote) return cloudAccounts[i]
@@ -118,7 +120,19 @@ Item {
   property double cloudStaleBytes: 0
   property int cloudRootFileCount: 0
   property double cloudRootFileBytes: 0
-  property bool cloudRootFiles: true
+  property bool cloudRootFiles: false
+  // -1 none, 0/1 a root-files change on its way.
+  property int pendingCloudRootFiles: -1
+  readonly property bool cloudRootFilesShown: pendingCloudRootFiles >= 0 ? pendingCloudRootFiles === 1 : cloudRootFiles
+  property int cloudStaleLoose: 0
+  // Inside a folder (the Cloud tab, a folder opened from its list): its
+  // path, its own state, and its folders, each on, off or partial.
+  property string cloudSubPath: ""
+  property string cloudSubState: ""
+  property bool cloudSubCovered: false
+  property var cloudSubfolders: []
+  property bool cloudSubLoading: false
+  property string cloudSubError: ""
   property bool cloudFoldersLoading: false
   property string cloudFoldersError: ""
   property var pendingCloudFolders: ({})
@@ -1094,13 +1108,13 @@ Item {
     cloudStatusProcess.running = true
   }
 
+  property bool _cloudFoldersAgain: false
   function refreshCloudFolders(remoteName) {
-    if (!remoteName || cloudFoldersProcess.running) return
-    var acc = null
-    for (var i = 0; i < cloudAccounts.length; i++) {
-      if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
-    }
-    var folderP = acc ? expandHome(acc.folderPath || "~/Cloud") : expandHome("~/Cloud")
+    if (!remoteName) return
+    // One listing at a time; a refresh asked meanwhile runs after it, so a
+    // change made during a listing is never shown stale.
+    if (cloudFoldersProcess.running) { _cloudFoldersAgain = true; return }
+    var folderP = cloudFolderPathOf(remoteName)
     cloudFoldersLoading = true
     cloudFoldersProcess.targetRemote = remoteName
     cloudFoldersProcess.command = ["python3", cloudHelperPath, "folders",
@@ -1109,31 +1123,69 @@ Item {
     cloudFoldersProcess.running = true
   }
 
-  function isCloudFolderSelected(folder) {
-    if (!folder) return false
-    var pending = pendingCloudFolders[folder.name]
-    return pending === undefined ? folder.selected === true : pending === true
+  function cloudFolderPathOf(remoteName) {
+    for (var i = 0; i < cloudAccounts.length; i++) {
+      if (cloudAccounts[i].remoteName === remoteName) return expandHome(cloudAccounts[i].folderPath || "~/Cloud")
+    }
+    return expandHome("~/Cloud")
   }
 
+  property bool _cloudSubAgain: false
+  function refreshCloudSubfolders(remoteName, path) {
+    if (!remoteName) return
+    if (path !== undefined && path !== cloudSubPath) {
+      cloudSubPath = path
+      cloudSubfolders = []
+      cloudSubState = ""
+      cloudSubError = ""
+    }
+    if (!cloudSubPath) return
+    if (cloudSubProcess.running) { _cloudSubAgain = true; return }
+    cloudSubLoading = true
+    cloudSubProcess.targetRemote = remoteName
+    cloudSubProcess.targetPath = cloudSubPath
+    cloudSubProcess.command = ["python3", cloudHelperPath, "folders", "--remote", remoteName,
+                               "--folder", cloudFolderPathOf(remoteName), "--path", cloudSubPath]
+    cloudSubProcess.running = true
+  }
+
+  function cloudFolderKey(folder) { return folder ? String(folder.path || folder.name || "") : "" }
+
+  // "on", "off" or "partial", with a change on its way shown already.
+  function cloudFolderState(folder) {
+    if (!folder) return "off"
+    var pending = pendingCloudFolders[cloudFolderKey(folder)]
+    if (pending !== undefined) return pending
+    return folder.state || (folder.selected === true ? "on" : "off")
+  }
+  function isCloudFolderSelected(folder) { return cloudFolderState(folder) === "on" }
+
+  // A click keeps the folder whole, or leaves it out when it is kept (all of
+  // it, or all but some parts). Changes queue behind a running task rather
+  // than being dropped, and one made during a sync is applied by a second
+  // run straight after it (cloud-sync.py do_run).
   function toggleCloudFolder(remoteName, folder) {
-    if (!folder || cloudBusy || !remoteName) return
-    var name = String(folder.name)
-    var next = !isCloudFolderSelected(folder)
+    if (!folder || !remoteName) return
+    var key = cloudFolderKey(folder)
+    var covered = folder.covered !== undefined ? folder.covered === true : cloudFolderState(folder) === "on"
+    var next = covered ? "off" : "on"
     var copy = {}
-    for (var key in pendingCloudFolders) copy[key] = pendingCloudFolders[key]
-    copy[name] = next
+    for (var k in pendingCloudFolders) copy[k] = pendingCloudFolders[k]
+    copy[key] = next
     pendingCloudFolders = copy
 
-    noteCloud(next ? "Adding " + name + "…" : "Removing " + name + " from sync…")
-    runCloudControl(["python3", cloudHelperPath, "select", "--remote", remoteName, (next ? "--add=" : "--remove=") + name], function() {
+    noteCloud(next === "on" ? "Keeping " + key + " on disk…" : "Leaving " + key + " out of the sync…")
+    runCloudControl(["python3", cloudHelperPath, "select", "--remote", remoteName, "--toggle=" + key], function() {
       refreshCloudFolders(remoteName)
+      if (cloudSubPath) refreshCloudSubfolders(remoteName)
       refreshCloudStatus(remoteName)
     })
   }
 
   function setCloudRootFiles(remoteName, enabled) {
-    if (cloudBusy || !remoteName) return
-    noteCloud(enabled ? "Including root files…" : "Excluding root files…")
+    if (!remoteName) return
+    pendingCloudRootFiles = enabled ? 1 : 0
+    noteCloud(enabled ? "Including loose files…" : "Leaving loose files out…")
     runCloudControl(["python3", cloudHelperPath, "select", "--remote", remoteName, enabled ? "--root-files" : "--no-root-files"], function() {
       refreshCloudFolders(remoteName)
       refreshCloudStatus(remoteName)
@@ -1192,7 +1244,7 @@ Item {
   }
 
   function cleanupCloudStale(remoteName) {
-    if (cloudBusy || !remoteName) return
+    if (!remoteName) return
     var acc = null
     for (var i = 0; i < cloudAccounts.length; i++) {
       if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
@@ -1201,6 +1253,7 @@ Item {
     noteCloud("Verifying against remote before deleting…")
     runCloudControl(["python3", cloudHelperPath, "cleanup", "--remote", remoteName, "--folder", folderP], function() {
       refreshCloudFolders(remoteName)
+      if (cloudSubPath) refreshCloudSubfolders(remoteName)
       refreshCloudStatus(remoteName)
     })
   }
@@ -2927,11 +2980,36 @@ Item {
         root.cloudRootFiles = parsed.rootFiles
         root.cloudRootFileCount = parsed.rootFileCount
         root.cloudRootFileBytes = parsed.rootFileBytes
+        root.cloudStaleLoose = Number(parsed.staleLooseFiles || 0)
         root.cloudFoldersError = ""
-        root.pendingCloudFolders = ({})
+        if (!root.cloudBusy) { root.pendingCloudFolders = ({}); root.pendingCloudRootFiles = -1 }
       } else {
         root.cloudFoldersError = parsed.lastError || "Could not list cloud folders"
       }
+      if (root._cloudFoldersAgain) { root._cloudFoldersAgain = false; root.refreshCloudFolders(targetRemote) }
+    }
+  }
+
+  Process {
+    id: cloudSubProcess
+    property string targetRemote: ""
+    property string targetPath: ""
+    stdout: StdioCollector { id: cloudSubStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.cloudSubLoading = false
+      // Moved to another folder meanwhile: this listing is not that one's.
+      if (targetPath === root.cloudSubPath) {
+        var parsed = Model.parseCloudFolders(String(cloudSubStdout.text || ""))
+        if (parsed.ok) {
+          root.cloudSubfolders = parsed.folders
+          root.cloudSubState = String(parsed.state || "")
+          root.cloudSubCovered = parsed.covered === true
+          root.cloudSubError = ""
+        } else {
+          root.cloudSubError = parsed.lastError || "Could not list this folder"
+        }
+      }
+      if (root._cloudSubAgain || targetPath !== root.cloudSubPath) { root._cloudSubAgain = false; root.refreshCloudSubfolders(targetRemote) }
     }
   }
 

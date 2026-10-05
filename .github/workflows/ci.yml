@@ -28,3 +28,6 @@ jobs:
 
       - name: Run Wiring checks
         run: node test/wiring.test.js
+
+      - name: Run cloud selection tests
+        run: python3 test/selection_test.py

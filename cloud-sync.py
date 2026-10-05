@@ -29,6 +29,7 @@ import re
 import secrets
 import selectors
 import shutil
+import tempfile
 import signal
 import stat
 import subprocess
@@ -490,30 +491,137 @@ def write_json(path: Path, payload: Any) -> None:
   write_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+# ---- what is kept on disk
+#
+# A selection is folders to keep (any depth: "Work", "Work/2026/Reports"),
+# folders left out of them ("Work/Videos": the rest of Work syncs), and
+# whether the loose files at the top sync. Loose files are off unless you
+# turn them on: a fresh account syncs nothing until you choose.
+#
+# The deepest rule on a path decides it: kept under a kept folder, left out
+# under a left-out one. A left-out folder can't keep a folder of its own
+# (rclone doesn't look inside an excluded folder), so normalise_selection
+# drops such rules, and every rule under a path is dropped when that path is
+# switched as a whole.
+
+MAX_PATH_DEPTH = 32
+
+
+def clean_cloud_path(value: object) -> str:
+  return "/".join(part for part in str(value or "").strip().strip("/").split("/") if part != "")
+
+
+def valid_cloud_path(value: object) -> bool:
+  if not isinstance(value, str) or value == "":
+    return False
+  parts = value.split("/")
+  return len(parts) <= MAX_PATH_DEPTH and all(valid_drive_name(part) for part in parts)
+
+
+def at_or_under(path: str, ancestor: str) -> bool:
+  return path == ancestor or path.startswith(ancestor + "/")
+
+
+def strictly_under(path: str, ancestor: str) -> bool:
+  return path.startswith(ancestor + "/")
+
+
+def rule_for(selection: dict[str, Any], path: str) -> str:
+  """The deepest rule at or above path: "+" kept, "-" left out, "" none."""
+  best, depth = "", -1
+  for sign, key in (("+", "folders"), ("-", "excludes")):
+    for rule in selection[key]:
+      if at_or_under(path, rule) and rule.count("/") > depth:
+        best, depth = sign, rule.count("/")
+  return best
+
+
+def is_covered(selection: dict[str, Any], path: str) -> bool:
+  return rule_for(selection, path) == "+"
+
+
+def has_rules_beneath(selection: dict[str, Any], path: str) -> bool:
+  return any(strictly_under(rule, path) for rule in selection["folders"] + selection["excludes"])
+
+
+def path_state(selection: dict[str, Any], path: str) -> str:
+  """on (all of it syncs), off (none of it), partial (some of it)."""
+  if has_rules_beneath(selection, path):
+    return "partial"
+  return "on" if is_covered(selection, path) else "off"
+
+
+def normalise_selection(selection: dict[str, Any]) -> dict[str, Any]:
+  def cleaned(values: object) -> list[str]:
+    out = {clean_cloud_path(v) for v in (values if isinstance(values, list) else []) if isinstance(v, str)}
+    return sorted((v for v in out if valid_cloud_path(v)), key=lambda v: (v.count("/"), v.casefold()))
+  includes: list[str] = []
+  for path in cleaned(selection.get("folders")):
+    if not any(at_or_under(path, kept) for kept in includes):
+      includes.append(path)
+  excludes: list[str] = []
+  for path in cleaned(selection.get("excludes")):
+    if any(strictly_under(path, kept) for kept in includes) and not any(at_or_under(path, out) for out in excludes):
+      excludes.append(path)
+  includes = [path for path in includes if not any(strictly_under(path, out) for out in excludes)]
+  return {
+    "folders": sorted(includes, key=str.casefold),
+    "excludes": sorted(excludes, key=str.casefold),
+    "rootFiles": selection.get("rootFiles") is True,
+  }
+
+
+def drop_beneath(selection: dict[str, Any], path: str) -> None:
+  selection["folders"] = [rule for rule in selection["folders"] if not strictly_under(rule, path)]
+  selection["excludes"] = [rule for rule in selection["excludes"] if not strictly_under(rule, path)]
+
+
+def keep_path(selection: dict[str, Any], path: str) -> None:
+  drop_beneath(selection, path)
+  selection["excludes"] = [rule for rule in selection["excludes"] if rule != path]
+  if not is_covered(selection, path):
+    selection["folders"].append(path)
+
+
+def leave_out_path(selection: dict[str, Any], path: str) -> None:
+  drop_beneath(selection, path)
+  if path in selection["folders"]:
+    selection["folders"].remove(path)
+  if is_covered(selection, path):
+    selection["excludes"].append(path)
+
+
+def toggle_path(selection: dict[str, Any], path: str) -> None:
+  # A partly kept folder is kept whole by a click, unless it was kept and
+  # had parts left out: then the click leaves it out.
+  if is_covered(selection, path):
+    leave_out_path(selection, path)
+  else:
+    keep_path(selection, path)
+
+
 def load_selection(paths: dict[str, Any]) -> dict[str, Any]:
   data = read_json(paths["selection_path"], {})
-  folders = data.get("folders") if isinstance(data, dict) else None
-  folders_list = [f for f in folders if isinstance(f, str) and valid_drive_name(f)] if isinstance(folders, list) else []
-  root_files = data.get("rootFiles") if isinstance(data, dict) else True
-  return {"folders": sorted(set(folders_list), key=str.casefold), "rootFiles": root_files is not False}
+  if not isinstance(data, dict):
+    data = {}
+  return normalise_selection(data)
 
 
 def save_selection(paths: dict[str, Any], selection: dict[str, Any]) -> None:
-  write_json(paths["selection_path"], {
-    "folders": sorted(set(selection["folders"]), key=str.casefold),
-    "rootFiles": selection["rootFiles"] is not False,
-  })
+  write_json(paths["selection_path"], normalise_selection(selection))
 
 
 def build_filters(selection: dict[str, Any]) -> str:
+  selection = normalise_selection(selection)
   lines = [
     "# Generated by Omarchy Storage Drives. Edit selection in panel.",
     "- /Personal Vault/**",
   ]
-  for name in selection["folders"]:
-    if not valid_drive_name(name):
-      continue
-    lines.append("+ /" + escape_glob(name) + "/**")
+  # The deepest rule first: rclone takes the first rule that matches.
+  rules = [("-", path) for path in selection["excludes"]] + [("+", path) for path in selection["folders"]]
+  rules.sort(key=lambda rule: (-rule[1].count("/"), rule[1].casefold()))
+  for sign, path in rules:
+    lines.append(sign + " /" + escape_glob(path) + "/**")
   if selection["rootFiles"]:
     lines.append("+ /*")
   lines.append("- **")
@@ -827,11 +935,11 @@ def configured_remotes(rclone: str) -> tuple[dict[str, str], str]:
   return remotes, ""
 
 
-def remote_folders(rclone: str, remote: str) -> tuple[list[str], str]:
+def remote_folders(rclone: str, remote: str, path: str = "") -> tuple[list[str], str]:
   names: list[str] = []
   dropped = 0
   try:
-    with Child([rclone, "lsjson", f"{remote}:", "--dirs-only", "--no-modtime"],
+    with Child([rclone, "lsjson", f"{remote}:{path}", "--dirs-only", "--no-modtime"],
                timeout=90, max_stdout=MAX_LIST_BYTES) as child:
       try:
         for row in iter_json_array(child.chunks()):
@@ -845,7 +953,7 @@ def remote_folders(rclone: str, remote: str) -> tuple[list[str], str]:
       if child.returncode != 0:
         return [], clean_text(child.stderr_text() or f"Could not list folders for {remote}")
   except ListingTooLarge:
-    return [], f"Remote {remote} has more than {MAX_LIST_ENTRIES} top-level folders"
+    return [], f"{remote}:{path} has more than {MAX_LIST_ENTRIES} folders"
   except ChildTimeout:
     return [], f"Listing folders for {remote} timed out"
   except ChildOutputTooLarge:
@@ -1057,6 +1165,46 @@ def local_top_level(folder: Path) -> tuple[dict[str, int], bool]:
   return sizes, approx
 
 
+def local_stale(folder: Path, selection: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+  """What is on disk but no longer synced: folders left out as a whole, and
+  files in a folder that isn't kept (the top one included, unless its loose
+  files sync). Kept folders are not walked, partly kept ones are."""
+  out: list[dict[str, Any]] = []
+  budget = WalkBudget()
+  approx = False
+
+  def walk(rel: str) -> None:
+    nonlocal approx
+    try:
+      entries = list(os.scandir(folder / rel if rel else folder))
+    except OSError:
+      return
+    files_sync = selection["rootFiles"] if not rel else is_covered(selection, rel)
+    for entry in entries:
+      if budget.exhausted:
+        approx = True
+        return
+      if (not rel and entry.name in SKIP_LOCAL) or not valid_drive_name(entry.name):
+        continue
+      path = rel + "/" + entry.name if rel else entry.name
+      try:
+        if entry.is_dir(follow_symlinks=False):
+          state = path_state(selection, path)
+          if state == "partial":
+            walk(path)
+          elif state == "off":
+            size, cut = directory_bytes(Path(entry.path), budget)
+            approx = approx or cut
+            out.append({"path": path, "dir": True, "bytes": size})
+        elif not files_sync:
+          out.append({"path": path, "dir": False, "bytes": entry.stat(follow_symlinks=False).st_size})
+      except OSError:
+        continue
+
+  walk("")
+  return out, approx
+
+
 def path_is_live(path: Path) -> bool:
   try:
     os.stat(path)
@@ -1249,7 +1397,18 @@ def clear_stale_bisync_lock(paths: dict[str, Any]) -> bool:
   return True
 
 
-def do_run(remote_value: str, folder_value: str, resync: bool) -> int:
+def do_run(remote_value: str, folder_value: str, resync: bool, again: int = 0) -> int:
+  paths = remote_paths(normalize_remote(remote_value))
+  used = build_filters(load_selection(paths))
+  code = do_run_once(remote_value, folder_value, resync)
+  # A selection changed while rclone ran applies only from the next run:
+  # that run is now, rather than a timer tick away (twice at most).
+  if code == 0 and again < 2 and build_filters(load_selection(paths)) != used:
+    return do_run(remote_value, folder_value, False, again + 1)
+  return code
+
+
+def do_run_once(remote_value: str, folder_value: str, resync: bool) -> int:
   remote = normalize_remote(remote_value)
   folder = normalize_path(folder_value, "~/Cloud")
   paths = remote_paths(remote)
@@ -1390,7 +1549,8 @@ def last_log_error(log_path: Path) -> str:
 
 # ---------------------------------------------------------------- payloads
 
-def folders_payload(remote_value: str, folder_value: str) -> dict[str, Any]:
+def folders_payload(remote_value: str, folder_value: str, sub_path: str = "") -> dict[str, Any]:
+  """The folders at the top (or inside sub_path), each on, off or partial."""
   remote = normalize_remote(remote_value)
   folder = normalize_path(folder_value, "~/Cloud")
   paths = remote_paths(remote)
@@ -1398,41 +1558,59 @@ def folders_payload(remote_value: str, folder_value: str) -> dict[str, Any]:
   selection = load_selection(paths)
   if not rclone:
     return {"ok": False, "folders": [], "lastError": "rclone is not installed"}
+  base = clean_cloud_path(sub_path)
+  if base and not valid_cloud_path(base):
+    return {"ok": False, "folders": [], "lastError": "Folder path not allowed"}
 
-  names, error = remote_folders(rclone, remote)
+  names, error = remote_folders(rclone, remote, base)
   if error:
     return {"ok": False, "folders": [], "lastError": error}
 
-  local, approx = local_top_level(folder)
-  root_count, root_bytes, _ = remote_root_files(rclone, remote)
-  chosen = set(selection["folders"])
-  rows = [
-    {
+  local, approx = local_top_level(folder / base if base else folder)
+
+  def row(name: str) -> dict[str, Any]:
+    path = base + "/" + name if base else name
+    state = path_state(selection, path)
+    return {
       "name": name,
-      "selected": name in chosen,
+      "path": path,
+      "state": state,
+      "selected": state == "on",
+      "partial": state == "partial",
+      "covered": is_covered(selection, path),
       "localBytes": local.get(name, 0),
       "onDisk": name in local,
       "approx": approx,
     }
-    for name in names
-  ]
-  stale = [
-    {"name": name, "selected": False, "localBytes": size, "onDisk": True, "stale": True, "approx": approx}
-    for name, size in sorted(local.items(), key=lambda item: item[0].casefold())
-    if name not in {row["name"] for row in rows}
-  ]
-  return {
+
+  rows = [row(name) for name in names]
+  listed = {r["name"] for r in rows}
+  # On disk only (deleted or renamed in the cloud, or made here and never
+  # synced): shown so they can be cleaned up.
+  extra = [dict(row(name), stale=True) for name in sorted(local, key=str.casefold) if name not in listed]
+  payload: dict[str, Any] = {
     "ok": True,
-    "folders": rows + stale,
+    "path": base,
+    "state": path_state(selection, base) if base else "",
+    "covered": is_covered(selection, base) if base else False,
+    "folders": rows + extra,
     "rootFiles": selection["rootFiles"],
-    "rootFileCount": root_count,
-    "rootFileBytes": root_bytes,
-    "staleBytes": sum(row["localBytes"] for row in rows if not row["selected"] and row["onDisk"])
-      + sum(row["localBytes"] for row in stale),
-    "staleCount": sum(1 for row in rows if not row["selected"] and row["onDisk"]) + len(stale),
-    "localBytesApprox": approx,
     "lastError": "",
   }
+  if not base:
+    stale, stale_approx = local_stale(folder, selection)
+    root_count, root_bytes, _ = remote_root_files(rclone, remote)
+    payload.update({
+      "rootFileCount": root_count,
+      "rootFileBytes": root_bytes,
+      "staleBytes": sum(item["bytes"] for item in stale),
+      "staleCount": len(stale),
+      "staleLooseFiles": sum(1 for item in stale if not item["dir"] and "/" not in item["path"]),
+      "localBytesApprox": approx or stale_approx,
+      "excludes": selection["excludes"],
+      "kept": selection["folders"],
+    })
+  return payload
 
 
 def status_payload(remote_value: str, folder_value: str, mount_value: str) -> dict[str, Any]:
@@ -1457,6 +1635,7 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
     "mountPath": str(mount_path),
     "remoteName": remote,
     "selectedCount": len(selection["folders"]),
+    "excludedCount": len(selection["excludes"]),
     "rootFiles": selection["rootFiles"],
     "localBytes": 0,
     "localBytesApprox": False,
@@ -1558,25 +1737,55 @@ def cmd_select(args: argparse.Namespace) -> None:
   remote = normalize_remote(args.remote)
   paths = remote_paths(remote)
   selection = load_selection(paths)
-  folders = set(selection["folders"])
+
+  def checked(value: str) -> str:
+    path = clean_cloud_path(value)
+    if not valid_cloud_path(path):
+      raise ValueError(f"Folder path not allowed: {clean_text(value, 80)!r}")
+    return path
+
   if args.set is not None:
-    folders = {name for name in args.set if name.strip()}
-  folders.update(args.add or [])
-  for name in folders:
-    if not valid_drive_name(name):
-      raise ValueError(f"Folder name not allowed: {clean_text(name, 60)!r}")
-  folders.difference_update(args.remove or [])
-  if len(folders) > MAX_LIST_ENTRIES:
-    raise ValueError(f"At most {MAX_LIST_ENTRIES} folders can be selected")
-  selection["folders"] = sorted(folders, key=str.casefold)
+    selection["folders"] = [checked(v) for v in args.set if v.strip()]
+    selection["excludes"] = []
+  for value in args.add or []:
+    keep_path(selection, checked(value))
+  for value in args.remove or []:
+    leave_out_path(selection, checked(value))
+  for value in args.toggle or []:
+    toggle_path(selection, checked(value))
   if args.root_files is not None:
     selection["rootFiles"] = args.root_files
+  selection = normalise_selection(selection)
+  if len(selection["folders"]) + len(selection["excludes"]) > MAX_LIST_ENTRIES:
+    raise ValueError(f"At most {MAX_LIST_ENTRIES} folders can be chosen")
   save_selection(paths, selection)
   sync_filters_file(paths, selection)
-  print(json.dumps({"ok": True, "folders": selection["folders"], "rootFiles": selection["rootFiles"]}))
+  print(json.dumps({"ok": True, "folders": selection["folders"], "excludes": selection["excludes"],
+                    "rootFiles": selection["rootFiles"]}))
+
+
+def check_identical(rclone: str, local_dir: Path, remote_dir: str, names: list[str] | None) -> set[str]:
+  """Which of names (or of everything under local_dir) the cloud holds
+  byte for byte, as paths relative to local_dir."""
+  command = [rclone, "check", str(local_dir), remote_dir, "--one-way", "--combined", "-"]
+  listing = None
+  if names is not None:
+    listing = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".lst", delete=False)
+    listing.write("\n".join(names) + "\n")
+    listing.close()
+    command += ["--files-from", listing.name]
+  try:
+    _, out, _ = run(command, timeout=600, max_stdout=MAX_LIST_BYTES)
+  finally:
+    if listing is not None:
+      os.unlink(listing.name)
+  return {line[2:] for line in (out or "").splitlines() if line.startswith("= ")}
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
+  """Frees what is on disk but no longer synced, one item at a time, and
+  only once the cloud is seen to hold the same bytes: a folder whose every
+  file matches, a file that matches."""
   remote = normalize_remote(args.remote)
   folder = normalize_path(args.folder, "~/Cloud")
   paths = remote_paths(remote)
@@ -1585,32 +1794,48 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     raise RuntimeError("rclone is not installed")
 
   selection = load_selection(paths)
-  chosen = set(selection["folders"])
-  local, _ = local_top_level(folder)
-  targets = [name for name in sorted(local, key=str.casefold) if name not in chosen]
+  stale, _ = local_stale(folder, selection)
   if args.only:
-    targets = [name for name in targets if name in set(args.only)]
-  if not targets:
-    print(json.dumps({"ok": True, "removed": [], "freedBytes": 0}))
-    return 0
+    only = {clean_cloud_path(v) for v in args.only}
+    stale = [item for item in stale if item["path"] in only]
 
   removed: list[str] = []
   freed = 0
-  for name in targets:
-    target_path = folder / name
-    if not target_path.is_dir():
-      continue
-    # Check that remote copy still exists
-    code, _, _ = run([rclone, "check", str(target_path), f"{remote}:{name}", "--one-way"], timeout=120)
-    if code == 0:
+  kept_back = 0
+  files_by_dir: dict[str, list[dict[str, Any]]] = {}
+  for item in stale:
+    if item["dir"]:
+      target = folder / item["path"]
+      if not target.is_dir() or target.is_symlink():
+        continue
+      code, _, _ = run([rclone, "check", str(target), f"{remote}:{item['path']}", "--one-way"], timeout=600)
+      if code != 0:
+        kept_back += 1
+        continue
       try:
-        size, _ = directory_bytes(target_path)
-        shutil.rmtree(target_path)
-        removed.append(name)
-        freed += size
-      except OSError as error:
-        pass
-  print(json.dumps({"ok": True, "removed": removed, "freedBytes": freed}))
+        shutil.rmtree(target)
+        removed.append(item["path"])
+        freed += item["bytes"]
+      except OSError:
+        kept_back += 1
+    else:
+      parent = item["path"].rpartition("/")[0]
+      files_by_dir.setdefault(parent, []).append(item)
+  for parent, items in files_by_dir.items():
+    local_dir = folder / parent if parent else folder
+    same = check_identical(rclone, local_dir, f"{remote}:{parent}", [i["path"].rpartition("/")[2] for i in items])
+    for item in items:
+      name = item["path"].rpartition("/")[2]
+      if name not in same:
+        kept_back += 1
+        continue
+      try:
+        (local_dir / name).unlink()
+        removed.append(item["path"])
+        freed += item["bytes"]
+      except OSError:
+        kept_back += 1
+  print(json.dumps({"ok": True, "removed": removed, "freedBytes": freed, "keptBack": kept_back}))
   return 0
 
 
@@ -1785,12 +2010,14 @@ def parser() -> argparse.ArgumentParser:
   folders = commands.add_parser("folders")
   folders.add_argument("--remote", default="gdrive")
   folders.add_argument("--folder", default="~/Cloud")
+  folders.add_argument("--path", default="")
 
   select = commands.add_parser("select")
   select.add_argument("--remote", default="gdrive")
   select.add_argument("--add", action="append", default=[])
   select.add_argument("--remove", action="append", default=[])
   select.add_argument("--set", action="append", default=None)
+  select.add_argument("--toggle", action="append", default=[])
   select.add_argument("--root-files", dest="root_files", action="store_true", default=None)
   select.add_argument("--no-root-files", dest="root_files", action="store_false", default=None)
 
@@ -1856,7 +2083,7 @@ def main() -> int:
     elif args.command == "status":
       print(json.dumps(status_payload(args.remote, args.folder, args.mount)))
     elif args.command == "folders":
-      print(json.dumps(folders_payload(args.remote, args.folder)))
+      print(json.dumps(folders_payload(args.remote, args.folder, args.path)))
     elif args.command == "select":
       cmd_select(args)
     elif args.command == "sync":

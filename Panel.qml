@@ -1897,8 +1897,9 @@ Panel {
                     Text { text: "In Cloud"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption }
                     Item { Layout.fillWidth: true }
                     Text {
-                      text: Model.cloudUsageText(drives.selectedCloudStatus.usedBytes, drives.selectedCloudStatus.quotaBytes, drives.selectedCloudStatus.quotaKnown)
-                      color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true
+                      text: Model.cloudSpaceText(drives.selectedCloudStatus) || "—"
+                      color: Model.cloudOverQuota(drives.selectedCloudStatus) ? root.urgent : root.foreground
+                      font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true
                     }
                   }
 
@@ -2227,11 +2228,118 @@ Panel {
                 font.bold: true
               }
 
+              // Inside a folder: the path back up (the first crumb is the
+              // drive's top), and the folder kept as a whole.
+              Flow {
+                visible: drives.cloudSubPath !== ""
+                width: parent.width
+                spacing: Style.space(4)
+                Repeater {
+                  model: drives.cloudSubPath !== "" ? [""].concat(drives.cloudSubPath.split("/")) : []
+                  Row {
+                    required property string modelData
+                    required property int index
+                    readonly property bool here: index === drives.cloudSubPath.split("/").length
+                    spacing: Style.space(4)
+                    Text {
+                      visible: index > 0
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: "󰅂"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      text: index === 0 ? "Top" : modelData
+                      color: here ? root.foreground : root.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: here
+                      MouseArea {
+                        anchors.fill: parent
+                        enabled: !parent.parent.here
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: drives.refreshCloudSubfolders(drives.selectedCloudRemote, drives.cloudSubPath.split("/").slice(0, index).join("/"))
+                      }
+                    }
+                  }
+                }
+              }
+
+              Rectangle {
+                id: subSelf
+                readonly property string name: drives.cloudSubPath.split("/").pop()
+                readonly property var folder: ({ name: name, path: drives.cloudSubPath, state: drives.cloudSubState, covered: drives.cloudSubCovered })
+                readonly property string state: drives.cloudFolderState(folder)
+                visible: drives.cloudSubPath !== "" && drives.cloudSubState !== ""
+                width: foldersListCol.width
+                radius: Style.space(6)
+                color: selfMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.02)
+                border.width: 1
+                border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                implicitHeight: selfRow.implicitHeight + Style.space(12)
+
+                MouseArea {
+                  id: selfMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: drives.toggleCloudFolder(drives.selectedCloudRemote, subSelf.folder)
+                }
+
+                RowLayout {
+                  id: selfRow
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  anchors.topMargin: Style.space(8)
+                  anchors.bottomMargin: Style.space(8)
+                  spacing: Style.space(8)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    Layout.preferredWidth: Style.space(20)
+                    horizontalAlignment: Text.AlignHCenter
+                    text: Model.cloudStateGlyph(subSelf.state)
+                    color: subSelf.state === "off" ? root.dim : root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.icon
+                  }
+
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(1)
+                    Text {
+                      textFormat: Text.PlainText
+                      Layout.fillWidth: true
+                      text: "All of " + subSelf.name
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      elide: Text.ElideRight
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      Layout.fillWidth: true
+                      text: subSelf.state === "on" ? "Everything in it syncs, new folders too"
+                        : subSelf.state === "partial" ? "Only what is ticked below syncs"
+                        : "Nothing in it syncs: tick folders below, or all of it"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
+                  }
+                }
+              }
+
               Text {
                 textFormat: Text.PlainText
-                visible: drives.cloudFoldersLoading && drives.cloudFolders.length === 0
+                visible: drives.cloudSubPath !== "" ? drives.cloudSubLoading && drives.cloudSubfolders.length === 0 : drives.cloudFoldersLoading && drives.cloudFolders.length === 0
                 width: parent.width
-                text: "Reading your cloud folders…"
+                text: drives.cloudSubPath !== "" ? "Reading " + drives.cloudSubPath.split("/").pop() + "…" : "Reading your cloud folders…"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -2242,9 +2350,9 @@ Panel {
 
               Text {
                 textFormat: Text.PlainText
-                visible: !drives.cloudFoldersLoading && drives.cloudFolders.length === 0
+                visible: drives.cloudSubPath !== "" ? !drives.cloudSubLoading && drives.cloudSubfolders.length === 0 : !drives.cloudFoldersLoading && drives.cloudFolders.length === 0
                 width: parent.width
-                text: "No folders found in this drive"
+                text: drives.cloudSubPath !== "" ? (drives.cloudSubError || "No folders inside, only files") : "No folders found in this drive"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -2255,6 +2363,7 @@ Panel {
 
               // Root files row
               Rectangle {
+                visible: drives.cloudSubPath === ""
                 width: foldersListCol.width
                 radius: Style.space(6)
                 color: rootMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06) : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.02)
@@ -2267,7 +2376,7 @@ Panel {
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: drives.setCloudRootFiles(drives.selectedCloudRemote, !drives.cloudRootFiles)
+                  onClicked: drives.setCloudRootFiles(drives.selectedCloudRemote, !drives.cloudRootFilesShown)
                 }
 
                 RowLayout {
@@ -2287,8 +2396,8 @@ Panel {
                     Text {
                       anchors.centerIn: parent
                       textFormat: Text.PlainText
-                      text: drives.cloudRootFiles ? "󰄲" : "󰄱"
-                      color: drives.cloudRootFiles ? root.foreground : root.dim
+                      text: drives.cloudRootFilesShown ? "󰄲" : "󰄱"
+                      color: drives.cloudRootFilesShown ? root.foreground : root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.icon
                     }
@@ -2327,7 +2436,7 @@ Panel {
                     Text {
                       textFormat: Text.PlainText
                       Layout.fillWidth: true
-                      text: Model.cloudRootFilesMeta(drives.cloudRootFileCount, drives.cloudRootFileBytes)
+                      text: Model.cloudRootFilesMeta(drives.cloudRootFileCount, drives.cloudRootFileBytes) + (drives.cloudRootFilesShown ? "" : " · off unless you turn it on")
                       color: root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -2339,11 +2448,13 @@ Panel {
 
               // Repeater over cloud folders
               Repeater {
-                model: drives.cloudFolders
+                model: drives.cloudSubPath !== "" ? drives.cloudSubfolders : drives.cloudFolders
 
                 Rectangle {
                   required property var modelData
                   required property int index
+                  id: folderItem
+                  readonly property string state: drives.cloudFolderState(modelData)
 
                   width: foldersListCol.width
                   radius: Style.space(6)
@@ -2377,8 +2488,8 @@ Panel {
                       Text {
                         anchors.centerIn: parent
                         textFormat: Text.PlainText
-                        text: drives.isCloudFolderSelected(modelData) ? "󰄲" : "󰄱"
-                        color: drives.isCloudFolderSelected(modelData) ? root.foreground : root.dim
+                        text: Model.cloudStateGlyph(folderItem.state)
+                        color: folderItem.state === "off" ? root.dim : root.foreground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.icon
                       }
@@ -2417,20 +2528,57 @@ Panel {
                       Text {
                         textFormat: Text.PlainText
                         Layout.fillWidth: true
-                        text: Model.cloudFolderMeta(modelData)
+                        text: Model.cloudFolderMeta(modelData, folderItem.state)
                         color: modelData && modelData.stale ? root.urgent : root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         elide: Text.ElideRight
                       }
                     }
+
+                    // Open it, to keep only some of it or leave parts out.
+                    Rectangle {
+                      visible: !(modelData && modelData.stale)
+                      Layout.alignment: Qt.AlignVCenter
+                      implicitWidth: Style.space(26)
+                      implicitHeight: Style.space(26)
+                      radius: Style.space(13)
+                      color: openMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.10) : "transparent"
+                      Text {
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: "󰅂"
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.icon
+                      }
+                      MouseArea {
+                        id: openMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: drives.refreshCloudSubfolders(drives.selectedCloudRemote, String(modelData.path || modelData.name))
+                      }
+                    }
                   }
                 }
               }
 
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                text: drives.cloudSubPath !== ""
+                  ? "A folder you untick here is left out; the rest keeps syncing."
+                  : "Open a folder (󰅂) to keep only some of it, or leave parts out. Add more any time: the next sync brings them down and changes nothing else."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.captionSmall || Style.space(9)
+                wrapMode: Text.WordWrap
+              }
+
               // Stale cleanup bar
               Rectangle {
-                visible: drives.cloudStaleBytes > 0 || drives.cloudStaleCount > 0
+                visible: drives.cloudSubPath === "" && (drives.cloudStaleBytes > 0 || drives.cloudStaleCount > 0)
                 width: parent.width
                 radius: Style.space(6)
                 color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.08)
@@ -2447,7 +2595,7 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     Layout.fillWidth: true
-                    text: Model.formatCloudBytes(drives.cloudStaleBytes) + " is still on disk for folders you stopped syncing."
+                    text: Model.cloudStaleMeta(drives.cloudStaleCount, drives.cloudStaleLoose, Model.formatCloudBytes(drives.cloudStaleBytes))
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -3050,7 +3198,8 @@ Panel {
   //
   //   [icon] gdrive                              (● Ready to sync)
   //          Google Drive · gameticharles@gmail.com
-  //   [███░░░░░░░░░░░░░░░░░░░░░░░]  334 GB of 5.0 TB
+  //   4.6 TB free of 5.0 TB (7% used)                  4.1 GB on disk
+  //   [███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]
   //   Synced 8m ago                          [sync] [open] [browse]
   component CloudTile: Rectangle {
     id: tile
@@ -3063,11 +3212,7 @@ Panel {
     readonly property real fraction: Model.cloudUsageFraction(st)
     readonly property bool overQuota: Model.cloudOverQuota(st)
     readonly property bool hot: overQuota || fraction >= drives.fullWarnPct / 100
-    readonly property string usage: {
-      if (!st.quotaKnown && !(st.usedBytes > 0)) return ""
-      var t = Model.cloudUsageText(st.usedBytes, st.quotaBytes, st.quotaKnown)
-      return overQuota ? t + " · over quota" : t
-    }
+    readonly property string space: Model.cloudSpaceText(st)
     readonly property string identity: st.accountEmail !== ""
       ? (st.accountName !== "" ? st.accountEmail + " · " + st.accountName : st.accountEmail)
       : (st.authenticated ? Model.shortHomePath(account ? account.folderPath : "", drives.homePath)
@@ -3206,38 +3351,45 @@ Panel {
         }
       }
 
-      // Quota bar with the figures beside it.
+      // Room in the cloud over its bar, as a drive's; what is on this
+      // computer on the right.
       RowLayout {
-        visible: tile.usage !== ""
+        visible: tile.space !== "" || tile.st.localBytes > 0
         Layout.fillWidth: true
         spacing: Style.space(8)
 
-        Rectangle {
-          visible: tile.st.quotaKnown
-          Layout.fillWidth: true
-          Layout.alignment: Qt.AlignVCenter
-          implicitHeight: Math.max(3, Style.space(4))
-          radius: height / 2
-          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
-
-          Rectangle {
-            width: Math.max(tile.fraction > 0 ? 2 : 0, parent.width * tile.fraction)
-            height: parent.height
-            radius: parent.radius
-            color: tile.hot ? root.urgent : root.foreground
-            opacity: tile.hot ? 1 : 0.6
-          }
-        }
-
-        Item { visible: !tile.st.quotaKnown; Layout.fillWidth: true }
-
         Text {
           textFormat: Text.PlainText
-          text: tile.usage
+          Layout.fillWidth: true
+          text: tile.space
           color: tile.overQuota ? root.urgent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
-          Layout.alignment: Qt.AlignVCenter
+          elide: Text.ElideRight
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          text: Model.cloudOnDiskText(tile.st)
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      Rectangle {
+        visible: tile.st.quotaKnown
+        Layout.fillWidth: true
+        implicitHeight: Math.max(3, Style.space(4))
+        radius: height / 2
+        color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+        Rectangle {
+          width: Math.max(tile.fraction > 0 ? 2 : 0, parent.width * tile.fraction)
+          height: parent.height
+          radius: parent.radius
+          color: tile.hot ? root.urgent : root.foreground
+          opacity: tile.hot ? 1 : 0.6
         }
       }
 

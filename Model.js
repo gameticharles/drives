@@ -2965,7 +2965,7 @@ function cloudAuthCommand(remoteName, providerType) {
 
 function parseCloudFolders(raw) {
   var text = String(raw || "").trim()
-  var fallback = { ok: false, folders: [], rootFiles: true, rootFileCount: 0, rootFileBytes: 0, staleBytes: 0, staleCount: 0, lastError: "" }
+  var fallback = { ok: false, folders: [], rootFiles: false, rootFileCount: 0, rootFileBytes: 0, staleBytes: 0, staleCount: 0, lastError: "" }
   if (text === "") return fallback
   try {
     var parsed = JSON.parse(text)
@@ -3037,6 +3037,23 @@ function cloudUsageText(usedBytes, quotaBytes, quotaKnown) {
   return formatCloudBytes(used)
 }
 
+// Over a cloud tile's quota bar, as a drive's: "4.6 TB free of 5.0 TB (7% used)".
+function cloudSpaceText(status) {
+  if (!status) return ""
+  var used = Number(status.usedBytes || 0), quota = Number(status.quotaBytes || 0)
+  if (status.quotaKnown && quota > 0) {
+    if (used > quota) return formatCloudBytes(used) + " used of " + formatCloudBytes(quota) + " · over quota"
+    return formatCloudBytes(quota - used) + " free of " + formatCloudBytes(quota) + " (" + Math.round(100 * used / quota) + "% used)"
+  }
+  return used > 0 ? formatCloudBytes(used) + " used" : ""
+}
+
+// On the right of that line: what is kept on this computer.
+function cloudOnDiskText(status) {
+  if (!status) return ""
+  return (status.localBytesApprox ? "≈ " : "") + formatCloudBytes(status.localBytes) + " on disk"
+}
+
 function cloudSummary(status) {
   if (!status) return ""
   var count = Number(status.selectedCount || 0)
@@ -3047,16 +3064,38 @@ function cloudSummary(status) {
   return parts.join(" · ")
 }
 
-function cloudFolderMeta(folder) {
+// state: "on", "off" or "partial" (cloud-sync.py path_state); older
+// listings only say `selected`.
+function cloudFolderMeta(folder, state) {
   if (!folder) return ""
+  var st = state || folder.state || (folder.selected ? "on" : "off")
   var bytes = (folder.approx ? "≈ " : "") + formatCloudBytes(folder.localBytes)
-  if (folder.stale) return "No longer syncing · " + bytes
-  if (folder.selected) return folder.onDisk ? bytes + " on disk" : "Waiting for first sync"
-  return "Not synced"
+  if (folder.stale) return "Only on this computer · " + bytes
+  if (st === "partial") return "Some of it kept" + (folder.onDisk ? " · " + bytes + " on disk" : "")
+  if (st === "on") return folder.onDisk ? bytes + " on disk" : "Waiting for the next sync"
+  return folder.onDisk ? "Not synced · " + bytes + " still on disk" : "Not synced"
 }
 
 function cloudFolderGlyph(folder) {
-  return folder && folder.selected ? GLYPH_FOLDER_SYNC : GLYPH_FOLDER
+  return folder && (folder.selected || folder.state === "partial") ? GLYPH_FOLDER_SYNC : GLYPH_FOLDER
+}
+
+// The checkbox for a state, as a Nerd Font glyph (the plugin's panel).
+function cloudStateGlyph(state) {
+  return codepoint(state === "on" ? 0xF0132 : state === "partial" ? 0xF0856 : 0xF0131)   // md-checkbox_marked / _intermediate / _blank_outline
+}
+
+// The checkbox for a state, as a Material Symbol (Terrace).
+function cloudStateIcon(state) {
+  return state === "on" ? "check_box" : state === "partial" ? "indeterminate_check_box" : "check_box_outline_blank"
+}
+
+// The Clean up row: what it frees, loose files at the top named apart.
+function cloudStaleMeta(count, looseCount, bytesText) {
+  var n = Number(count || 0), loose = Number(looseCount || 0)
+  var what = n === 1 ? "1 item" : n + " items"
+  var extra = loose > 0 ? " (" + loose + (loose === 1 ? " loose file" : " loose files") + ")" : ""
+  return what + extra + " no longer synced still use " + bytesText + " · each is checked against the cloud before it goes"
 }
 
 function cloudRootFilesMeta(count, bytes) {
