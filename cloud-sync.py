@@ -460,6 +460,24 @@ def open_owned_dir(path: Path, *, fix_mode: int | None = None) -> int:
     raise
 
 
+def open_owned_file(path: Path, flags: int = os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode: int = 0o600) -> int:
+  path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+  fd = os.open(path, flags | os.O_CLOEXEC, mode)
+  try:
+    info = os.fstat(fd)
+    if info.st_uid != os.geteuid():
+      raise RuntimeError(f"{path} is not owned by you (uid {info.st_uid})")
+    if (info.st_mode & 0o777) != mode:
+      try:
+        os.fchmod(fd, mode)
+      except OSError:
+        pass
+    return fd
+  except Exception:
+    os.close(fd)
+    raise
+
+
 def write_atomic(path: Path, text: str, mode: int = 0o600) -> None:
   dfd = open_owned_dir(path.parent, fix_mode=0o700)
   try:
