@@ -1348,6 +1348,69 @@ def unmount_browse(mount_path: Path, remote: str = "") -> None:
   remove_gtk_bookmark(mount_path)
 
 
+def tag_sync_path(path: Path, status: str) -> None:
+  """Tag file/folder with extended attribute and desktop GIO emblem.
+  Status: 'synced', 'syncing', 'partial', 'conflict', 'excluded'.
+  """
+  if not path.exists():
+    return
+  try:
+    os.setxattr(path, "user.terrace.sync", status.encode("utf-8"))
+  except OSError:
+    pass
+
+  emblem_map = {
+    "synced": "emblem-default",          # Green circle with white check
+    "syncing": "emblem-synchronizing",   # Blue rotating sync arrows
+    "partial": "emblem-dropbox-selsync", # Grey selective sync badge
+    "conflict": "emblem-important",      # Red exclamation warning
+    "excluded": "emblem-shared",         # Cloud / shared
+  }
+  emblem = emblem_map.get(status, "")
+  gio = shutil.which("gio")
+  if gio and emblem:
+    try:
+      subprocess.run([gio, "set", "-t", "stringv", str(path), "metadata::emblems", emblem],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, timeout=2, check=False)
+    except (OSError, subprocess.SubprocessError):
+      pass
+
+
+def tag_remote_tree(remote: str, folder: Path, selection: dict[str, Any], state: dict[str, Any]) -> None:
+  """Tag sync folder root and top-level directory entries with appropriate emblems."""
+  if not folder.is_dir():
+    return
+  tag_sync_path(folder, "synced")
+  try:
+    with os.scandir(folder) as scan:
+      for entry in scan:
+        if entry.is_dir(follow_symlinks=False):
+          rel = entry.name
+          st = path_state(selection, rel)
+          tag_state = "synced" if st == "on" else ("partial" if st == "partial" else "excluded")
+          tag_sync_path(Path(entry.path), tag_state)
+  except OSError:
+    pass
+
+
+def find_conflicts(folder: Path, max_find: int = 20) -> list[str]:
+  if not folder.is_dir():
+    return []
+  conflicts: list[str] = []
+  try:
+    for root_dir, _, files in os.walk(folder):
+      for f in files:
+        if ".conflict" in f:
+          rel = str(Path(root_dir, f).relative_to(folder))
+          conflicts.append(rel)
+          if len(conflicts) >= max_find:
+            return conflicts
+  except OSError:
+    pass
+  return conflicts
+
+
 def bisync_command(rclone: str, remote: str, folder: Path, resync: bool, rtype: str, paths: dict[str, Any]) -> list[str]:
   command = [
     rclone, "bisync", f"{remote}:", str(folder),
@@ -1361,7 +1424,9 @@ def bisync_command(rclone: str, remote: str, folder: Path, resync: bool, rtype: 
     "--force",
     "--transfers", "8",
     "--checkers", "16",
-    "--log-file", str(paths["log_path"]),
+    "--use-json-log",
+    "--stats", "1s",
+    "--stats-file-name-length", "0",
     "--log-level", "INFO",
   ]
   if rtype == "drive":
@@ -1375,6 +1440,136 @@ def bisync_command(rclone: str, remote: str, folder: Path, resync: bool, rtype: 
     command += ["--exclude", "/Personal Vault/**"]
   command += ["--resync", "--resync-mode", "newer"] if resync else ["--conflict-resolve", "newer"]
   return command
+
+
+def stream_bisync(cmd: list[str], log_path: Path, paths: dict[str, Any], folder: Path, remote: str) -> tuple[int, str, str]:
+  """Run bisync, streaming json logs line-by-line:
+  - Formats human-readable logs to log_path for user viewing.
+  - Updates state.json with activeTransfers and transferStats (throttled).
+  - Tags transferred files as synced.
+  - Returns (returncode, stdout, stderr).
+  """
+  proc = subprocess.Popen(
+    cmd,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.PIPE,
+    text=True,
+    bufsize=1,
+    errors="replace"
+  )
+
+  recent_transfers: list[dict[str, Any]] = load_state(paths).get("recentTransfers", []) or []
+  last_patch_ts = 0.0
+  active_transfers: list[dict[str, Any]] = []
+  transfer_stats: dict[str, Any] = {}
+  err_lines: list[str] = []
+
+  log_file = None
+  try:
+    log_fd = open_owned_file(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    log_file = open(log_fd, "a", encoding="utf-8")
+  except Exception:
+    pass
+
+  try:
+    assert proc.stderr is not None
+    for raw_line in proc.stderr:
+      line = raw_line.strip()
+      if not line:
+        continue
+
+      try:
+        obj = json.loads(line)
+      except Exception:
+        if log_file:
+          log_file.write(line + "\n")
+          log_file.flush()
+        err_lines.append(line)
+        continue
+
+      lvl = str(obj.get("level", "info")).upper()
+      t_str = str(obj.get("time", ""))[:19].replace("T", " ")
+      msg = str(obj.get("msg", ""))
+      src = str(obj.get("source", ""))
+      obj_name = str(obj.get("object", ""))
+
+      if log_file and msg:
+        prefix = f"{t_str} {lvl:<7}: " if t_str else f"{lvl:<7}: "
+        formatted = f"{prefix}{obj_name + ': ' if obj_name else ''}{msg}\n"
+        log_file.write(formatted)
+        log_file.flush()
+
+      if lvl in ("ERROR", "NOTICE"):
+        err_lines.append(f"{obj_name + ': ' if obj_name else ''}{msg}")
+
+      stats = obj.get("stats")
+      if isinstance(stats, dict):
+        transferring = stats.get("transferring")
+        if isinstance(transferring, list):
+          active_transfers = [
+            {
+              "name": str(t.get("name", "")),
+              "size": clamp_int(t.get("size")),
+              "bytes": clamp_int(t.get("bytes")),
+              "percentage": clamp_int(t.get("percentage")),
+              "speed": clamp_int(t.get("speed")),
+              "eta": clamp_int(t.get("eta")),
+            }
+            for t in transferring if isinstance(t, dict) and t.get("name")
+          ]
+        else:
+          active_transfers = []
+
+        transfer_stats = {
+          "bytes": clamp_int(stats.get("bytes")),
+          "totalBytes": clamp_int(stats.get("totalBytes")),
+          "speed": clamp_int(stats.get("speed")),
+          "transfers": clamp_int(stats.get("transfers")),
+          "totalTransfers": clamp_int(stats.get("totalTransfers")),
+          "checks": clamp_int(stats.get("checks")),
+          "totalChecks": clamp_int(stats.get("totalChecks")),
+          "elapsedTime": float(stats.get("elapsedTime", 0) or 0),
+        }
+
+      if obj_name and msg in ("Copied (new)", "Copied (replaced existing)", "Updated", "Deleted"):
+        entry = {
+          "name": obj_name,
+          "action": msg,
+          "size": clamp_int(obj.get("size")),
+          "ts": int(time.time()),
+        }
+        recent_transfers = [entry] + [r for r in recent_transfers if r.get("name") != obj_name][:19]
+        tag_sync_path(folder / obj_name, "synced")
+
+      now = time.time()
+      if now - last_patch_ts >= 1.5:
+        patch_state(
+          paths,
+          activeTransfers=active_transfers,
+          transferStats=transfer_stats,
+          recentTransfers=recent_transfers,
+        )
+        last_patch_ts = now
+
+    proc.wait(timeout=30)
+  except Exception as ex:
+    proc.kill()
+    proc.wait()
+    err_lines.append(str(ex))
+  finally:
+    if log_file:
+      try:
+        log_file.close()
+      except Exception:
+        pass
+
+  patch_state(
+    paths,
+    activeTransfers=[],
+    transferStats={},
+    recentTransfers=recent_transfers,
+  )
+  return proc.returncode or 0, "", "\n".join(err_lines)
 
 
 def bisync_running(paths: dict[str, Any]) -> bool:
@@ -1459,22 +1654,24 @@ def do_run_once(remote_value: str, folder_value: str, resync: bool) -> int:
   patch_state(paths, syncing=True, startTs=start_ts)
 
   cmd = bisync_command(rclone, remote, folder, resync, rtype, paths)
-  code, out, err = run(cmd, timeout=7200)
+  code, out, err = stream_bisync(cmd, paths["log_path"], paths, folder, remote)
 
   duration = time.time() - start_ts
   if code == 0:
     patch_state(paths, syncing=False, lastResult="ok", lastError="", finishedTs=int(time.time()),
                 durationSec=round(duration, 1), baseline=True)
+    tag_remote_tree(remote, folder, selection, load_state(paths))
     announce_recovery(remote, previous)
     return 0
   elif code in RCLONE_RESYNC_CODES:
     # Bisync requires a resync baseline run
     cmd_resync = bisync_command(rclone, remote, folder, True, rtype, paths)
-    code2, out2, err2 = run(cmd_resync, timeout=7200)
+    code2, out2, err2 = stream_bisync(cmd_resync, paths["log_path"], paths, folder, remote)
     duration2 = time.time() - start_ts
     if code2 == 0:
       patch_state(paths, syncing=False, lastResult="ok", lastError="", finishedTs=int(time.time()),
                   durationSec=round(duration2, 1), baseline=True)
+      tag_remote_tree(remote, folder, selection, load_state(paths))
       announce_recovery(remote, previous)
       return 0
     else:
@@ -1668,6 +1865,11 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
     "browseConflict": "",
     "logPath": str(paths["log_path"]),
     "mountLogPath": str(paths["mount_log_path"]),
+    "activeTransfers": state.get("activeTransfers", []) or [],
+    "transferStats": state.get("transferStats", {}) or {},
+    "recentTransfers": state.get("recentTransfers", []) or [],
+    "conflictFiles": [],
+    "conflictCount": 0,
   }
 
   if not rclone:
@@ -1690,6 +1892,12 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
 
   if payload["authenticated"]:
     ensure_sync_folder(remote, folder)
+
+  conflicts = find_conflicts(folder)
+  payload["conflictFiles"] = conflicts
+  payload["conflictCount"] = len(conflicts)
+  if conflicts and not payload["warning"]:
+    payload["warning"] = f"{len(conflicts)} conflicted files found"
 
   cache = load_cache(paths)
   cached = cache.get("localBytes") if isinstance(cache.get("localBytes"), dict) else None
@@ -1759,6 +1967,141 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
   else:
     payload["statusText"] = "Ready to sync"
   return payload
+
+
+def configured_accounts() -> list[dict[str, Any]]:
+  """Discover configured accounts from Omarchy / Storage Drives state, or infer from remotes."""
+  for store_path in (
+    Path.home() / ".local" / "state" / "omarchy" / "cloud-drives.json",
+    Path.home() / ".local" / "state" / "storage-drives" / "cloud-drives.json",
+    STATE_BASE.parent / "omarchy" / "cloud-drives.json",
+    STATE_BASE / "cloud-drives.json",
+  ):
+    if store_path.exists():
+      data = read_json(store_path, {})
+      if isinstance(data, dict) and isinstance(data.get("accounts"), list):
+        return data["accounts"]
+  rclone = rclone_bin()
+  if rclone:
+    remotes, _ = configured_remotes(rclone)
+    accounts = []
+    for r, rtype in remotes.items():
+      guess_names = [f"~/{r}"]
+      if rtype == "drive":
+        guess_names.insert(0, "~/Google Drive")
+      elif rtype == "onedrive":
+        guess_names.insert(0, "~/OneDrive")
+      elif rtype == "dropbox":
+        guess_names.insert(0, "~/Dropbox")
+      found = guess_names[0]
+      for g in guess_names:
+        if Path(g).expanduser().is_dir():
+          found = g
+          break
+      accounts.append({"remoteName": r, "type": rtype, "folderPath": found})
+    return accounts
+  return []
+
+
+def query_path(target_path: str, remote_hint: str = "", set_emblems: bool = False) -> dict[str, Any]:
+  target = Path(target_path).expanduser().resolve()
+  accounts = configured_accounts()
+
+  matched_remote = ""
+  matched_folder: Path | None = None
+  matched_type = ""
+
+  if remote_hint:
+    r_clean = normalize_remote(remote_hint)
+    for acc in accounts:
+      if normalize_remote(acc.get("remoteName", "")) == r_clean:
+        f = Path(normalize_path(acc.get("folderPath", "~/Cloud"), "~/Cloud")).resolve()
+        matched_remote = r_clean
+        matched_folder = f
+        matched_type = str(acc.get("type", ""))
+        break
+
+  if not matched_folder:
+    for acc in accounts:
+      f = Path(normalize_path(acc.get("folderPath", "~/Cloud"), "~/Cloud")).resolve()
+      if target == f or f in target.parents:
+        matched_remote = normalize_remote(acc.get("remoteName", ""))
+        matched_folder = f
+        matched_type = str(acc.get("type", ""))
+        break
+
+  if not matched_folder:
+    return {
+      "ok": False,
+      "managed": False,
+      "path": str(target),
+      "reason": "Path is not inside any managed cloud sync folder",
+    }
+
+  rel = target.relative_to(matched_folder).as_posix() if target != matched_folder else ""
+  paths = remote_paths(matched_remote)
+  selection = load_selection(paths)
+  state = load_state(paths)
+  is_syncing = state.get("syncing") is True
+  active_transfers = state.get("activeTransfers", []) or []
+
+  has_conflict = False
+  if target.exists():
+    if target.is_file():
+      if ".conflict" in target.name:
+        has_conflict = True
+      else:
+        has_conflict = any(target.parent.glob(f"{target.stem}.conflict*"))
+    elif target.is_dir():
+      has_conflict = any(target.glob("*.conflict*"))
+
+  sel_state = path_state(selection, rel) if rel else "on"
+  transferring = is_syncing and any(
+    t.get("name") == rel or (rel and str(t.get("name", "")).startswith(rel + "/"))
+    for t in active_transfers
+  )
+
+  if has_conflict:
+    status = "conflict"
+    emblem = "emblem-important"
+  elif transferring:
+    status = "syncing"
+    emblem = "emblem-synchronizing"
+  elif sel_state == "off":
+    status = "excluded"
+    emblem = "emblem-shared"
+  elif sel_state == "partial":
+    status = "partial"
+    emblem = "emblem-dropbox-selsync"
+  else:
+    status = "synced"
+    emblem = "emblem-default"
+
+  if set_emblems and target.exists():
+    tag_sync_path(target, status)
+
+  return {
+    "ok": True,
+    "managed": True,
+    "path": str(target),
+    "remote": matched_remote,
+    "remoteType": matched_type,
+    "syncRoot": str(matched_folder),
+    "relativePath": rel,
+    "isDir": target.is_dir() if target.exists() else False,
+    "exists": target.exists(),
+    "status": status,
+    "emblem": emblem,
+    "selection": sel_state,
+    "syncing": is_syncing,
+    "transferring": transferring,
+    "conflict": has_conflict,
+    "lastSyncTs": int(state.get("finishedTs") or 0),
+  }
+
+
+def cmd_query(args: argparse.Namespace) -> None:
+  print(json.dumps(query_path(args.path, remote_hint=args.remote or "", set_emblems=args.set_emblems)))
 
 
 # ---------------------------------------------------------------- commands
@@ -2112,6 +2455,11 @@ def parser() -> argparse.ArgumentParser:
   remove.add_argument("--folder", default="")
   remove.add_argument("--purge-remote", action="store_true", default=False)
 
+  query = commands.add_parser("query")
+  query.add_argument("path", help="Local file or folder path")
+  query.add_argument("--remote", default="", help="Optional remote name hint")
+  query.add_argument("--set-emblems", action="store_true", help="Apply GIO emblem and xattr to path")
+
   return result
 
 
@@ -2130,6 +2478,8 @@ def main() -> int:
       print(json.dumps(folders_payload(args.remote, args.folder, args.path)))
     elif args.command == "select":
       cmd_select(args)
+    elif args.command == "query":
+      cmd_query(args)
     elif args.command == "sync":
       cmd_sync(args)
     elif args.command == "run":
@@ -2153,7 +2503,7 @@ def main() -> int:
     elif args.command == "remove-account":
       cmd_remove_account(args)
   except (OSError, RuntimeError, ValueError) as error:
-    if args.command in ("status", "folders"):
+    if args.command in ("status", "folders", "query"):
       print(json.dumps({"ok": False, "lastError": clean_text(str(error)), "folders": []}))
       return 0
     print(clean_text(str(error)), file=sys.stderr)

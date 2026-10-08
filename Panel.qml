@@ -1805,6 +1805,146 @@ Panel {
                   wrapMode: Text.WordWrap
                 }
 
+                // Live Transfer Activity Card
+                Rectangle {
+                  visible: drives.selectedCloudStatus.syncing
+                  Layout.fillWidth: true
+                  radius: Style.space(6)
+                  color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.08)
+                  border.width: 1
+                  border.color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.25)
+                  implicitHeight: liveColSD.implicitHeight + Style.space(16)
+
+                  ColumnLayout {
+                    id: liveColSD
+                    anchors.fill: parent
+                    anchors.margins: Style.space(8)
+                    spacing: Style.space(4)
+
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
+                      Text {
+                        text: Model.GLYPH_REFRESH
+                        color: root.accent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+
+                      ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: Style.space(2)
+
+                        Text {
+                          textFormat: Text.PlainText
+                          Layout.fillWidth: true
+                          text: (drives.selectedCloudStatus.activeTransfers && drives.selectedCloudStatus.activeTransfers.length > 0)
+                            ? drives.selectedCloudStatus.activeTransfers[0].name
+                            : "Syncing in progress…"
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                          elide: Text.ElideMiddle
+                        }
+
+                        Text {
+                          textFormat: Text.PlainText
+                          Layout.fillWidth: true
+                          text: {
+                            var ts = drives.selectedCloudStatus.transferStats || {}
+                            var parts = []
+                            if (ts.speed) parts.push(Model.formatBytes(ts.speed) + "/s")
+                            if (ts.transfers !== undefined && ts.totalTransfers !== undefined && ts.totalTransfers > 0) {
+                              parts.push(ts.transfers + " of " + ts.totalTransfers + " files")
+                            }
+                            if (ts.bytes && ts.totalBytes) {
+                              parts.push(Model.formatBytes(ts.bytes) + " of " + Model.formatBytes(ts.totalBytes))
+                            }
+                            return parts.length > 0 ? parts.join(" • ") : "Syncing files with cloud…"
+                          }
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.captionSmall || Style.space(9)
+                        }
+                      }
+                    }
+
+                    Rectangle {
+                      Layout.fillWidth: true
+                      visible: !!(drives.selectedCloudStatus.transferStats && drives.selectedCloudStatus.transferStats.totalBytes > 0)
+                      height: Style.space(4)
+                      radius: height / 2
+                      color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.1)
+
+                      Rectangle {
+                        readonly property real pct: (drives.selectedCloudStatus.transferStats && drives.selectedCloudStatus.transferStats.totalBytes > 0)
+                          ? Math.min(1, Math.max(0, drives.selectedCloudStatus.transferStats.bytes / drives.selectedCloudStatus.transferStats.totalBytes))
+                          : 0
+                        width: parent.width * pct
+                        height: parent.height
+                        radius: height / 2
+                        color: root.accent
+                      }
+                    }
+                  }
+                }
+
+                // Conflict Warning Card
+                Rectangle {
+                  visible: !!(drives.selectedCloudStatus.conflictCount > 0)
+                  Layout.fillWidth: true
+                  radius: Style.space(6)
+                  color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.08)
+                  border.width: 1
+                  border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.25)
+                  implicitHeight: conflictColSD.implicitHeight + Style.space(16)
+
+                  ColumnLayout {
+                    id: conflictColSD
+                    anchors.fill: parent
+                    anchors.margins: Style.space(8)
+                    spacing: Style.space(4)
+
+                    RowLayout {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
+                      Text {
+                        text: Model.GLYPH_ALERT
+                        color: root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+
+                      ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: Style.space(2)
+
+                        Text {
+                          textFormat: Text.PlainText
+                          Layout.fillWidth: true
+                          text: drives.selectedCloudStatus.conflictCount + " Conflicted File" + (drives.selectedCloudStatus.conflictCount === 1 ? "" : "s")
+                          color: root.urgent
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                        }
+
+                        Text {
+                          textFormat: Text.PlainText
+                          Layout.fillWidth: true
+                          text: "Files edited simultaneously in both places. Preserved with .conflict extension."
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.captionSmall || Style.space(9)
+                        }
+                      }
+                    }
+                  }
+                }
+
                 // Notice if not authenticated in rclone
                 Rectangle {
                   visible: !drives.selectedCloudStatus.authenticated && drives.rcloneInstalled
@@ -2608,6 +2748,74 @@ Panel {
                     danger: true
                     tooltipText: "Verify files still exist in cloud, then remove local copies"
                     onClicked: drives.cleanupCloudStale(drives.selectedCloudRemote)
+                  }
+                }
+              }
+            }
+
+            // Recent Activity Section
+            Column {
+              visible: !drives.selectedCloudStatus.syncing && !!drives.selectedCloudStatus.recentTransfers && drives.selectedCloudStatus.recentTransfers.length > 0
+              width: parent.width
+              spacing: Style.space(4)
+
+              Text {
+                textFormat: Text.PlainText
+                text: "Recent Activity"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                topPadding: Style.space(6)
+              }
+
+              Repeater {
+                model: (!drives.selectedCloudStatus.syncing && drives.selectedCloudStatus.recentTransfers)
+                  ? drives.selectedCloudStatus.recentTransfers.slice(0, 5) : []
+
+                Rectangle {
+                  required property var modelData
+                  width: parent.width
+                  implicitHeight: recentRow.implicitHeight + Style.space(10)
+                  radius: Style.space(4)
+                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.04)
+
+                  RowLayout {
+                    id: recentRow
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.space(8)
+                    anchors.rightMargin: Style.space(8)
+                    spacing: Style.space(6)
+
+                    Text {
+                      text: (modelData.action && modelData.action.indexOf("Deleted") >= 0) ? Model.GLYPH_TRASH : Model.GLYPH_HEALTHY
+                      color: (modelData.action && modelData.action.indexOf("Deleted") >= 0) ? root.urgent : root.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    ColumnLayout {
+                      Layout.fillWidth: true
+                      spacing: 0
+
+                      Text {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        text: modelData.name || "File"
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideMiddle
+                      }
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: (modelData.action || "Synced") + (modelData.size ? " (" + Model.formatBytes(modelData.size) + ")" : "")
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.captionSmall || Style.space(9)
+                      }
+                    }
                   }
                 }
               }

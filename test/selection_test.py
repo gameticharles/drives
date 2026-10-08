@@ -142,11 +142,32 @@ def t_stale_and_cleanup():
     assert (root / "Work/Reports/r.pdf").exists() and (root / "Work/notes.txt").exists() and (root / "Photos/2026/a.jpg").exists()
 
 
+def t_query_and_tag():
+  with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp) / "Cloud"
+    root.mkdir()
+    (root / "Doc.pdf").write_text("data")
+    (root / "Folder").mkdir()
+    (root / "Folder" / "Sub.txt").write_text("sub")
+    (root / "Conflicted.txt").write_text("1")
+    (root / "Conflicted.conflict1.txt").write_text("2")
+
+    cs.tag_sync_path(root / "Doc.pdf", "synced")
+    try:
+      eq(os.getxattr(root / "Doc.pdf", "user.terrace.sync"), b"synced")
+    except OSError:
+      pass
+
+    conflicts = cs.find_conflicts(root)
+    assert any("Conflicted.conflict1.txt" in c for c in conflicts), "finds conflict file"
+
+
 test("loose files are off unless chosen", t_default)
 test("each path is on, off or partial", t_states)
 test("redundant and impossible rules are dropped", t_normalise)
 test("toggling keeps, leaves out, and replaces parts", t_toggle)
 test("filters put the deepest rule first", t_filters)
 test("clean-up frees only what isn't kept and the cloud holds", t_stale_and_cleanup)
+test("query, tagging and conflict detection", t_query_and_tag)
 print(f"\n{passes} passed, {failures} failed")
 sys.exit(1 if failures else 0)

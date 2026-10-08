@@ -2919,7 +2919,12 @@ function defaultCloudStatus(remoteName) {
     lastDurationSec: 0,
     baseline: false,
     warning: "",
-    lastError: ""
+    lastError: "",
+    activeTransfers: [],
+    transferStats: {},
+    recentTransfers: [],
+    conflictFiles: [],
+    conflictCount: 0
   }
 }
 
@@ -2931,6 +2936,11 @@ function parseCloudStatus(raw, remoteName) {
     if (!parsed || typeof parsed !== "object") return defaultCloudStatus(remoteName)
     parsed.accountEmail = String(parsed.accountEmail || "")
     parsed.accountName = String(parsed.accountName || "")
+    parsed.activeTransfers = Array.isArray(parsed.activeTransfers) ? parsed.activeTransfers : []
+    parsed.transferStats = (parsed.transferStats && typeof parsed.transferStats === "object") ? parsed.transferStats : {}
+    parsed.recentTransfers = Array.isArray(parsed.recentTransfers) ? parsed.recentTransfers : []
+    parsed.conflictFiles = Array.isArray(parsed.conflictFiles) ? parsed.conflictFiles : []
+    parsed.conflictCount = typeof parsed.conflictCount === "number" ? parsed.conflictCount : parsed.conflictFiles.length
     return parsed
   } catch (e) {
     var d = defaultCloudStatus(remoteName)

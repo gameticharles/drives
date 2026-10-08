@@ -5,6 +5,20 @@ All notable changes to Storage Drives. Newest first. The format follows
 [Semantic Versioning](https://semver.org/). Releases before 2.7.0 are
 described in their commit messages.
 
+## [2.7.2] - 2026-10-08
+
+### Added
+- **File Manager Agnostic Sync Badges & Path Query**: Added `python3 cloud-sync.py query <path>` CLI command (with optional `--set-emblems`), providing fast JSON resolution of sync root, relative path, selection state (`on`/`partial`/`off`), sync status (`synced`/`syncing`/`partial`/`conflict`/`excluded`), and emblem mapping. Works independently of any single file manager.
+- **Nautilus Sync Emblems Extension**: Added `storage-drives-emblems.py` (`Nautilus.InfoProvider` / `Nautilus.MenuProvider`) delivering real-time desktop sync badges and context menus to Nautilus without daemon lock-in.
+- **Consistent Emblem Hierarchy**: Standardized desktop emblem visual cues:
+  - `synced`: Green circle with white checkmark (`emblem-default`) for fully synchronized files and folders.
+  - `partial`: Slate grey selective sync badge (`emblem-dropbox-selsync`) for folders containing deselected subfolders.
+  - `syncing`: Blue rotating sync arrows (`emblem-synchronizing`) for active transfers.
+  - `conflict`: Red exclamation warning (`emblem-important`) for files preserved with `.conflict` suffix.
+  - `excluded`: Shared/cloud badge (`emblem-shared`) for unselected items.
+- **Live Transfer Queue & Stats**: Replaced blocking bisync execution with streaming JSON logs (`--use-json-log --stats 1s`), exposing real-time active transfers, current speed, ETA, and progress metrics to the UI.
+- **Live Activity Card & Recent Transfer Feed**: Added real-time transfer progress bar, active file banner, conflict warning card, and recent transfers activity list to the detailed account panel.
+
 ## [2.7.1] - 2026-10-08
 
 ### Fixed
