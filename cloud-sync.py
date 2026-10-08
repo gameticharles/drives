@@ -1358,6 +1358,7 @@ def bisync_command(rclone: str, remote: str, folder: Path, resync: bool, rtype: 
     "--recover",
     "--fast-list",
     "--track-renames",
+    "--force",
     "--transfers", "8",
     "--checkers", "16",
     "--log-file", str(paths["log_path"]),
