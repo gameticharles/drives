@@ -2940,13 +2940,19 @@ function parseCloudStatus(raw, remoteName) {
   }
 }
 
-function cloudAuthCommand(remoteName, providerType) {
+function cloudAuthCommand(remoteName, providerType, clientId, clientSecret) {
   var name = String(remoteName || "").trim()
   var p = String(providerType || "").trim().toLowerCase()
   if (name === "") return "rclone config"
   var quoted = shellQuote(name)
   if (p === "drive") {
-    return "rclone config create " + quoted + " drive scope=drive config_is_local=true config_shared_client_id=true"
+    var cmd = "rclone config create " + quoted + " drive scope=drive config_is_local=true"
+    if (clientId && clientSecret) {
+      cmd += " client_id=" + shellQuote(String(clientId).trim()) + " client_secret=" + shellQuote(String(clientSecret).trim())
+    } else {
+      cmd += " config_shared_client_id=true"
+    }
+    return cmd
   }
   if (p === "onedrive") {
     return "rclone config create " + quoted + " onedrive config_is_local=true"

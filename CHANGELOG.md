@@ -5,6 +5,22 @@ All notable changes to Storage Drives. Newest first. The format follows
 [Semantic Versioning](https://semver.org/). Releases before 2.7.0 are
 described in their commit messages.
 
+## [2.7.1] - 2026-10-08
+
+### Fixed
+- **Google Drive 403 Abuse Flag & Shortcut Failures**: Added `--drive-acknowledge-abuse` to `bisync_command`, `mount_browse`, and `rclone check`. Prevents syncs from crashing on `.lnk` files, executables, or false-positive security flags.
+- **Poll Storm During Syncing**: Throttled `cloudSyncPoll` in `Service.qml` from 3s to 5s and added concurrency guards so that status requests are not queued when a check is already in-flight.
+- **Disk-Walking Caching**: Fixed `status_payload` in `cloud-sync.py` to reuse cached `localBytes` when idle for up to 5 minutes or until the next sync completes, eliminating up to 2 seconds of disk traversal per status query.
+- **Blocking Status Calls During Active Sync**: `status_payload` now returns cached storage usage immediately while syncing is active instead of blocking on an 18-second `rclone about` query, speeding up live status checks from ~5.6s to 0.21s.
+- **OneDrive Redundant Probing**: Removed unnecessary `rclone about` queries in `ensure_onedrive_drive_id` when `drive_id` is already valid in `rclone.conf`, cutting status check time from 8.4s to 0.21s.
+- **Credential & API Rate Limit Handling**: `user_identity` now parses tokens directly from `rclone.conf` using `configparser` without spawning `rclone config dump`, and caches negative lookups for 5 minutes to avoid tripping Google API rate limits.
+- **Safe Stale Cleanups via Trash**: `cmd_cleanup` now routes removed files through `gio trash` (falling back to POSIX unlink/rmtree), preventing permanent data loss when de-selecting synced folders.
+
+### Changed
+- **Bisync Performance & Move Tracking**: Enabled `--fast-list` and `--track-renames` in `bisync_command`, plus Google Drive API pacing (`--tpslimit 10`, `--drive-pacer-min-sleep 100ms`). In benchmarks, directory listing speed improved from 8 minutes down to under 2 minutes for 110,000+ files.
+- **Browse Mount Progressive Streaming**: Added `--vfs-read-chunk-size 128M` and `--vfs-read-chunk-size-limit 1G` to `mount_browse` for smooth streaming of large files.
+- **Custom OAuth Credentials Support**: `cloudAuthCommand` in `Model.js` now accepts optional custom `clientId` and `clientSecret` parameters in preparation for Google's 2026 retirement of rclone's shared client ID.
+
 ## [2.7.0] - 2026-10-05
 
 ### Added

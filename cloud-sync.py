@@ -862,9 +862,7 @@ def ensure_onedrive_drive_id(rclone: str, remote: str) -> bool:
 
     drive_id = cparser[remote].get("drive_id", "")
     if drive_id and not drive_id.startswith("b!"):
-      c, _, _ = run([rclone, "about", f"{remote}:"], timeout=4)
-      if c == 0:
-        return True
+      return True
 
     token_str = cparser[remote].get("token", "")
     if not token_str:
@@ -1016,10 +1014,27 @@ def storage_usage(rclone: str, remote: str, cache: dict[str, Any] | None = None)
   return used, total, known, warning
 
 
+def remote_token(rclone: str, remote: str) -> dict[str, Any]:
+  try:
+    conf_path = rclone_conf_path(rclone)
+    if not conf_path.exists():
+      return {}
+    cparser = configparser.ConfigParser()
+    cparser.read(str(conf_path))
+    if remote not in cparser:
+      return {}
+    token_str = cparser[remote].get("token", "{}")
+    return json.loads(token_str) if token_str else {}
+  except Exception:
+    return {}
+
+
 def user_identity(rclone: str, remote: str, rtype: str, cache: dict[str, Any] | None = None) -> dict[str, str]:
   entry = (cache or {}).get("identity")
-  if isinstance(entry, dict) and entry.get("remote") == remote and time.time() - clamp_int(entry.get("ts")) < 3600 and entry.get("email"):
-    return {"email": str(entry.get("email") or ""), "name": str(entry.get("name") or "")}
+  if isinstance(entry, dict) and entry.get("remote") == remote:
+    age = time.time() - clamp_int(entry.get("ts"))
+    if (entry.get("email") and age < 3600) or age < 300:
+      return {"email": str(entry.get("email") or ""), "name": str(entry.get("name") or "")}
 
   email = ""
   name = ""
@@ -1032,69 +1047,52 @@ def user_identity(rclone: str, remote: str, rtype: str, cache: dict[str, Any] | 
   except Exception:
     pass
 
-  if not email and rtype == "drive":
+  token = remote_token(rclone, remote) if not email else {}
+  access_token = token.get("access_token")
+
+  if not email and rtype == "drive" and access_token:
     try:
-      code, dump, _ = run([rclone, "config", "dump"], timeout=6)
-      if code == 0 and dump:
-        cfg = json.loads(dump)
-        token_str = cfg.get(remote, {}).get("token", "{}")
-        token = json.loads(token_str)
-        access_token = token.get("access_token")
-        if access_token:
-          req = urllib.request.Request("https://www.googleapis.com/drive/v3/about?fields=user", headers={
-            "Authorization": f"Bearer {access_token}"
-          })
-          with urllib.request.urlopen(req, timeout=4) as resp:
-            info = json.loads(resp.read().decode())
-            u = info.get("user", {})
-            email = str(u.get("emailAddress") or "")
-            name = str(u.get("displayName") or "")
+      req = urllib.request.Request("https://www.googleapis.com/drive/v3/about?fields=user", headers={
+        "Authorization": f"Bearer {access_token}"
+      })
+      with urllib.request.urlopen(req, timeout=4) as resp:
+        info = json.loads(resp.read().decode())
+        u = info.get("user", {})
+        email = str(u.get("emailAddress") or "")
+        name = str(u.get("displayName") or "")
     except Exception:
       pass
 
-  if not email and rtype == "onedrive":
+  if not email and rtype == "onedrive" and access_token:
     try:
-      code, dump, _ = run([rclone, "config", "dump"], timeout=6)
-      if code == 0 and dump:
-        cfg = json.loads(dump)
-        token_str = cfg.get(remote, {}).get("token", "{}")
-        token = json.loads(token_str)
-        access_token = token.get("access_token")
-        if access_token:
-          req = urllib.request.Request("https://graph.microsoft.com/v1.0/me/drives", headers={
-            "Authorization": f"Bearer {access_token}"
-          })
-          with urllib.request.urlopen(req, timeout=5) as resp:
-            info = json.loads(resp.read().decode())
-            for d in info.get("value", []):
-              u = d.get("owner", {}).get("user", {})
-              if u.get("email"):
-                email = str(u.get("email") or "")
-                name = str(u.get("displayName") or "")
-                break
+      req = urllib.request.Request("https://graph.microsoft.com/v1.0/me/drives", headers={
+        "Authorization": f"Bearer {access_token}"
+      })
+      with urllib.request.urlopen(req, timeout=5) as resp:
+        info = json.loads(resp.read().decode())
+        for d in info.get("value", []):
+          u = d.get("owner", {}).get("user", {})
+          if u.get("email"):
+            email = str(u.get("email") or "")
+            name = str(u.get("displayName") or "")
+            break
     except Exception:
       pass
 
   # rclone has no userinfo for Dropbox, so the account card showed a folder
   # path where every other provider shows an email. Dropbox's own API answers
   # with the token rclone already holds.
-  if not email and rtype == "dropbox":
+  if not email and rtype == "dropbox" and access_token:
     try:
-      code, dump, _ = run([rclone, "config", "dump"], timeout=6)
-      if code == 0 and dump:
-        cfg = json.loads(dump)
-        token = json.loads(cfg.get(remote, {}).get("token", "{}"))
-        access_token = token.get("access_token")
-        if access_token:
-          req = urllib.request.Request("https://api.dropboxapi.com/2/users/get_current_account",
-                                       data=b"null", method="POST", headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-          })
-          with urllib.request.urlopen(req, timeout=5) as resp:
-            info = json.loads(resp.read(MAX_ITEM_BYTES).decode())
-            email = str(info.get("email") or "")
-            name = str((info.get("name") or {}).get("display_name") or "")
+      req = urllib.request.Request("https://api.dropboxapi.com/2/users/get_current_account",
+                                   data=b"null", method="POST", headers={
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+      })
+      with urllib.request.urlopen(req, timeout=5) as resp:
+        info = json.loads(resp.read(MAX_ITEM_BYTES).decode())
+        email = str(info.get("email") or "")
+        name = str((info.get("name") or {}).get("display_name") or "")
     except Exception:
       pass
 
@@ -1295,6 +1293,7 @@ def mount_browse(remote: str, mount_path: Path) -> None:
   label = get_account_display_label(rclone, remote)
   display_name = f"{label} (Cloud)"
 
+  rtype = remotes.get(remote, "")
   command = [
     rclone, "mount", f"{remote}:", str(mount_path),
     "--daemon",
@@ -1304,11 +1303,15 @@ def mount_browse(remote: str, mount_path: Path) -> None:
     "--vfs-cache-mode", "full",
     "--vfs-cache-max-age", "6h",
     "--vfs-cache-max-size", "2G",
+    "--vfs-read-chunk-size", "128M",
+    "--vfs-read-chunk-size-limit", "1G",
     "--dir-cache-time", "5m",
     "--poll-interval", "1m",
     "--log-file", str(paths["mount_log_path"]),
     "--log-level", "NOTICE",
   ]
+  if rtype == "drive":
+    command.append("--drive-acknowledge-abuse")
   try:
     subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
   except OSError as error:
@@ -1353,13 +1356,20 @@ def bisync_command(rclone: str, remote: str, folder: Path, resync: bool, rtype: 
     "--create-empty-src-dirs",
     "--resilient",
     "--recover",
+    "--fast-list",
+    "--track-renames",
     "--transfers", "8",
     "--checkers", "16",
     "--log-file", str(paths["log_path"]),
     "--log-level", "INFO",
   ]
   if rtype == "drive":
-    command.append("--drive-skip-gdocs")
+    command += [
+      "--drive-skip-gdocs",
+      "--drive-acknowledge-abuse",
+      "--tpslimit", "10",
+      "--drive-pacer-min-sleep", "100ms",
+    ]
   if rtype == "onedrive":
     command += ["--exclude", "/Personal Vault/**"]
   command += ["--resync", "--resync-mode", "newer"] if resync else ["--conflict-resolve", "newer"]
@@ -1682,9 +1692,16 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
 
   cache = load_cache(paths)
   cached = cache.get("localBytes") if isinstance(cache.get("localBytes"), dict) else None
+  cache_ts = clamp_int(cached.get("ts")) if cached else 0
+  sync_finished = int(state.get("finishedTs") or 0)
+  cache_fresh = cached is not None and (time.time() - cache_ts < 300) and (cache_ts >= sync_finished)
+
   if payload["syncing"] and cached is not None:
     payload["localBytes"] = clamp_int(cached.get("bytes"))
     payload["localBytesApprox"] = True
+  elif cache_fresh:
+    payload["localBytes"] = clamp_int(cached.get("bytes"))
+    payload["localBytesApprox"] = cached.get("approx", False) is True
   else:
     size, approx = directory_bytes(folder) if folder.is_dir() else (0, False)
     payload["localBytes"] = size
@@ -1705,7 +1722,19 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
     payload["lastError"] = f"{folder} is mounted as {fs_type}; unmount it to sync into it"
     return payload
 
-  used, total, quota_known, warning = storage_usage(rclone, remote, cache)
+  if payload["syncing"]:
+    entry = (cache or {}).get("about")
+    if isinstance(entry, dict) and entry.get("remote") == remote:
+      used = clamp_int(entry.get("used"))
+      total = clamp_int(entry.get("total"))
+      quota_known = entry.get("known") is True
+      warning = str(entry.get("warning") or "")
+    else:
+      used = total = 0
+      quota_known = False
+      warning = ""
+  else:
+    used, total, quota_known, warning = storage_usage(rclone, remote, cache)
   payload.update(usedBytes=used, quotaBytes=total, quotaKnown=quota_known,
                  usagePercent=(used / total * 100) if total > 0 else 0, warning=warning)
   ident = user_identity(rclone, remote, payload["remoteType"], cache)
@@ -1764,10 +1793,26 @@ def cmd_select(args: argparse.Namespace) -> None:
                     "rootFiles": selection["rootFiles"]}))
 
 
+def trash_or_remove(path: Path) -> bool:
+  gio = shutil.which("gio")
+  if gio:
+    code, _, _ = run([gio, "trash", str(path)], timeout=15)
+    if code == 0:
+      return True
+  try:
+    if path.is_dir() and not path.is_symlink():
+      shutil.rmtree(path)
+    else:
+      path.unlink()
+    return True
+  except OSError:
+    return False
+
+
 def check_identical(rclone: str, local_dir: Path, remote_dir: str, names: list[str] | None) -> set[str]:
   """Which of names (or of everything under local_dir) the cloud holds
   byte for byte, as paths relative to local_dir."""
-  command = [rclone, "check", str(local_dir), remote_dir, "--one-way", "--combined", "-"]
+  command = [rclone, "check", str(local_dir), remote_dir, "--one-way", "--combined", "-", "--drive-acknowledge-abuse"]
   listing = None
   if names is not None:
     listing = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".lst", delete=False)
@@ -1808,15 +1853,14 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
       target = folder / item["path"]
       if not target.is_dir() or target.is_symlink():
         continue
-      code, _, _ = run([rclone, "check", str(target), f"{remote}:{item['path']}", "--one-way"], timeout=600)
+      code, _, _ = run([rclone, "check", str(target), f"{remote}:{item['path']}", "--one-way", "--drive-acknowledge-abuse"], timeout=600)
       if code != 0:
         kept_back += 1
         continue
-      try:
-        shutil.rmtree(target)
+      if trash_or_remove(target):
         removed.append(item["path"])
         freed += item["bytes"]
-      except OSError:
+      else:
         kept_back += 1
     else:
       parent = item["path"].rpartition("/")[0]
@@ -1829,11 +1873,10 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
       if name not in same:
         kept_back += 1
         continue
-      try:
-        (local_dir / name).unlink()
+      if trash_or_remove(local_dir / name):
         removed.append(item["path"])
         freed += item["bytes"]
-      except OSError:
+      else:
         kept_back += 1
   print(json.dumps({"ok": True, "removed": removed, "freedBytes": freed, "keptBack": kept_back}))
   return 0

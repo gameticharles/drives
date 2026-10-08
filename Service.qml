@@ -3045,19 +3045,23 @@ Item {
 
   Timer {
     id: cloudSyncPoll
-    interval: 3000
+    interval: 5000
     repeat: true
     running: {
       if (!root.selectedCloudRemote || root.selectedCloudRemote === "") return false
       var st = root.cloudStatuses[root.selectedCloudRemote]
       return st && st.syncing === true
     }
-    onTriggered: root.refreshCloudStatus(root.selectedCloudRemote)
+    onTriggered: {
+      if (!cloudStatusProcess.running && root._cloudStatusQueue.indexOf(root.selectedCloudRemote) < 0) {
+        root.refreshCloudStatus(root.selectedCloudRemote)
+      }
+    }
   }
 
   Timer {
     id: cloudUnauthPoll
-    interval: 3500
+    interval: 5000
     repeat: true
     running: root.cloudAccountCount > 0 && root.hasUnauthenticatedCloudAccount()
     // Let the checks already in flight finish before queueing another round.
