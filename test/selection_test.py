@@ -147,20 +147,50 @@ def t_query_and_tag():
     root = Path(tmp) / "Cloud"
     root.mkdir()
     (root / "Doc.pdf").write_text("data")
-    (root / "Folder").mkdir()
-    (root / "Folder" / "Sub.txt").write_text("sub")
-    (root / "Conflicted.txt").write_text("1")
-    (root / "Conflicted.conflict1.txt").write_text("2")
+    (root / "Work" / "Reports").mkdir(parents=True)
+    (root / "Work" / "notes.txt").write_text("n")
+    (root / "Work" / "Reports" / "r.pdf").write_text("r")
+    (root / "Work" / "Drafts").mkdir()
+    (root / "Photos").mkdir()
+    (root / "Photos" / "a.jpg").write_text("a")
+    (root / "Teaching").mkdir()
+    (root / "Teaching" / "week1.md").write_text("1")
+    (root / "Teaching" / "week1.md.conflict1").write_text("2")
+    (root / "my.conflicts.txt").write_text("not a conflict")
 
+    def tag(rel):
+      try:
+        return os.getxattr(root / rel if rel else root, cs.STATUS_XATTR).decode()
+      except OSError:
+        return "-"
+
+    # A filesystem without user xattrs can't hold a tag; there is nothing to check then.
+    if not cs.set_status_xattr(root / "Doc.pdf", "syncing"):
+      return
+    os.setxattr(root / "Doc.pdf", cs.LEGACY_XATTR, b"synced")
     cs.tag_sync_path(root / "Doc.pdf", "synced")
-    try:
-      eq(os.getxattr(root / "Doc.pdf", "user.terrace.sync"), b"synced")
-    except OSError:
-      pass
+    eq(tag("Doc.pdf"), "synced")
+    assert cs.LEGACY_XATTR not in os.listxattr(root / "Doc.pdf"), "the old name is cleared"
+    assert not cs.set_status_xattr(root / "Doc.pdf", "synced"), "an unchanged status isn't rewritten"
 
+    selection = {"folders": ["Work", "Teaching"], "excludes": ["Work/Drafts"], "rootFiles": False}
+    cs.tag_remote_tree("cloud", root, selection, {})
+    eq(tag("Work/notes.txt"), "synced")
+    eq(tag("Work/Reports/r.pdf"), "synced")
+    eq(tag("Work/Drafts"), "excluded")
+    eq(tag("Work"), "partial")
+    eq(tag("Photos"), "excluded")
+    eq(tag("Photos/a.jpg"), "-")
+    eq(tag("Teaching/week1.md"), "synced")
+    eq(tag("Teaching/week1.md.conflict1"), "conflict")
+    eq(tag("Teaching"), "conflict")
+    eq(tag("Doc.pdf"), "excluded")
+    eq(tag("my.conflicts.txt"), "excluded")
+    eq(tag(""), "conflict")
+
+    assert cs.is_conflict_name("notes.conflict2.txt") and not cs.is_conflict_name("conflict1")
     conflicts = cs.find_conflicts(root)
-    assert any("Conflicted.conflict1.txt" in c for c in conflicts), "finds conflict file"
-
+    eq(conflicts, ["Teaching/week1.md.conflict1"])
 
 test("loose files are off unless chosen", t_default)
 test("each path is on, off or partial", t_states)

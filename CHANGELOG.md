@@ -5,6 +5,27 @@ All notable changes to Storage Drives. Newest first. The format follows
 [Semantic Versioning](https://semver.org/). Releases before 2.7.0 are
 described in their commit messages.
 
+## [2.7.3] - 2026-10-09
+
+### Changed
+
+- Sync status is written as the neutral extended attribute `user.sync.status`
+  (synced, syncing, partial, conflict, excluded), so any file manager can read it
+  without knowing which app synced the folder. Flea draws it as a badge, the
+  Nautilus extension as an emblem. The old `user.terrace.sync` is cleared on retag.
+- After each successful sync every file and folder in the sync folder is tagged,
+  not just the top level: files the selection keeps are synced, others excluded,
+  rclone conflict copies conflict; folders are partial when only some of them
+  syncs and conflict when a conflict sits beneath. A tag is rewritten only when
+  it changes (23,571 entries: 0.87 s first pass, 0.39 s unchanged).
+- The sync root reads syncing while a sync runs; a failed sync marks it conflict,
+  an offline one restores what it had.
+
+### Fixed
+
+- Conflict detection matched any name containing ".conflict" (my.conflicts.txt);
+  it now matches rclone's `.conflictN` part only (sync engine and Nautilus extension).
+
 ## [2.7.2] - 2026-10-08
 
 ### Added

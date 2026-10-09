@@ -1366,16 +1366,44 @@ def unmount_browse(mount_path: Path, remote: str = "") -> None:
   remove_gtk_bookmark(mount_path)
 
 
-def tag_sync_path(path: Path, status: str) -> None:
-  """Tag file/folder with extended attribute and desktop GIO emblem.
-  Status: 'synced', 'syncing', 'partial', 'conflict', 'excluded'.
-  """
-  if not path.exists():
-    return
+# The sync status any file manager can read: Flea draws it as a badge, the Nautilus extension as an
+# emblem. A neutral name, so a reader never has to know which app synced the folder.
+STATUS_XATTR = "user.sync.status"
+LEGACY_XATTR = "user.terrace.sync"
+SYNC_STATUSES = ("synced", "syncing", "partial", "conflict", "excluded")
+
+
+def is_conflict_name(name: str) -> bool:
+  """rclone bisync renames a conflict loser with a ".conflictN" part: notes.txt.conflict1."""
+  return any(part.startswith("conflict") and part[8:].isdigit() or part == "conflict"
+             for part in name.split(".")[1:])
+
+
+def set_status_xattr(path: Path, status: str) -> bool:
+  """Write the status only when it changed, so a file manager isn't sent an
+  attribute event for every file on every sync. Symlinks can't hold user xattrs."""
+  value = status.encode("utf-8")
   try:
-    os.setxattr(path, "user.terrace.sync", status.encode("utf-8"))
+    if os.getxattr(path, STATUS_XATTR, follow_symlinks=False) == value:
+      return False
   except OSError:
     pass
+  try:
+    os.setxattr(path, STATUS_XATTR, value, follow_symlinks=False)
+  except OSError:
+    return False
+  try:
+    os.removexattr(path, LEGACY_XATTR, follow_symlinks=False)
+  except OSError:
+    pass
+  return True
+
+
+def tag_sync_path(path: Path, status: str) -> None:
+  """Tag a file or folder with the status xattr, and a GIO emblem for file
+  managers that read gvfs metadata. Status is one of SYNC_STATUSES."""
+  if status not in SYNC_STATUSES or not path.exists() or not set_status_xattr(path, status):
+    return
 
   emblem_map = {
     "synced": "emblem-default",          # Green circle with white check
@@ -1396,20 +1424,69 @@ def tag_sync_path(path: Path, status: str) -> None:
 
 
 def tag_remote_tree(remote: str, folder: Path, selection: dict[str, Any], state: dict[str, Any]) -> None:
-  """Tag sync folder root and top-level directory entries with appropriate emblems."""
+  """Tag every file and folder in the sync folder after a successful sync.
+
+  Files: synced when the selection covers them, excluded when it doesn't,
+  conflict for rclone's conflict copies. Folders: excluded (not descended),
+  partial when only some of it syncs, synced otherwise, and conflict when a
+  conflict sits anywhere beneath. Only the root and its top-level folders get
+  a GIO emblem too: that costs a subprocess each, the xattr costs a syscall.
+  """
   if not folder.is_dir():
     return
-  tag_sync_path(folder, "synced")
+  selection = normalise_selection(selection)
+
+  def walk(directory: Path, rel: str) -> bool:
+    conflict = False
+    try:
+      with os.scandir(directory) as scan:
+        entries = list(scan)
+    except OSError:
+      return False
+    for entry in entries:
+      if entry.is_symlink():
+        continue
+      child = f"{rel}/{entry.name}" if rel else entry.name
+      if entry.is_dir(follow_symlinks=False):
+        state_here = path_state(selection, child)
+        if state_here == "off":
+          status = "excluded"
+        else:
+          below = walk(Path(entry.path), child)
+          conflict = conflict or below
+          status = "conflict" if below else ("partial" if state_here == "partial" else "synced")
+        (tag_sync_path if not rel else set_status_xattr)(Path(entry.path), status)
+      else:
+        covered = selection["rootFiles"] if not rel else is_covered(selection, child)
+        if is_conflict_name(entry.name):
+          status, conflict = "conflict", True
+        else:
+          status = "synced" if covered else "excluded"
+        set_status_xattr(Path(entry.path), status)
+    return conflict
+
+  tag_sync_path(folder, "conflict" if walk(folder, "") else "synced")
+
+
+def read_status_xattr(path: Path) -> str:
   try:
-    with os.scandir(folder) as scan:
-      for entry in scan:
-        if entry.is_dir(follow_symlinks=False):
-          rel = entry.name
-          st = path_state(selection, rel)
-          tag_state = "synced" if st == "on" else ("partial" if st == "partial" else "excluded")
-          tag_sync_path(Path(entry.path), tag_state)
+    return os.getxattr(path, STATUS_XATTR, follow_symlinks=False).decode("utf-8")
   except OSError:
-    pass
+    return ""
+
+
+def untag_failed_sync(folder: Path, paths: dict[str, Any], root_tag: str) -> None:
+  """A failed sync can't leave the root saying "syncing": an error needs the
+  user (conflict), being offline doesn't, so the root keeps what it had."""
+  if load_state(paths).get("lastResult") == "error":
+    tag_sync_path(folder, "conflict")
+  elif root_tag:
+    tag_sync_path(folder, root_tag)
+  else:
+    try:
+      os.removexattr(folder, STATUS_XATTR)
+    except OSError:
+      pass
 
 
 def find_conflicts(folder: Path, max_find: int = 20) -> list[str]:
@@ -1419,7 +1496,7 @@ def find_conflicts(folder: Path, max_find: int = 20) -> list[str]:
   try:
     for root_dir, _, files in os.walk(folder):
       for f in files:
-        if ".conflict" in f:
+        if is_conflict_name(f):
           rel = str(Path(root_dir, f).relative_to(folder))
           conflicts.append(rel)
           if len(conflicts) >= max_find:
@@ -1670,6 +1747,8 @@ def do_run_once(remote_value: str, folder_value: str, resync: bool) -> int:
   start_ts = int(time.time())
   previous = str(load_state(paths).get("lastResult") or "")
   patch_state(paths, syncing=True, startTs=start_ts)
+  root_tag = read_status_xattr(folder)
+  tag_sync_path(folder, "syncing")
 
   cmd = bisync_command(rclone, remote, folder, resync, rtype, paths)
   code, out, err = stream_bisync(cmd, paths["log_path"], paths, folder, remote)
@@ -1695,10 +1774,12 @@ def do_run_once(remote_value: str, folder_value: str, resync: bool) -> int:
     else:
       record_failure(paths, remote, last_log_error(paths["log_path"]) or clean_text(err2 or out2 or "Resync failed"),
                      duration2, previous)
+      untag_failed_sync(folder, paths, root_tag)
       return 1
   else:
     record_failure(paths, remote, last_log_error(paths["log_path"]) or clean_text(err or out or "Sync failed"),
                    duration, previous)
+    untag_failed_sync(folder, paths, root_tag)
     return 1
 
 

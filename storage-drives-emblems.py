@@ -65,13 +65,18 @@ class TerraceSyncEmblemExtension(GObject.GObject, Nautilus.InfoProvider, Nautilu
             return Nautilus.OperationResult.COMPLETE
 
         name = file.get_name()
-        if ".conflict" in name:
+        # rclone bisync's conflict copies carry a ".conflictN" part: notes.txt.conflict1
+        if any(p == "conflict" or (p.startswith("conflict") and p[8:].isdigit()) for p in name.split(".")[1:]):
             file.add_emblem("emblem-important")
             return Nautilus.OperationResult.COMPLETE
 
         # 1. Extended attribute check
         try:
-            xattr_status = os.getxattr(path_str, "user.terrace.sync").decode("utf-8")
+            # user.sync.status is what the sync engine writes; user.terrace.sync is its older name.
+            try:
+                xattr_status = os.getxattr(path_str, "user.sync.status").decode("utf-8")
+            except OSError:
+                xattr_status = os.getxattr(path_str, "user.terrace.sync").decode("utf-8")
             emblem_map = {
                 "synced": "emblem-default",          # Green circle with white check
                 "syncing": "emblem-synchronizing",   # Blue rotating sync arrows
