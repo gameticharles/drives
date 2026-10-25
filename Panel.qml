@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -20,8 +21,8 @@ Panel {
   ipcTarget: "storage-drives"
   manageIpc: false
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -2909,8 +2910,8 @@ Panel {
                       options: Model.cloudProviderOptions()
                       value: root.cloudAddProvider
                       foreground: root.foreground
-                      background: Color.popups.background
-                      accent: Color.accent
+                      background: Commons.Color.popups.background
+                      accent: Commons.Color.accent
                       fontFamily: root.fontFamily
                       onChanged: function(val) { root.selectCloudAddProvider(val) }
 

@@ -380,7 +380,16 @@ def rotate_log(path: Path, limit: int = LOG_ROTATE_BYTES) -> None:
 
 
 def rclone_bin() -> str | None:
-  return shutil.which("rclone")
+  # systemd user units don't get the login shell's PATH, so an rclone
+  # installed by mise or into ~/.local/bin is invisible to mount services.
+  found = shutil.which("rclone")
+  if found:
+    return found
+  home = Path.home()
+  for candidate in (home / ".local/share/mise/shims/rclone", home / ".local/bin/rclone"):
+    if os.access(candidate, os.X_OK):
+      return str(candidate)
+  return None
 
 
 def normalize_remote(value: str) -> str:

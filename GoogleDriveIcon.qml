@@ -9,6 +9,7 @@
 import QtQuick
 import QtQuick.Shapes
 import qs.Commons
+import qs.Commons as Commons
 
 // Only darker steps are used, never lighter. `Qt.lighter` on an already-light
 // foreground clips to white on dark themes, and the same trick inverts badly
@@ -17,7 +18,7 @@ Item {
     id: root
 
     property real iconSize: Style.font.icon
-    property color color: Color.foreground
+    property color color: Commons.Color.foreground
     readonly property real viewWidth: 87.3
     readonly property real viewHeight: 78
     // Faces, brightest first.

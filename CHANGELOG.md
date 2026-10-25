@@ -5,6 +5,29 @@ All notable changes to Storage Drives. Newest first. The format follows
 [Semantic Versioning](https://semver.org/). Releases before 2.7.0 are
 described in their commit messages.
 
+## [2.7.5] - 2026-10-23
+
+### Fixed
+
+- Storage Drives lost the Omarchy theme colours after the Omarchy 4.0.6 update (Qt
+  6.12). Qt 6.12 adds a global `Color` object to QtQuick that wins over the
+  imported `qs.Commons` singleton, so `Color.background`, `Color.accent` and
+  the rest were undefined and the plugin fell back to its hard-coded colours.
+  Every use is now qualified as `Commons.Color` (`import qs.Commons as
+  Commons`). Use the qualified form in new code; a bare `Color` means
+  QtQuick's.
+
+## [2.7.4] - 2026-10-16
+
+### Fixed
+
+- Mount and sync services find an `rclone` installed by mise
+  (`~/.local/share/mise/shims`) or into `~/.local/bin`. systemd user units don't
+  get the login shell's PATH, so a service written by Storage Drives failed to
+  start with such an rclone. Terrace's built-in copy of this engine had the fix
+  already; the two share the same drives and accounts, so either can now write
+  the services.
+
 ## [2.7.3] - 2026-10-09
 
 ### Changed
