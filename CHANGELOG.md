@@ -85,6 +85,12 @@ described in their commit messages.
 
 ### Fixed
 
+- CI failed on every push since 2026-10-08 before any test ran. The
+  workflow installed `qml-tools`, a package Ubuntu doesn't have. It now
+  installs `qt6-declarative-dev-tools`, which provides
+  `/usr/lib/qt6/bin/qmlformat` for the wiring check that the QML parses. The
+  workflow also moves to Node 22 and `actions/checkout@v5` /
+  `actions/setup-node@v5`, which clears GitHub's Node 20 deprecation warning.
 - A running sync was reported as not running. `systemctl is-active` exits
   with code 3 for a oneshot service that is still starting ("activating"),
   which is the whole of a sync, so `service_active` read it as stopped. It

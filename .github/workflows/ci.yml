@@ -11,17 +11,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
 
-      - name: Install Qt QML tools
+      # qmlformat, for the wiring check that Panel.qml and Service.qml parse.
+      # Ubuntu ships it in qt6-declarative-dev-tools, at /usr/lib/qt6/bin
+      # (there is no `qml-tools` package; asking for one failed every run
+      # before the tests started). qmlformat, not qmllint: qmllint resolves
+      # types, and every Quickshell and `qs.*` type here lives in Omarchy's
+      # shell, which a CI runner doesn't have. Its answer would depend on the
+      # machine. qmlformat only parses the grammar, so it gives one answer
+      # everywhere.
+      - name: Install qmlformat
         run: |
           sudo apt-get update
-          sudo apt-get install -y qml-tools libqt6qml6 qml6-module-qtquick qml6-module-qtquick-controls
+          sudo apt-get install -y --no-install-recommends qt6-declarative-dev-tools
+          /usr/lib/qt6/bin/qmlformat --version
 
       - name: Run Model tests
         run: node test/model.test.js
