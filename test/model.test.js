@@ -2711,5 +2711,70 @@ test("a syncing cloud account shows with its provider when no drive is writing",
   assert.strictEqual(api.writingNow([wSys], {}, {}, accounts, { gdrive: { syncing: false } }), null)
 })
 
+test("cloudSyncFeed lists files in flight, then what is still to do", () => {
+  const st = {
+    activeTransfers: [{ name: "Work/big.bin", percentage: 41.6, direction: "down" }],
+    plannedChanges: [
+      { name: "Work/big.bin", direction: "down", kind: "new" },
+      { name: "Work/report.docx", direction: "up", kind: "changed" },
+      { name: "Work/old.txt", direction: "up", kind: "deleted" },
+      { name: "Work/gone.txt", direction: "down", kind: "deleted" },
+      { name: "Work/both.txt", direction: "up", kind: "conflict" }
+    ],
+    plannedRemaining: 5,
+    plannedCounts: { up: 3, down: 2 }
+  }
+  const feed = api.cloudSyncFeed(st, 6)
+  assert.deepStrictEqual(feed.rows.map(r => [r.name, r.icon, r.active]), [
+    ["Work/big.bin", "down", true],
+    ["Work/report.docx", "up", false],
+    ["Work/old.txt", "delete", false],
+    ["Work/gone.txt", "delete", false],
+    ["Work/both.txt", "conflict", false]
+  ])
+  assert.strictEqual(feed.rows[0].verb, "Downloading · 42%")
+  assert.strictEqual(feed.rows[1].verb, "Changed here · to upload")
+  assert.strictEqual(feed.rows[2].verb, "Deleted here · to delete in the cloud")
+  assert.strictEqual(feed.rows[3].verb, "Deleted in the cloud · to delete here")
+  assert.strictEqual(feed.more, 0)
+  assert.strictEqual(feed.summary, "3 to upload · 2 to download")
+})
+
+test("cloudSyncFeed counts what does not fit", () => {
+  const planned = []
+  for (let i = 0; i < 100; i++) planned.push({ name: "f" + i, direction: "up", kind: "new" })
+  const feed = api.cloudSyncFeed({ plannedChanges: planned, plannedRemaining: 1234,
+                                   activeTransfers: [{ name: "elsewhere.bin", percentage: 5, direction: "up" }] }, 4)
+  assert.strictEqual(feed.rows.length, 4)
+  assert.strictEqual(feed.rows[0].verb, "Uploading · 5%")
+  assert.strictEqual(feed.rows[1].verb, "New here · to upload")
+  assert.strictEqual(feed.more, 1234 + 1 - 4)
+})
+
+test("cloudSyncFeed is empty for an idle or malformed status", () => {
+  assert.deepStrictEqual(api.cloudSyncFeed(null), { rows: [], more: 0, summary: "" })
+  assert.deepStrictEqual(api.cloudSyncFeed({ activeTransfers: "x", plannedChanges: [null, {}], plannedCounts: 3 }),
+                         { rows: [], more: 2, summary: "" })
+})
+
+test("cloudSyncLine names the file in flight, or what the sync is doing", () => {
+  assert.strictEqual(api.cloudSyncLine({ activeTransfers: [{ name: "Work/Reports/q3.pdf", percentage: 7, direction: "up" }],
+                                         plannedChanges: [{ name: "a", direction: "up", kind: "new" }], plannedRemaining: 1 }),
+                     "Uploading q3.pdf · 7% · 1 more")
+  assert.strictEqual(api.cloudSyncLine({ phaseText: "Listing both sides · 17,067 items" }), "Listing both sides · 17,067 items")
+  assert.strictEqual(api.cloudSyncLine({}), "Syncing now…")
+})
+
+test("networkOverview and cloudTabOverview head their own tabs", () => {
+  assert.strictEqual(api.networkOverview(0), "No network shares mounted")
+  assert.strictEqual(api.networkOverview(1), "1 network share mounted")
+  assert.strictEqual(api.networkOverview(3), "3 network shares mounted")
+  const accounts = [{ remoteName: "a" }, { remoteName: "b" }]
+  assert.strictEqual(api.cloudTabOverview(accounts, { a: { syncing: true, authenticated: true } }, {}, false), "2 cloud drives · 1 syncing")
+  assert.strictEqual(api.cloudTabOverview(accounts, {}, {}, true), "Sync paused · 2 cloud drives")
+  assert.strictEqual(api.cloudTabOverview([], {}, {}, false), "No cloud drives yet")
+  assert.strictEqual(api.cloudTabOverview([], {}, {}, true), "Sync paused")
+})
+
 console.log(failures === 0 ? "\nAll tests passed." : `\n${failures} test(s) failed.`)
 process.exit(failures === 0 ? 0 : 1)

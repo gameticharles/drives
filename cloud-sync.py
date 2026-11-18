@@ -19,19 +19,23 @@ import argparse
 import codecs
 import configparser
 import ctypes
+import datetime
 import errno
 import fcntl
+import getpass
 import hashlib
 import itertools
 import json
 import os
 import re
 import secrets
+import select
 import selectors
 import shutil
 import tempfile
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -421,6 +425,7 @@ def remote_paths(remote: str) -> dict[str, Any]:
     "service_name": f"omarchy-storage-sync-{slug}.service",
     "timer_name": f"omarchy-storage-sync-{slug}.timer",
     "browse_service_name": f"omarchy-storage-browse-{slug}.service",
+    "watch_service_name": f"omarchy-storage-watch-{slug}.service",
   }
 
 
@@ -680,8 +685,10 @@ def patch_state(paths: dict[str, Any], **fields: Any) -> dict[str, Any]:
 
 
 def service_active(service_name: str) -> bool:
-  code, out, _ = run(["systemctl", "--user", "is-active", service_name], timeout=6)
-  return code == 0 and out.strip() in ("active", "activating")
+  # is-active exits 0 only for "active": a oneshot sync that is running
+  # reports "activating" with exit code 3, so the state text decides.
+  _, out, _ = run(["systemctl", "--user", "is-active", service_name], timeout=6)
+  return out.strip() in ("active", "activating", "reloading")
 
 
 def systemd_quote(value: str) -> str:
@@ -704,6 +711,8 @@ Documentation=https://rclone.org/bisync/
 Type=oneshot
 ExecStart={python} {helper} run --remote {systemd_quote(remote)} --folder {systemd_quote(str(folder))}
 TimeoutStartSec=7200
+# Pausing stops a run with SIGTERM, which _on_signal turns into exit code 143.
+SuccessExitStatus=143
 Nice=10
 IOSchedulingClass=idle
 """,
@@ -712,13 +721,14 @@ Description=Sync Omarchy Storage Drive ({remote})
 
 [Timer]
 OnBootSec=2min
-OnUnitInactiveSec=10min
+OnUnitInactiveSec=30min
 AccuracySec=30s
 Unit={paths["service_name"]}
 
 [Install]
 WantedBy=timers.target
 """,
+    paths["watch_service_name"]: watch_unit_source(remote, folder),
     paths["browse_service_name"]: f"""[Unit]
 Description=Omarchy Storage Drive browse mount ({remote})
 Documentation=https://rclone.org/commands/rclone_mount/
@@ -847,16 +857,32 @@ def rclone_conf_path(rclone: str | None = None) -> Path:
   return Path.home() / ".config" / "rclone" / "rclone.conf"
 
 
-def is_remote_authenticated(rclone: str, remote: str, rtype: str) -> bool:
+def remote_conf_section(rclone: str | None, remote: str) -> dict[str, str] | None:
+  """The remote's section of rclone.conf, or None (missing, unreadable, or
+  an encrypted config, which configparser cannot read)."""
   try:
     conf_path = rclone_conf_path(rclone)
     if not conf_path.exists():
-      return False
-    cparser = configparser.ConfigParser()
+      return None
+    cparser = configparser.ConfigParser(interpolation=None)
     cparser.read(str(conf_path))
-    if remote not in cparser:
+    return dict(cparser[remote]) if remote in cparser else None
+  except Exception:
+    return None
+
+
+def uses_shared_client_id(section: dict[str, str] | None) -> bool:
+  """A Google Drive remote with no client_id of its own runs on rclone's
+  shared one: rate-limited across every rclone user, and being retired."""
+  return bool(section) and section.get("type", "").strip() == "drive" and not section.get("client_id", "").strip()
+
+
+def is_remote_authenticated(rclone: str, remote: str, rtype: str, section: dict[str, str] | None = None) -> bool:
+  try:
+    if section is None:
+      section = remote_conf_section(rclone, remote)
+    if section is None:
       return False
-    section = cparser[remote]
     if rtype in ("drive", "onedrive", "dropbox", "box"):
       token = section.get("token", "").strip()
       return bool(token and token != "{}")
@@ -1523,8 +1549,8 @@ def bisync_command(rclone: str, remote: str, folder: Path, resync: bool, rtype: 
     "--create-empty-src-dirs",
     "--resilient",
     "--recover",
-    "--fast-list",
-    "--track-renames",
+    # No --track-renames: bisync syncs with copy and move, where rclone
+    # ignores it and logs an ERROR line on every run.
     "--force",
     "--transfers", "8",
     "--checkers", "16",
@@ -1533,6 +1559,11 @@ def bisync_command(rclone: str, remote: str, folder: Path, resync: bool, rtype: 
     "--stats-file-name-length", "0",
     "--log-level", "INFO",
   ]
+  if rtype != "drive":
+    # On Google Drive, --fast-list lists the whole drive (filters only apply
+    # after), which took 30+ minutes on a large drive for a small selection.
+    # Without it rclone walks only the selected folders.
+    command.append("--fast-list")
   if rtype == "drive":
     command += [
       "--drive-skip-gdocs",
@@ -1544,6 +1575,142 @@ def bisync_command(rclone: str, remote: str, folder: Path, resync: bool, rtype: 
     command += ["--exclude", "/Personal Vault/**"]
   command += ["--resync", "--resync-mode", "newer"] if resync else ["--conflict-resolve", "newer"]
   return command
+
+
+# ---- what a running sync is doing
+#
+# bisync says what it is doing in its log: the phase it is in, every change
+# it found on each side ("- Path1  File is new  - Work/a.txt"), and which way
+# the copies it is about to make go ("- Path2  Do queued copies to  - Path1").
+# Path1 is the cloud and Path2 this computer. SyncProgress reads those lines
+# so the panel can say more than "Syncing": what the sync is doing, what it
+# found, and which way each file is going.
+
+SYNC_PHASES = (
+  (re.compile(r"^Building Path1 and Path2 listings"), "listing"),
+  (re.compile(r"^Path[12] checking for diffs"), "comparing"),
+  (re.compile(r"^No changes found"), "nochanges"),
+  (re.compile(r"^Applying changes"), "applying"),
+  (re.compile(r"^(Updating|Validating) listings"), "finishing"),
+)
+SYNC_DIFF = re.compile(r"^- (Path[12])\s+File (changed(?::.*?)?|is new|was deleted)\s+- (.+)$")
+SYNC_BATCH = re.compile(r"^- Path[12]\s+(?:Do queued copies to|Resync is copying files to)\s+- (Path[12])$")
+SYNC_RESYNC_COPY = re.compile(r"^Copying Path[12] files to (Path[12])")
+SYNC_DONE_MESSAGES = ("Copied", "Updated", "Deleted", "Made directory", "Making directory",
+                      "Removed directory", "Removing directory")
+MAX_PLANNED_SHOWN = 100
+SYNC_PHASE_TEXT = {
+  "starting": "Starting",
+  "listing": "Listing both sides",
+  "comparing": "Comparing both sides",
+  "nochanges": "No changes found",
+  "applying": "Applying changes",
+  "up": "Uploading changes",
+  "down": "Downloading changes",
+  "finishing": "Saving the sync state",
+}
+SYNC_PHASE_SHORT = {
+  "starting": "starting", "listing": "listing", "comparing": "comparing", "nochanges": "finishing",
+  "applying": "applying changes", "up": "uploading", "down": "downloading", "finishing": "finishing",
+}
+
+
+class SyncProgress:
+  def __init__(self, resync: bool = False):
+    self.resync = resync
+    self.phase = "starting"
+    self.direction = ""
+    self.pending: dict[str, dict[str, str]] = {}
+    self.counts = {"up": 0, "down": 0}
+
+  def line(self, message: str) -> bool:
+    """Read one bisync log message; True when the phase changed."""
+    text = ANSI.sub("", message).strip()
+    before = self.phase
+    for pattern, phase in SYNC_PHASES:
+      if pattern.match(text):
+        self.phase = phase
+        return self.phase != before
+    match = SYNC_BATCH.match(text) or SYNC_RESYNC_COPY.match(text)
+    if match:
+      self.direction = "up" if match[1] == "Path1" else "down"
+      self.phase = self.direction
+      return self.phase != before
+    match = SYNC_DIFF.match(text)
+    if match:
+      side, what, name = match[1], match[2], match[3].strip()
+      direction = "down" if side == "Path1" else "up"  # changed in the cloud comes down
+      kind = "deleted" if what == "was deleted" else "new" if what == "is new" else "changed"
+      seen = self.pending.get(name)
+      if seen is None:
+        self.pending[name] = {"name": name, "direction": direction, "kind": kind}
+        self.counts[direction] += 1
+      elif seen["direction"] != direction:
+        seen["kind"] = "conflict"  # changed on both sides; --conflict-resolve newer decides
+    return False
+
+  def done(self, name: str, message: str) -> None:
+    if message.startswith(SYNC_DONE_MESSAGES):
+      self.pending.pop(name, None)
+
+  def text(self, stats: dict[str, Any]) -> str:
+    base = SYNC_PHASE_TEXT.get(self.phase, "Syncing")
+    if self.resync and self.phase in ("up", "down"):
+      return "First sync: copying to " + ("the cloud" if self.phase == "up" else "this computer")
+    if self.phase == "listing" and clamp_int(stats.get("listed")) > 0:
+      return f"{base} · {clamp_int(stats.get('listed')):,} items"
+    if self.phase == "applying":
+      found = self.counts["up"] + self.counts["down"]
+      return f"{found:,} change{'' if found == 1 else 's'} to apply" if found else base
+    return base
+
+  def fields(self, stats: dict[str, Any]) -> dict[str, Any]:
+    return {
+      "phase": self.phase,
+      "phaseText": self.text(stats),
+      "plannedChanges": list(itertools.islice(self.pending.values(), MAX_PLANNED_SHOWN)),
+      "plannedRemaining": len(self.pending),
+      "plannedCounts": dict(self.counts),
+    }
+
+
+IDLE_PROGRESS = {"phase": "", "phaseText": "", "plannedChanges": [], "plannedRemaining": 0, "plannedCounts": {}}
+SYNC_REASON_SECONDS = 6 * 3600  # a run queued behind a long one still counts
+
+
+def take_sync_reason(paths: dict[str, Any], override: str = "") -> dict[str, Any]:
+  """Why this run started: a local change (the watch service), Sync now
+  (cmd_sync), a selection change (do_run's rerun), or the timer. The first
+  two leave a note in state.json just before they start the service."""
+  if override:
+    return {"kind": override, "ts": int(time.time())}
+  note = load_state(paths).get("syncReason")
+  if isinstance(note, dict) and time.time() - clamp_int(note.get("ts")) < SYNC_REASON_SECONDS \
+      and note.get("kind") in ("local", "manual", "resume"):
+    return note
+  return {"kind": "timer", "ts": int(time.time())}
+
+
+def sync_reason_text(reason: object) -> str:
+  if not isinstance(reason, dict):
+    return ""
+  kind = reason.get("kind")
+  if kind == "local":
+    names = [str(p) for p in reason.get("paths", []) if isinstance(p, str)] if isinstance(reason.get("paths"), list) else []
+    count = clamp_int(reason.get("count")) or len(names)
+    if not names:
+      return "For a change in this folder"
+    more = count - 1
+    return f"For your change to {names[0]}" + (f" and {more:,} more" if more > 0 else "")
+  if kind == "manual":
+    return "Started with Sync now"
+  if kind == "resume":
+    return "Catching up after the pause"
+  if kind == "selection":
+    return "The folders kept on disk changed"
+  if kind == "timer":
+    return "Regular check"
+  return ""
 
 
 def stream_bisync(cmd: list[str], log_path: Path, paths: dict[str, Any], folder: Path, remote: str) -> tuple[int, str, str]:
@@ -1567,6 +1734,7 @@ def stream_bisync(cmd: list[str], log_path: Path, paths: dict[str, Any], folder:
   active_transfers: list[dict[str, Any]] = []
   transfer_stats: dict[str, Any] = {}
   err_lines: list[str] = []
+  progress = SyncProgress(resync="--resync" in cmd)
 
   log_file = None
   try:
@@ -1606,6 +1774,12 @@ def stream_bisync(cmd: list[str], log_path: Path, paths: dict[str, Any], folder:
       if lvl in ("ERROR", "NOTICE"):
         err_lines.append(f"{obj_name + ': ' if obj_name else ''}{msg}")
 
+      phase_changed = progress.line(msg) if not obj_name else False
+      if phase_changed:
+        active_transfers = []  # the last stats are the batch before this one
+      if obj_name:
+        progress.done(obj_name, msg)
+
       stats = obj.get("stats")
       if isinstance(stats, dict):
         transferring = stats.get("transferring")
@@ -1618,6 +1792,7 @@ def stream_bisync(cmd: list[str], log_path: Path, paths: dict[str, Any], folder:
               "percentage": clamp_int(t.get("percentage")),
               "speed": clamp_int(t.get("speed")),
               "eta": clamp_int(t.get("eta")),
+              "direction": progress.direction,
             }
             for t in transferring if isinstance(t, dict) and t.get("name")
           ]
@@ -1632,6 +1807,7 @@ def stream_bisync(cmd: list[str], log_path: Path, paths: dict[str, Any], folder:
           "totalTransfers": clamp_int(stats.get("totalTransfers")),
           "checks": clamp_int(stats.get("checks")),
           "totalChecks": clamp_int(stats.get("totalChecks")),
+          "listed": clamp_int(stats.get("listed")),
           "elapsedTime": float(stats.get("elapsedTime", 0) or 0),
         }
 
@@ -1641,17 +1817,19 @@ def stream_bisync(cmd: list[str], log_path: Path, paths: dict[str, Any], folder:
           "action": msg,
           "size": clamp_int(obj.get("size")),
           "ts": int(time.time()),
+          "direction": progress.direction,
         }
         recent_transfers = [entry] + [r for r in recent_transfers if r.get("name") != obj_name][:19]
         tag_sync_path(folder / obj_name, "synced")
 
       now = time.time()
-      if now - last_patch_ts >= 1.5:
+      if phase_changed or now - last_patch_ts >= 1.5:
         patch_state(
           paths,
           activeTransfers=active_transfers,
           transferStats=transfer_stats,
           recentTransfers=recent_transfers,
+          **progress.fields(transfer_stats),
         )
         last_patch_ts = now
 
@@ -1672,6 +1850,7 @@ def stream_bisync(cmd: list[str], log_path: Path, paths: dict[str, Any], folder:
     activeTransfers=[],
     transferStats={},
     recentTransfers=recent_transfers,
+    **IDLE_PROGRESS,
   )
   return proc.returncode or 0, "", "\n".join(err_lines)
 
@@ -1707,21 +1886,128 @@ def clear_stale_bisync_lock(paths: dict[str, Any]) -> bool:
   return True
 
 
+def needs_resync(errors: str) -> bool:
+  """Whether a failed bisync really needs a --resync. Exit codes 2 and 7
+  cover both "Must run --resync to recover" and an abort that --resilient
+  makes "retryable without --resync" (a listing cut short by a rate limit or
+  a network blip). A resync then is wrong: it takes an hour or more on a large
+  drive, and it copies each side's files to the other, so a file deleted
+  since the last good sync comes back. Only rclone's own word starts one."""
+  text = ANSI.sub("", errors or "")
+  if "retryable without --resync" in text:
+    return False
+  return "Must run --resync" in text or "cannot find prior Path1 or Path2 listings" in text
+
+
+# ---- pausing every cloud sync
+#
+# One flag for all accounts, in the shared state folder, so Storage Drives
+# and Terrace both obey it and it outlives a reboot. Pausing stops any sync
+# that is running (rclone's --resilient --recover pick up an interrupted run
+# next time) and leaves the timers and watch services installed: their runs
+# end at once while the flag is there. Resuming removes it and starts one
+# sync for each account with auto-sync on, to catch up.
+
+PAUSE_PATH = STATE_BASE / "paused.json"
+
+
+def sync_paused() -> bool:
+  return PAUSE_PATH.is_file()
+
+
+def sync_accounts_on_disk() -> list[dict[str, Any]]:
+  """Every account with a sync service unit: its paths (by slug, which a
+  slug maps to itself) and whether auto-sync is on."""
+  out = []
+  for unit in sorted(UNIT_DIR.glob("omarchy-storage-sync-*.service")):
+    slug = unit.name[len("omarchy-storage-sync-"):-len(".service")]
+    try:
+      paths = remote_paths(slug)
+    except ValueError:
+      continue
+    out.append(paths)
+  return out
+
+
+def stopped_midway(paths: dict[str, Any], folder: Path, root_tag: str) -> None:
+  """A sync stopped from outside (a pause, logging out, removing the account)
+  leaves nothing saying it is still running."""
+  try:
+    patch_state(paths, syncing=False, activeTransfers=[], transferStats={}, **IDLE_PROGRESS)
+    untag_failed_sync(folder, paths, root_tag)
+  except Exception:
+    pass
+
+
+def cmd_pause(args: argparse.Namespace) -> None:
+  if args.on:
+    if not sync_paused():
+      write_json(PAUSE_PATH, {"since": int(time.time())})
+    for paths in sync_accounts_on_disk():
+      if service_active(paths["service_name"]):
+        run(["systemctl", "--user", "stop", paths["service_name"]], timeout=90)
+  elif args.off:
+    try:
+      PAUSE_PATH.unlink()
+    except FileNotFoundError:
+      pass
+    for paths in sync_accounts_on_disk():
+      if timer_enabled(paths["timer_name"]) and not service_active(paths["service_name"]):
+        patch_state(paths, syncReason={"kind": "resume", "ts": int(time.time())})
+        run(["systemctl", "--user", "start", "--no-block", paths["service_name"]], timeout=20)
+  since = read_json(PAUSE_PATH, {}) if sync_paused() else {}
+  print(json.dumps({"ok": True, "paused": sync_paused(),
+                    "since": clamp_int(since.get("since")) if isinstance(since, dict) else 0}))
+
+
+STALE_TMP_SECONDS = 3600
+STALE_TMP_NAME = re.compile(r"^\..+\.tmp\.[0-9a-f]{16}$")
+
+
+def clear_stale_tmp_files(state_dir: Path) -> int:
+  """Remove write_atomic leftovers (.name.tmp.<hex>) that a killed process
+  never renamed into place. Only ones older than an hour: a younger one may
+  belong to a write still in progress (the panel's status poll)."""
+  if not state_dir.is_dir():
+    return 0
+  removed = 0
+  cutoff = time.time() - STALE_TMP_SECONDS
+  dfd = open_owned_dir(state_dir, fix_mode=0o700)
+  try:
+    with os.scandir(dfd) as scan:
+      for entry in scan:
+        if not STALE_TMP_NAME.match(entry.name) or not entry.is_file(follow_symlinks=False):
+          continue
+        try:
+          if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+            _unlink_quiet(entry.name, dfd)
+            removed += 1
+        except OSError:
+          pass
+  finally:
+    os.close(dfd)
+  return removed
+
+
 def do_run(remote_value: str, folder_value: str, resync: bool, again: int = 0) -> int:
   paths = remote_paths(normalize_remote(remote_value))
   used = build_filters(load_selection(paths))
-  code = do_run_once(remote_value, folder_value, resync)
+  code = do_run_once(remote_value, folder_value, resync, "selection" if again else "")
   # A selection changed while rclone ran applies only from the next run:
   # that run is now, rather than a timer tick away (twice at most).
-  if code == 0 and again < 2 and build_filters(load_selection(paths)) != used:
+  if code == 0 and again < 2 and not sync_paused() and build_filters(load_selection(paths)) != used:
     return do_run(remote_value, folder_value, False, again + 1)
   return code
 
 
-def do_run_once(remote_value: str, folder_value: str, resync: bool) -> int:
+def do_run_once(remote_value: str, folder_value: str, resync: bool, reason_override: str = "") -> int:
   remote = normalize_remote(remote_value)
   folder = normalize_path(folder_value, "~/Cloud")
   paths = remote_paths(remote)
+  if sync_paused():
+    # The timer and the watch keep running while paused; their runs end here.
+    print("Cloud sync is paused; nothing synced.")
+    return 0
   rclone = rclone_bin()
   if not rclone:
     patch_state(paths, lastResult="error", lastError="rclone is not installed")
@@ -1751,16 +2037,24 @@ def do_run_once(remote_value: str, folder_value: str, resync: bool) -> int:
 
   paths["workdir"].mkdir(parents=True, exist_ok=True, mode=0o700)
   clear_stale_bisync_lock(paths)
+  clear_stale_tmp_files(paths["state_dir"])
   rotate_log(paths["log_path"])
+  ensure_watch_unit(remote, folder)
 
   start_ts = int(time.time())
   previous = str(load_state(paths).get("lastResult") or "")
-  patch_state(paths, syncing=True, startTs=start_ts)
+  reason = take_sync_reason(paths, reason_override)
+  patch_state(paths, syncing=True, startTs=start_ts, runReason=reason, syncReason=None,
+              **dict(IDLE_PROGRESS, phase="starting", phaseText=SYNC_PHASE_TEXT["starting"]))
   root_tag = read_status_xattr(folder)
   tag_sync_path(folder, "syncing")
 
   cmd = bisync_command(rclone, remote, folder, resync, rtype, paths)
-  code, out, err = stream_bisync(cmd, paths["log_path"], paths, folder, remote)
+  try:
+    code, out, err = stream_bisync(cmd, paths["log_path"], paths, folder, remote)
+  except SystemExit:
+    stopped_midway(paths, folder, root_tag)
+    raise
 
   duration = time.time() - start_ts
   if code == 0:
@@ -1769,10 +2063,14 @@ def do_run_once(remote_value: str, folder_value: str, resync: bool) -> int:
     tag_remote_tree(remote, folder, selection, load_state(paths))
     announce_recovery(remote, previous)
     return 0
-  elif code in RCLONE_RESYNC_CODES:
+  elif code in RCLONE_RESYNC_CODES and needs_resync(err):
     # Bisync requires a resync baseline run
     cmd_resync = bisync_command(rclone, remote, folder, True, rtype, paths)
-    code2, out2, err2 = stream_bisync(cmd_resync, paths["log_path"], paths, folder, remote)
+    try:
+      code2, out2, err2 = stream_bisync(cmd_resync, paths["log_path"], paths, folder, remote)
+    except SystemExit:
+      stopped_midway(paths, folder, root_tag)
+      raise
     duration2 = time.time() - start_ts
     if code2 == 0:
       patch_state(paths, syncing=False, lastResult="ok", lastError="", finishedTs=int(time.time()),
@@ -1819,7 +2117,15 @@ def notify(summary: str, body: str, critical: bool = False) -> None:
     pass
 
 
+RATE_LIMITED = re.compile(r"rateLimitExceeded|userRateLimitExceeded|RATE_LIMIT_EXCEEDED|Quota exceeded|Error 429", re.I)
+
+
 def record_failure(paths: dict[str, Any], remote: str, reason: str, duration: float, previous: str) -> None:
+  if RATE_LIMITED.search(reason or ""):
+    # Google's raw 403 says "Quota exceeded for quota metric 'Queries'…",
+    # which reads like the drive being full. It is the request rate.
+    reason = ("The cloud refused more requests for now (rate limit). The next sync tries again"
+              + ("; on Google Drive, a client ID of your own avoids this." if "googleapi" in (reason or "") else "."))
   result = "offline" if is_network_error(reason) else "error"
   patch_state(paths, syncing=False, lastResult=result, lastError=reason,
               finishedTs=int(time.time()), durationSec=round(duration, 1))
@@ -1978,6 +2284,15 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
     "recentTransfers": state.get("recentTransfers", []) or [],
     "conflictFiles": [],
     "conflictCount": 0,
+    "sharedClientId": False,
+    "paused": sync_paused(),
+    # While a sync runs: what it is doing (SyncProgress) and why it started.
+    "phase": "",
+    "phaseText": "",
+    "plannedChanges": [],
+    "plannedRemaining": 0,
+    "plannedCounts": {},
+    "syncReasonText": "",
   }
 
   if not rclone:
@@ -1986,7 +2301,9 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
 
   remotes, config_error = configured_remotes(rclone)
   payload["remoteType"] = remotes.get(remote, "")
-  payload["authenticated"] = (remote in remotes) and is_remote_authenticated(rclone, remote, payload["remoteType"])
+  section = remote_conf_section(rclone, remote) if remote in remotes else None
+  payload["authenticated"] = section is not None and is_remote_authenticated(rclone, remote, payload["remoteType"], section)
+  payload["sharedClientId"] = uses_shared_client_id(section)
   browse_state = mount_info(mount_path)
   owned = browse_state[1] and browse_owned_by(mount_path, remote)
   payload["browseMounted"] = owned and browse_state[3]
@@ -1997,6 +2314,18 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
   payload["timerEnabled"] = timer_enabled(paths["timer_name"])
   payload["unitsInstalled"] = (UNIT_DIR / paths["service_name"]).exists() and (UNIT_DIR / paths["timer_name"]).exists()
   payload["syncing"] = service_active(paths["service_name"]) or bisync_running(paths)
+  if payload["syncing"]:
+    # Only while it runs: a sync that was killed leaves its last phase behind.
+    planned = state.get("plannedChanges")
+    counts = state.get("plannedCounts")
+    payload.update(
+      phase=str(state.get("phase") or "starting"),
+      phaseText=str(state.get("phaseText") or SYNC_PHASE_TEXT["starting"]),
+      plannedChanges=[p for p in planned if isinstance(p, dict)][:MAX_PLANNED_SHOWN] if isinstance(planned, list) else [],
+      plannedRemaining=clamp_int(state.get("plannedRemaining")),
+      plannedCounts={k: clamp_int(v) for k, v in counts.items() if k in ("up", "down")} if isinstance(counts, dict) else {},
+      syncReasonText=sync_reason_text(state.get("runReason")),
+    )
 
   if payload["authenticated"]:
     ensure_sync_folder(remote, folder)
@@ -2063,7 +2392,9 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str) -> di
     pass
 
   if payload["syncing"]:
-    payload["statusText"] = "Syncing…"
+    payload["statusText"] = "Syncing · " + SYNC_PHASE_SHORT.get(payload["phase"], "starting")
+  elif payload["paused"]:
+    payload["statusText"] = "Paused"
   elif payload["selectedCount"] == 0 and not selection["rootFiles"]:
     payload["statusText"] = "Nothing selected"
   elif payload["lastResult"] == "offline":
@@ -2334,6 +2665,357 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
   return 0
 
 
+# ---- syncing on a local change
+#
+# The timer alone finds a local edit only at its next tick, and every tick
+# lists the whole selection on both sides, which on a large Google Drive takes
+# many minutes even when nothing changed. The watch service (one per account,
+# on whenever auto-sync is on) follows the sync folder with inotify and starts
+# the sync service shortly after a change, so local edits go up in seconds and
+# the timer only has to catch changes made in the cloud.
+#
+# The sync itself writes into the folder. Those events are not changes to
+# upload: once no sync is running, each changed path is checked against
+# bisync's local listing (the .path2.lst it rewrites at the end of a run), and
+# a path that matches it is already in sync. So downloads never start another
+# run, while an edit made during a run still does.
+
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_DELETE_SELF = 0x00000400
+IN_MOVE_SELF = 0x00000800
+IN_Q_OVERFLOW = 0x00004000
+IN_IGNORED = 0x00008000
+IN_ONLYDIR = 0x01000000
+IN_DONT_FOLLOW = 0x02000000
+IN_EXCL_UNLINK = 0x04000000
+IN_ISDIR = 0x40000000
+WATCH_MASK = (IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE
+              | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR | IN_DONT_FOLLOW | IN_EXCL_UNLINK)
+INOTIFY_EVENT = struct.Struct("iIII")
+
+WATCH_QUIET_SECONDS = 15      # start once the folder has been quiet this long
+WATCH_MAX_WAIT_SECONDS = 120  # or this long after the first change, whichever is first
+WATCH_POLL_SECONDS = 5
+WATCH_BUSY_RECHECK_SECONDS = 10
+# Editor and office scratch files: they come and go while a document is open
+# and are not worth a sync of their own (a sync started for a real change
+# still carries them, the filters are unchanged).
+WATCH_IGNORED_NAME = re.compile(
+  r"^(\.~lock\..*#|~\$.*|\.#.*|#.*#|\..*\.sw[a-p]|.*~|\.goutputstream-.*|.*\.partial|.*\.part|.*\.crdownload)$")
+LISTING_LINE = re.compile(r'^([d-])\s+(-?\d+)\s+\S+\s+\S+\s+(\S+)\s+"(.*)"$')
+LISTING_TIME = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d{4})$")
+
+
+class TreeWatch:
+  """inotify on a folder and every folder beneath it, reporting paths
+  relative to the root. Adding watches stops quietly at the kernel's limit
+  (fs.inotify.max_user_watches): the timer still covers the rest."""
+
+  def __init__(self, root: Path):
+    libc = ctypes.CDLL(None, use_errno=True)
+    self._add = libc.inotify_add_watch
+    self._add.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    self._add.restype = ctypes.c_int
+    self._rm = libc.inotify_rm_watch
+    self._rm.argtypes = [ctypes.c_int, ctypes.c_int]
+    self._rm.restype = ctypes.c_int
+    self.fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    if self.fd < 0:
+      raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+    self.root = root
+    self.dirs: dict[int, str] = {}
+    self.overflow = False
+    self.root_gone = False
+    self.limited = False
+
+  def close(self) -> None:
+    os.close(self.fd)
+
+  def add_tree(self, rel: str, found: list[str] | None = None) -> None:
+    """Watch rel and every folder beneath it. With found, also report what is
+    already inside: a folder that just appeared can fill up before its watch
+    exists, and those files would otherwise go unseen."""
+    stack = [rel]
+    while stack and not self.limited:
+      current = stack.pop()
+      full = self.root / current if current else self.root
+      wd = self._add(self.fd, os.fsencode(str(full)), WATCH_MASK)
+      if wd < 0:
+        if ctypes.get_errno() == errno.ENOSPC:
+          self.limited = True
+        continue
+      self.dirs[wd] = current
+      try:
+        with os.scandir(full) as scan:
+          for entry in scan:
+            if entry.name in SKIP_LOCAL:
+              continue
+            child = f"{current}/{entry.name}" if current else entry.name
+            if found is not None:
+              found.append(child)
+            if entry.is_dir(follow_symlinks=False):
+              stack.append(child)
+      except OSError:
+        pass
+
+  def drop_tree(self, rel: str) -> None:
+    for wd, current in list(self.dirs.items()):
+      if rel == "" or at_or_under(current, rel):
+        self._rm(self.fd, wd)
+        self.dirs.pop(wd, None)
+
+  def read(self, timeout: float) -> list[str]:
+    ready, _, _ = select.select([self.fd], [], [], timeout)
+    if not ready:
+      return []
+    changed: list[str] = []
+    while True:
+      try:
+        data = os.read(self.fd, 1 << 16)
+      except BlockingIOError:
+        break
+      if not data:
+        break
+      offset = 0
+      while offset + INOTIFY_EVENT.size <= len(data):
+        wd, mask, _cookie, length = INOTIFY_EVENT.unpack_from(data, offset)
+        offset += INOTIFY_EVENT.size
+        name = os.fsdecode(data[offset:offset + length].rstrip(b"\0"))
+        offset += length
+        self._event(wd, mask, name, changed)
+    return changed
+
+  def _event(self, wd: int, mask: int, name: str, changed: list[str]) -> None:
+    if mask & IN_Q_OVERFLOW:
+      self.overflow = True
+      return
+    base = self.dirs.get(wd)
+    if mask & IN_IGNORED:
+      self.dirs.pop(wd, None)
+      if base == "":
+        self.root_gone = True
+      return
+    if base is None:
+      return
+    if mask & (IN_DELETE_SELF | IN_MOVE_SELF):
+      # The parent reports the same change by name; only the root has none.
+      if base == "":
+        self.root_gone = True
+      return
+    if not name:
+      return
+    rel = f"{base}/{name}" if base else name
+    if mask & IN_ISDIR:
+      if mask & IN_MOVED_FROM:
+        self.drop_tree(rel)
+      elif mask & (IN_CREATE | IN_MOVED_TO):
+        changed.append(rel)
+        self.add_tree(rel, changed)
+        return
+    changed.append(rel)
+
+
+def watch_unit_source(remote: str, folder: Path) -> str:
+  helper = systemd_quote(str(Path(__file__).resolve()))
+  python = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else (shutil.which("python3") or "/usr/bin/python3")
+  return f"""[Unit]
+Description=Omarchy Storage Drives change watch ({remote})
+Documentation=man:inotify(7)
+
+[Service]
+Type=simple
+ExecStart={python} {helper} watch --remote {systemd_quote(remote)} --folder {systemd_quote(str(folder))}
+Restart=on-failure
+RestartSec=60
+# A stop arrives as SIGTERM, which _on_signal turns into exit code 143.
+SuccessExitStatus=143
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def ensure_watch_unit(remote: str, folder: Path) -> None:
+  """Keep the watch unit current and running alongside the timer. Called by
+  every sync run, so accounts set up before the watcher existed get it at
+  their next timer tick without a trip to the panel."""
+  paths = remote_paths(remote)
+  path = UNIT_DIR / paths["watch_service_name"]
+  text = watch_unit_source(remote, folder)
+  try:
+    current = path.read_text(encoding="utf-8")
+  except OSError:
+    current = ""
+  try:
+    if current != text:
+      write_atomic(path, text, mode=0o644)
+      run(["systemctl", "--user", "daemon-reload"], timeout=30)
+      if current:
+        run(["systemctl", "--user", "try-restart", "--no-block", paths["watch_service_name"]], timeout=15)
+    if timer_enabled(paths["timer_name"]) and not unit_enabled(paths["watch_service_name"]):
+      run(["systemctl", "--user", "enable", "--now", "--no-block", paths["watch_service_name"]], timeout=20)
+  except (OSError, RuntimeError):
+    pass
+
+
+def watched_path(selection: dict[str, Any], rel: str) -> bool:
+  """True when a local path is one the sync carries (filters.txt's rules)."""
+  if at_or_under(rel, "Personal Vault"):
+    return False
+  parts = rel.split("/")
+  if WATCH_IGNORED_NAME.match(parts[-1]) or any(part in SKIP_LOCAL for part in parts):
+    return False
+  if is_covered(selection, rel):
+    return True
+  return selection["rootFiles"] and "/" not in rel
+
+
+def listing_time(text: str) -> float | None:
+  match = LISTING_TIME.match(text)
+  if not match:
+    return None
+  zone = "+0000" if match[3] == "Z" else match[3]
+  try:
+    whole = datetime.datetime.strptime(match[1] + zone, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+  except ValueError:
+    return None
+  return whole + float(match[2] or 0)
+
+
+def local_listing(paths: dict[str, Any]) -> dict[str, tuple[str, int, float | None]] | None:
+  """bisync's record of the local side after its last successful run:
+  {path: (kind, size, modtime)}. None when there is none to compare with."""
+  try:
+    candidates = sorted(paths["workdir"].glob("*.path2.lst"), key=lambda p: p.stat().st_mtime, reverse=True)
+  except OSError:
+    return None
+  if not candidates:
+    return None
+  entries: dict[str, tuple[str, int, float | None]] = {}
+  try:
+    with open(candidates[0], encoding="utf-8", errors="surrogateescape") as handle:
+      for line in handle:
+        match = LISTING_LINE.match(line.rstrip("\n"))
+        if not match:
+          continue
+        name = match[4]
+        if "\\" in name:
+          try:
+            name = json.loads('"' + name + '"')
+          except ValueError:
+            pass
+        entries[name] = (match[1], int(match[2]), listing_time(match[3]))
+  except OSError:
+    return None
+  return entries
+
+
+def differs_from_listing(folder: Path, rel: str, listing: dict[str, tuple[str, int, float | None]]) -> bool:
+  entry = listing.get(rel)
+  try:
+    info = os.lstat(folder / rel)
+  except FileNotFoundError:
+    return entry is not None
+  except OSError:
+    return False
+  if stat.S_ISLNK(info.st_mode):
+    return False  # rclone skips symlinks
+  if stat.S_ISDIR(info.st_mode):
+    return entry is None or entry[0] != "d"
+  if not stat.S_ISREG(info.st_mode):
+    return False
+  if entry is None or entry[0] != "-" or entry[1] != info.st_size:
+    return True
+  return entry[2] is None or abs(entry[2] - info.st_mtime) >= 1.0
+
+
+def local_changes(folder: Path, paths: dict[str, Any], pending: set[str]) -> list[str]:
+  listing = local_listing(paths)
+  if listing is None:
+    return sorted(pending)
+  return sorted(rel for rel in pending if differs_from_listing(folder, rel, listing))
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+  remote = normalize_remote(args.remote)
+  folder = normalize_path(args.folder, "~/Cloud")
+  paths = remote_paths(remote)
+  while not folder.is_dir():
+    time.sleep(60)
+  watch = TreeWatch(folder)
+  watch.add_tree("")
+  print(f"Watching {folder} ({len(watch.dirs)} folders)", flush=True)
+  if watch.limited:
+    print("inotify watch limit reached (fs.inotify.max_user_watches); "
+          "folders past it are synced by the timer only", flush=True)
+  selection = load_selection(paths)
+  selection_mtime = 0.0
+  pending: set[str] = set()
+  first = last = checked = 0.0
+  try:
+    while True:
+      names = watch.read(WATCH_POLL_SECONDS)
+      if watch.root_gone:
+        print(f"{folder} was moved or removed; stopping", flush=True)
+        return 1
+      try:
+        mtime = paths["selection_path"].stat().st_mtime
+      except OSError:
+        mtime = 0.0
+      if mtime != selection_mtime:
+        selection, selection_mtime = load_selection(paths), mtime
+      now = time.monotonic()
+      for rel in names:
+        if watched_path(selection, rel):
+          pending.add(rel)
+          last = now
+          first = first or now
+      if watch.overflow:
+        last = now
+        first = first or now
+      if not pending and not watch.overflow:
+        continue
+      if now - last < WATCH_QUIET_SECONDS and now - first < WATCH_MAX_WAIT_SECONDS:
+        continue
+      if now - checked < WATCH_BUSY_RECHECK_SECONDS:
+        continue
+      checked = now
+      if sync_paused():
+        pending.clear()  # resuming syncs every account anyway
+        first = 0.0
+        watch.overflow = False
+        continue
+      if service_active(paths["service_name"]):
+        continue  # what it wrote is sorted out against its listing once it ends
+      if watch.overflow:
+        # The kernel dropped events, so neither the list nor the folders
+        # watched can be trusted: sync, and watch the tree afresh.
+        changes = sorted(pending) or ["(more changes than inotify could report)"]
+        watch.drop_tree("")
+        watch.add_tree("")
+      else:
+        changes = local_changes(folder, paths, pending)
+      pending.clear()
+      watch.overflow = False
+      first = 0.0
+      if not changes:
+        continue
+      more = f" and {len(changes) - 1} more" if len(changes) > 1 else ""
+      print(f"Local change: {changes[0]}{more}; starting a sync", flush=True)
+      named = [rel for rel in changes if not rel.startswith("(")]
+      patch_state(paths, syncReason={"kind": "local", "paths": named[:5], "count": len(named),
+                                     "ts": int(time.time())})
+      run(["systemctl", "--user", "start", "--no-block", paths["service_name"]], timeout=20)
+  finally:
+    watch.close()
+
+
 def write_timer_interval(timer_name: str, minutes: int) -> None:
   value = max(1, min(1440, int(minutes)))
   write_atomic(
@@ -2378,20 +3060,135 @@ def cmd_timer(args: argparse.Namespace) -> None:
   code, out, err = run(["systemctl", "--user", *action, timer_name], timeout=20)
   if code != 0:
     raise RuntimeError(clean_text(err or out or "Could not change the sync timer"))
+  # The change watch follows auto-sync; it failing to start only costs the
+  # fast path, the timer still syncs.
+  run(["systemctl", "--user", *action, "--no-block", paths["watch_service_name"]], timeout=20)
   print(json.dumps({"ok": True, "timerEnabled": timer_enabled(timer_name)}))
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
   remote = normalize_remote(args.remote)
   paths = remote_paths(remote)
+  if sync_paused():
+    raise RuntimeError("Cloud sync is paused. Resume it to sync.")
   units_from_args(args)
   service_name = paths["service_name"]
   if args.resync:
     patch_state(paths, forceResync=True)
+  # Left for the run this starts; while one is running, systemd queues the
+  # start and the note waits for that next run (each run takes it at start).
+  patch_state(paths, syncReason={"kind": "manual", "ts": int(time.time())})
   code, out, err = run(["systemctl", "--user", "start", service_name, "--no-block"], timeout=20)
   if code != 0:
     raise RuntimeError(clean_text(err or out or "Could not start the sync service"))
   print(json.dumps({"ok": True, "started": True}))
+
+
+GOOGLE_CLIENT_ID = re.compile(r"^[A-Za-z0-9-]+\.apps\.googleusercontent\.com$")
+GOOGLE_CLIENT_SECRET = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+CLIENT_ID_GUIDE = """\
+Your own Google client ID for '{remote}'
+
+This account uses rclone's shared Google client ID. Google rate-limits it
+across every rclone user, and rclone is retiring it, so syncs are slow now
+and will stop working. A client ID of your own is free and takes about ten
+minutes to create:
+
+  1. Open https://console.cloud.google.com/ and create a project (any name).
+  2. APIs & Services > Library: enable "Google Drive API".
+  3. Google Auth Platform (the OAuth consent screen): set it up as
+     External, with your own address as the contact.
+  4. Clients > Create client > Desktop app. Copy the client ID and the
+     client secret it shows.
+  5. Audience > Publish app. Otherwise Google ends the sign-in every 7 days.
+
+Step by step, with pictures: https://rclone.org/drive/#making-your-own-client-id
+
+Then paste both below. Sync stops while you sign in again and starts after.
+Leave the client ID empty to cancel.
+"""
+
+
+def cmd_client_id(args: argparse.Namespace) -> int:
+  """Interactive, in the terminal the panel opens: give a Google Drive remote
+  its own OAuth client and sign in again with it."""
+  remote = normalize_remote(args.remote)
+  paths = remote_paths(remote)
+  rclone = rclone_bin()
+  if not rclone:
+    print("rclone is not installed.")
+    return 1
+  section = remote_conf_section(rclone, remote)
+  if not section or section.get("type", "").strip() != "drive":
+    print(f"'{remote}' is not a Google Drive remote in rclone's config.")
+    return 1
+  if not sys.stdin.isatty():
+    print("Run this in a terminal: it asks for the client ID and secret.")
+    return 1
+  print(CLIENT_ID_GUIDE.format(remote=remote))
+  if section.get("client_id", "").strip():
+    print(f"It already has one: {section['client_id'].strip()}. A new one replaces it.\n")
+
+  while True:
+    client_id = input("Client ID: ").strip()
+    if not client_id:
+      print("Cancelled; nothing changed.")
+      return 1
+    if GOOGLE_CLIENT_ID.match(client_id):
+      break
+    print("That is not a client ID: it ends in .apps.googleusercontent.com.")
+  while True:
+    secret = getpass.getpass("Client secret (hidden): ").strip()
+    if GOOGLE_CLIENT_SECRET.match(secret):
+      break
+    print("That does not look like a client secret (letters, digits, - and _).")
+
+  # Everything that holds the old token stops first: a sync or browse mount
+  # still running would refresh the old token and write it back over the
+  # new one.
+  units = [paths["watch_service_name"], paths["timer_name"], paths["browse_service_name"]]
+  was_active = [unit for unit in units if service_active(unit)]
+  if service_active(paths["service_name"]):
+    print("A sync is running; stopping it (the next one picks up where it left off).")
+  for unit in was_active + [paths["service_name"]]:
+    run(["systemctl", "--user", "stop", unit], timeout=60)
+
+  old_id = section.get("client_id", "").strip()
+  old_secret = section.get("client_secret", "").strip()
+  old_token = section.get("token", "").strip()
+
+  def put(fields: list[str]) -> int:
+    # The secret goes on rclone's command line for a moment. For a desktop
+    # client Google does not treat it as confidential, and rclone.conf
+    # keeps it in plain text anyway.
+    code, _, err = run([rclone, "config", "update", remote, *fields, "--non-interactive"], timeout=30)
+    if code != 0:
+      print(clean_text(err or "rclone config update failed"))
+    return code
+
+  ok = False
+  try:
+    if put(["client_id", client_id, "client_secret", secret]) == 0:
+      print("\nSaved. Now sign in to Google again in your browser, with the same account.\n")
+      if subprocess.call([rclone, "config", "reconnect", remote + ":"]) == 0:
+        code, _, err = run([rclone, "lsjson", "--max-depth", "1", "--dirs-only", remote + ":"], timeout=60)
+        ok = code == 0
+        if not ok:
+          print("Signed in, but listing the drive failed: " + clean_text(err or "unknown error"))
+  finally:
+    # Cancelled or failed (Ctrl+C included): back to the old client and
+    # token, so the account works as it did. Either way the units it
+    # stopped run again.
+    if not ok:
+      put(["client_id", old_id, "client_secret", old_secret] + (["token", old_token] if old_token else []))
+      print("\nNot changed: the account is back on its previous client ID.")
+    for unit in was_active:
+      run(["systemctl", "--user", "start", unit], timeout=60)
+  if ok:
+    run(["systemctl", "--user", "start", "--no-block", paths["service_name"]], timeout=20)
+    print("\nDone. This account now uses your own client ID; a sync has started.")
+  input("\nPress Enter to close.")
+  return 0 if ok else 1
 
 
 def cmd_remove_account(args: argparse.Namespace) -> None:
@@ -2400,7 +3197,9 @@ def cmd_remove_account(args: argparse.Namespace) -> None:
   timer = paths["timer_name"]
   service = paths["service_name"]
   browse = paths["browse_service_name"]
+  watch = paths["watch_service_name"]
 
+  run(["systemctl", "--user", "disable", "--now", watch], timeout=15)
   run(["systemctl", "--user", "disable", "--now", timer], timeout=15)
   run(["systemctl", "--user", "stop", service], timeout=15)
   run(["systemctl", "--user", "disable", "--now", browse], timeout=15)
@@ -2429,7 +3228,7 @@ def cmd_remove_account(args: argparse.Namespace) -> None:
     except Exception:
       pass
 
-  for name in (timer, service, browse):
+  for name in (timer, service, browse, watch):
     p = UNIT_DIR / name
     if p.exists():
       try:
@@ -2527,6 +3326,18 @@ def parser() -> argparse.ArgumentParser:
   runner.add_argument("--folder", default="~/Cloud")
   runner.add_argument("--resync", action="store_true")
 
+  pause = commands.add_parser("pause")
+  pause_group = pause.add_mutually_exclusive_group()
+  pause_group.add_argument("--on", action="store_true")
+  pause_group.add_argument("--off", action="store_true")
+
+  client_id = commands.add_parser("client-id")
+  client_id.add_argument("--remote", required=True)
+
+  watcher = commands.add_parser("watch")
+  watcher.add_argument("--remote", default="gdrive")
+  watcher.add_argument("--folder", default="~/Cloud")
+
   cleanup = commands.add_parser("cleanup")
   cleanup.add_argument("--remote", default="gdrive")
   cleanup.add_argument("--folder", default="~/Cloud")
@@ -2597,6 +3408,12 @@ def main() -> int:
       if forced:
         patch_state(paths, forceResync=False)
       return do_run(args.remote, args.folder, forced)
+    elif args.command == "watch":
+      return cmd_watch(args)
+    elif args.command == "client-id":
+      return cmd_client_id(args)
+    elif args.command == "pause":
+      cmd_pause(args)
     elif args.command == "cleanup":
       return cmd_cleanup(args)
     elif args.command == "mount":

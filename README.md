@@ -6,7 +6,7 @@ USB sticks, SD cards, phones, external HDDs/SSDs, internal system storage, and m
 
 ## Advanced Features in Storage Drives
 
-- **Multi-Cloud Drive Integration**: Add multiple Google Drive, Mega, OneDrive, Dropbox, and Nextcloud/WebDAV accounts via rclone directly in the Network & Cloud tab. Features selective folder syncing at any depth (keep only chosen folders on disk; open a folder to keep just some of the folders inside it, or keep it whole and leave parts out), loose files at the top (off unless you turn them on), cleanup of what no longer syncs (each item checked against the cloud first), auto-sync timers via systemd, and read-only on-demand browsing (`rclone mount`) without consuming local disk space.
+- **Multi-Cloud Drive Integration**: Add multiple Google Drive, Mega, OneDrive, Dropbox, and Nextcloud/WebDAV accounts via rclone directly in the Cloud tab. Features selective folder syncing at any depth (keep only chosen folders on disk; open a folder to keep just some of the folders inside it, or keep it whole and leave parts out), loose files at the top (off unless you turn them on), cleanup of what no longer syncs (each item checked against the cloud first), auto-sync via systemd (local changes go up within seconds; a timer catches changes made in the cloud), and read-only on-demand browsing (`rclone mount`) without consuming local disk space.
 - **Cloud account tiles**: One full-width row per account, each with a status dot (synced, syncing, needs a look, failed), the signed-in email (Google Drive, OneDrive and now Dropbox), a quota bar that turns urgent when nearly full or over quota, and the last sync time. Sync, open and browse are one click from the tile; the detail view's chips wrap instead of squeezing.
 - **Accounts cannot trip over each other**: The add form checks, as you type, that the new account's sync and browse folders are not used by — or nested inside — another account's. Accounts saved before that check are flagged on their tile, and the browse folder can be moved from the account's Config drawer. A browse mount only counts as an account's if rclone is serving that account there, so a second account can no longer report "mounted" while showing the first one's files, or unmount it on removal.
 - **Sync failures say why**: The status line quotes rclone's own error from the sync log rather than "Resync failed", and Config has View sync log and Resync. A brand-new account's local folder is created on its first sync; once an account has synced, a missing folder stops the sync instead of being treated as "delete everything".
@@ -88,7 +88,7 @@ Needs Omarchy 4 (Quattro) and `udisks2`, both standard. It calls `lsblk`,
 own `omarchy-*` helpers. Nothing runs as root.
 
 Cloud drives also need `rclone` (and `fuse3` to browse without syncing). The
-plugin never installs them itself: when rclone is missing, the Network & Cloud
+plugin never installs them itself: when rclone is missing, the Cloud
 tab copies a search for the Omarchy menu (Super + Space) › Install › Package
 and opens that menu, then notices by itself once rclone is there.
 
@@ -380,6 +380,11 @@ candidate of a mounted removable volume. The tests assert it refuses `/`,
 
 ```bash
 node test/model.test.js       # 288 tests, no compositor required
+python3 test/selection_test.py # cloud selection and filters
+python3 test/watch_test.py     # sync on a local change
+python3 test/client_id_test.py # Google Drive's shared client ID
+python3 test/progress_test.py  # what a running sync shows
+python3 test/pause_test.py     # pausing and resuming cloud sync
 omarchy plugin validate .     # the same check the shell applies
 ```
 

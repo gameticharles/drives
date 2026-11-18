@@ -5,6 +5,125 @@ All notable changes to Storage Drives. Newest first. The format follows
 [Semantic Versioning](https://semver.org/). Releases before 2.7.0 are
 described in their commit messages.
 
+## [2.8.0] - 2026-11-18
+
+### Added
+
+- Local changes sync within seconds. Each account with auto-sync on gets a
+  watch service (`omarchy-storage-watch-<account>.service`) that follows the
+  sync folder with inotify. When the folder has been quiet for 15 seconds
+  (or 2 minutes after the first change at most), it starts a sync. Before
+  that, each changed path is checked against bisync's own listing of the last
+  run, so the files a sync downloads never start another sync. Only selected
+  folders count, and office and editor scratch files (`.~lock.*#`, `~$*`,
+  swap and partial files) don't trigger a sync. The timer stays on and catches
+  changes made in the cloud, so it can run less often: 20 to 30 minutes is
+  enough. Accounts set up before this version get the watch service at their
+  next timer run. When the inotify watch limit is reached, the rest of the
+  folder is synced by the timer only.
+- A notice on Google Drive accounts that use rclone's shared client ID.
+  Google rate-limits that ID across every rclone user, so syncs are slow, and
+  rclone is retiring it. The notice's **Set Up Client ID** button opens a
+  terminal (`cloud-sync.py client-id --remote <name>`). It lists the steps in
+  Google Cloud Console and asks for the client ID and secret. It then stops
+  this account's sync, watch and browse mount, saves the ID, and signs in
+  again (`rclone config reconnect`). It checks that the drive can be listed
+  and starts a sync. If anything fails or is cancelled, the account goes back
+  to its old client ID and token. **Guide** opens rclone's step-by-step page.
+  The status payload has a new `sharedClientId` field.
+- A running sync shows what it is doing, for every cloud account. Before, the
+  panel said only "Syncing", which on a large Google Drive meant 20 minutes
+  with no other feedback. The sync helper now reads bisync's own log
+  (`SyncProgress`) and records:
+  - The stage: starting, listing both sides (with a running count of items
+    listed), comparing, applying changes, uploading, downloading, or
+    finishing.
+  - Every change bisync found, with its direction: new, changed or deleted,
+    here or in the cloud, and changes made on both sides. Each one leaves the
+    list as it completes.
+  - The direction of each file in flight and of each recent transfer.
+  - Why the run started: your change to a file (named), Sync now, a change
+    to the folders kept on disk, or the regular timer.
+
+  The live card shows the stage, the reason, a total ("2 to upload · 3 to
+  download"), then up to six files with an arrow or trash icon and their
+  percentage or what is still to happen, and "and N more". An account's
+  status reads "Syncing · listing", "Syncing · uploading" and so on, and its
+  tile names the file in flight ("Uploading q3.pdf · 42% · 3 more"). New
+  status fields: `phase`, `phaseText`, `plannedChanges`, `plannedRemaining`,
+  `plannedCounts`, `syncReasonText`. New Model.js helpers: `cloudSyncFeed`,
+  `cloudSyncLine`.
+
+- A pause button for all cloud sync, in the header next to search on the
+  Cloud tab. Pausing stops any sync that is running at once, and nothing
+  syncs until you resume. Timer runs, the watch service and Sync now all
+  do nothing while paused. rclone's `--resilient --recover` pick up a
+  stopped run at the next sync. The pause is one flag
+  (`~/.local/state/omarchy-storage-drives/cloud/paused.json`) for every
+  account. Terrace reads the same flag, and the pause survives a reboot. A
+  "Cloud sync paused" bar with **Resume** shows on every tab, and each
+  account reads "Paused". Resuming syncs each account with auto-sync on once,
+  to catch up ("Catching up after the pause"). Browse mounts and network
+  shares keep working. CLI: `cloud-sync.py pause --on|--off`, which prints
+  `{"paused": …, "since": …}`. Tests: `test/pause_test.py`.
+
+### Changed
+
+- The **Network & Cloud** tab is now two tabs, **Cloud** and **Network**,
+  so the panel has three: Drives, Cloud and Network. Each has its own count
+  and header line ("3 cloud drives · 1 syncing", "2 network shares mounted").
+  The `w` key cycles through all three, and `setTab` takes `cloud`.
+  `openCloud` opens the Cloud tab.
+- The header has two rows. Row one holds the title and the header buttons,
+  and row two holds the status line, which now runs the full width (up to two
+  lines). Before, Omarchy's `PanelHero` set aside the buttons' width on both
+  rows, so the status line was cut short by buttons that sit beside the
+  title.
+- Auto-sync runs every 30 minutes by default, not every 10. Local changes no
+  longer wait for the timer, so it only has to catch changes made in the
+  cloud. Accounts keep the interval they already have.
+
+### Fixed
+
+- A running sync was reported as not running. `systemctl is-active` exits
+  with code 3 for a oneshot service that is still starting ("activating"),
+  which is the whole of a sync, so `service_active` read it as stopped. It
+  now reads the state text.
+- `rclone bisync` was passed `--track-renames`, which bisync ignores (it
+  syncs with copy and move). rclone logged an ERROR line about it on every
+  run. The flag is gone.
+- Leftover `.state.json.tmp.*` files from interrupted writes are removed at
+  the start of each sync, once they are an hour old.
+- A failed sync started a full `--resync` when it didn't need one. bisync's
+  exit codes 2 and 7 cover both "Must run --resync to recover" and an abort
+  that `--resilient` makes "retryable without --resync". That second case
+  covers a listing cut short by a rate limit or a network blip. Every such
+  failure was followed straight away by a resync. On a large Google Drive
+  that takes an hour or more, and because a resync copies each side's files
+  to the other, files deleted since the last good sync came back. A resync
+  now starts only when rclone's log says one is needed (`needs_resync`).
+- Google's rate-limit refusal (`403 Quota exceeded for quota metric
+  'Queries'…`) read as if the drive were full. It is now reported as a rate
+  limit that the next sync retries, with a pointer to a client ID of your
+  own.
+- A Sync now pressed while a sync was running queued the next run, but that
+  run was labelled a regular check. The note now waits for it.
+- The panel used `root.accent` in seven places (the "syncing" card, the
+  rclone install wait, folder rows, recent transfers) but never defined it.
+  Those parts had no accent colour, and each sync logged `TypeError: Cannot
+  read property 'r' of undefined`. It is now `Commons.Color.accent`.
+
+## [2.7.6] - 2026-11-16
+
+### Fixed
+
+- Google Drive sync no longer lists the whole drive. `rclone bisync` ran with
+  `--fast-list`, which on Google Drive lists every item before the folder
+  selection is applied; on a large drive a run took over 30 minutes for a few
+  selected folders and rarely finished. `--fast-list` is now used only for
+  other providers. Google Drive remotes should also have their own client ID,
+  because rclone's shared one is heavily rate-limited.
+
 ## [2.7.5] - 2026-10-23
 
 ### Fixed

@@ -31,3 +31,15 @@ jobs:
 
       - name: Run cloud selection tests
         run: python3 test/selection_test.py
+
+      - name: Run sync-on-change tests
+        run: python3 test/watch_test.py
+
+      - name: Run Google client ID tests
+        run: python3 test/client_id_test.py
+
+      - name: Run sync progress tests
+        run: python3 test/progress_test.py
+
+      - name: Run pause tests
+        run: python3 test/pause_test.py

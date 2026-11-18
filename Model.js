@@ -67,6 +67,8 @@ var GLYPH_THERMOMETER = codepoint(0xF050F) // md-thermometer
 var GLYPH_INTERNAL = codepoint(0xF0A0)      // fa-hdd_o
 var GLYPH_INFO = codepoint(0xF02FD)         // md-information_outline
 var GLYPH_CLOSE = codepoint(0xF0156)        // md-close
+var GLYPH_PAUSE = codepoint(0xF03E4)        // md-pause
+var GLYPH_PLAY = codepoint(0xF040A)         // md-play
 
 // ------------------------------------------------------------ formatting
 
@@ -3275,4 +3277,87 @@ function shortHomePath(path, home) {
   if (prefix !== "" && value === prefix) return "~"
   if (prefix !== "" && value.indexOf(prefix + "/") === 0) return "~" + value.substring(prefix.length)
   return value
+}
+
+// A running sync as rows for its card: the files in flight first, with their
+// progress, then what bisync found still to do; `limit` rows at most, and
+// how many more there are. `icon` is a key each view maps to its own glyph:
+// up, down, delete or conflict. `summary` totals what the run found.
+function cloudSyncFeed(status, limit) {
+  var st = status || {}
+  var max = Number(limit) > 0 ? Math.floor(Number(limit)) : 6
+  var active = Array.isArray(st.activeTransfers) ? st.activeTransfers : []
+  var planned = Array.isArray(st.plannedChanges) ? st.plannedChanges : []
+  var known = {}
+  for (var p = 0; p < planned.length; p++) {
+    if (planned[p] && planned[p].name) known[String(planned[p].name)] = planned[p]
+  }
+  var rows = []
+  var seen = {}
+  var extra = 0
+  for (var i = 0; i < active.length; i++) {
+    var t = active[i]
+    if (!t || !t.name || seen[t.name]) continue
+    var name = String(t.name)
+    seen[name] = true
+    if (!known[name]) extra++
+    var dir = t.direction || (known[name] ? known[name].direction : "")
+    var pct = Math.max(0, Math.min(100, Math.round(Number(t.percentage) || 0)))
+    if (rows.length < max) {
+      rows.push({ name: name, icon: dir === "down" ? "down" : "up", active: true, percentage: pct,
+                  verb: (dir === "down" ? "Downloading" : dir === "up" ? "Uploading" : "Copying") + " · " + pct + "%" })
+    }
+  }
+  for (var j = 0; j < planned.length && rows.length < max; j++) {
+    var c = planned[j]
+    if (!c || !c.name || seen[c.name]) continue
+    seen[c.name] = true
+    var down = c.direction === "down"
+    var row = { name: String(c.name), icon: down ? "down" : "up", active: false, percentage: 0, verb: "" }
+    if (c.kind === "conflict") {
+      row.icon = "conflict"
+      row.verb = "Changed in both places · the newer one is kept"
+    } else if (c.kind === "deleted") {
+      row.icon = "delete"
+      row.verb = down ? "Deleted in the cloud · to delete here" : "Deleted here · to delete in the cloud"
+    } else {
+      row.verb = (c.kind === "new" ? "New" : "Changed") + (down ? " in the cloud · to download" : " here · to upload")
+    }
+    rows.push(row)
+  }
+  var remaining = Math.max(Number(st.plannedRemaining) || 0, planned.length)
+  var counts = st.plannedCounts && typeof st.plannedCounts === "object" ? st.plannedCounts : {}
+  var parts = []
+  if (Number(counts.up) > 0) parts.push(Number(counts.up) + " to upload")
+  if (Number(counts.down) > 0) parts.push(Number(counts.down) + " to download")
+  return { rows: rows, more: Math.max(0, remaining + extra - rows.length), summary: parts.join(" · ") }
+}
+
+// One line for a syncing account's tile: the file in flight, or what the
+// sync is doing ("Listing both sides · 17,067 items").
+function cloudSyncLine(status) {
+  var st = status || {}
+  var feed = cloudSyncFeed(st, 1)
+  var row = feed.rows.length > 0 ? feed.rows[0] : null
+  if (row && row.active) {
+    var verb = row.verb.split(" · ")[0]
+    var base = row.name.split("/").pop() || row.name
+    return verb + " " + base + " · " + row.percentage + "%" + (feed.more > 0 ? " · " + feed.more + " more" : "")
+  }
+  return st.phaseText ? String(st.phaseText) : "Syncing now…"
+}
+
+// The Network tab's header line.
+function networkOverview(shareCount) {
+  var n = Number(shareCount) || 0
+  return n > 0 ? n + (n === 1 ? " network share mounted" : " network shares mounted") : "No network shares mounted"
+}
+
+// The Cloud tab's header line: the accounts, what is syncing or needs
+// attention, and the pause above all of it ("Sync paused · 3 cloud drives").
+function cloudTabOverview(accounts, statuses, conflicts, paused) {
+  var list = accounts || []
+  if (list.length === 0) return paused ? "Sync paused" : "No cloud drives yet"
+  var line = cloudOverview(list, statuses, conflicts, 0)
+  return paused ? "Sync paused · " + list.length + (list.length === 1 ? " cloud drive" : " cloud drives") : line
 }

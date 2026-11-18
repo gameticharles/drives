@@ -23,6 +23,7 @@ Panel {
 
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
+  readonly property color accent: Commons.Color.accent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -45,7 +46,7 @@ Panel {
   property string cloudAddRemoteName: "gdrive"
   property string cloudAddFolder: "~/Google Drive"
   property string cloudAddMount: "~/Google Drive (Cloud)"
-  property int cloudAddInterval: 10
+  property int cloudAddInterval: 30
   property bool cloudConfigDrawerOpen: false
 
   // A destructive cloud action waiting for its second click, e.g.
@@ -84,7 +85,7 @@ Panel {
 
   function rescanAll() {
     drives.rescan()
-    if (activeTab === "network") drives.refreshCloud()
+    if (activeTab === "cloud") drives.refreshCloud()
   }
 
   function openCloudAccount(remote) {
@@ -742,7 +743,7 @@ Panel {
     // Opens the panel on one cloud account's detail view.
     function openCloud(remote: string): string {
       if (!drives.hasCloudAccount(remote)) return "unknown cloud account: " + remote
-      root.activeTab = "network"
+      root.activeTab = "cloud"
       root.openCloudAccount(remote)
       root.open()
       return "ok"
@@ -760,7 +761,7 @@ Panel {
     }
 
     function setTab(tab: string): string {
-      if (tab === "local" || tab === "network") {
+      if (tab === "local" || tab === "network" || tab === "cloud") {
         root.activeTab = tab
         return "ok"
       }
@@ -894,7 +895,7 @@ Panel {
           }
         }
         else if (text === "w" || text === "W") {
-          root.activeTab = (root.activeTab === "local" ? "network" : "local")
+          root.activeTab = root.activeTab === "local" ? "cloud" : root.activeTab === "cloud" ? "network" : "local"
         }
       }
 
@@ -915,79 +916,134 @@ Panel {
           spacing: Style.space(12)
 
           // ------------------------------------------------------------ Hero
-          PanelHero {
+          // The glyph, then two rows: the title with the header buttons, and
+          // the status line under both across the full width. (Omarchy's
+          // PanelHero kept the buttons' width free on both rows, so the
+          // status line was cut short by buttons that sit beside the title.)
+          Item {
             id: hero
             width: parent.width
-            title: root.activeTab === "network" ? "Network Storage" : "Storage Drives"
-            meta: root.activeTab === "network"
-              ? Model.cloudOverview(drives.cloudAccounts, drives.cloudStatuses, drives.cloudConflicts, drives.networkCount)
-              : root.statusLine
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            iconComponent: Component {
-              Text {
-                textFormat: Text.PlainText
-                text: root.activeTab === "network"
-                  ? (drives.writing && drives.writing.kind === "cloud" ? drives.writing.glyph : Model.GLYPH_SERVER)
-                  : root.barIcon
-                color: root.writingActive ? root.urgent : root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.display
-              }
+            implicitHeight: Math.max(heroGlyph.implicitHeight, heroText.implicitHeight)
+
+            Text {
+              id: heroGlyph
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: root.activeTab === "network" ? Model.GLYPH_SERVER
+                : root.activeTab === "cloud" ? (drives.writing && drives.writing.kind === "cloud" ? drives.writing.glyph : Model.GLYPH_CLOUD)
+                : root.barIcon
+              color: root.writingActive ? root.urgent : root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
             }
-            trailingControl: Component {
-              Row {
-                spacing: Style.space(2)
 
-                PanelActionButton {
-                  visible: root.hasUnmountedNtfs && drives.hasTool("omarchy-ntfs-fix")
-                  iconText: Model.GLYPH_WRENCH
-                  tooltipText: "Fix & Mount All NTFS Partitions"
-                  foreground: root.urgent
-                  hoverColor: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: root.runNtfsFix("")
+            ColumnLayout {
+              id: heroText
+              anchors.left: heroGlyph.right
+              anchors.leftMargin: Style.space(14)
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
+
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(8)
+
+                Text {
+                  textFormat: Text.PlainText
+                  Layout.fillWidth: true
+                  Layout.alignment: Qt.AlignVCenter
+                  text: root.activeTab === "network" ? "Network Shares" : root.activeTab === "cloud" ? "Cloud Drives" : "Storage Drives"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.title
+                  font.bold: true
+                  elide: Text.ElideRight
                 }
 
-                PanelActionButton {
-                  visible: drives.ejectableDevices.length > 1
-                  iconText: Model.GLYPH_EJECT
-                  tooltipText: "Eject every removable drive"
-                  foreground: root.foreground
-                  hoverColor: root.urgent
-                  fontFamily: root.fontFamily
-                  enabled: !drives.busy
-                  onClicked: drives.ejectAll()
-                }
+                Row {
+                  Layout.alignment: Qt.AlignVCenter
+                  spacing: Style.space(2)
 
-                PanelActionButton {
-                  iconText: drives.showSystemDrives ? Model.GLYPH_DISK : Model.GLYPH_SD
-                  tooltipText: drives.showSystemDrives ? "Hide internal storage (removable only)" : "Show all storage drives (including OS & Swap)"
-                  foreground: drives.showSystemDrives ? root.foreground : root.dim
-                  fontFamily: root.fontFamily
-                  onClicked: drives.setShowSystemDrives(!drives.showSystemDrives)
-                }
+                  PanelActionButton {
+                    visible: root.hasUnmountedNtfs && drives.hasTool("omarchy-ntfs-fix")
+                    iconText: Model.GLYPH_WRENCH
+                    tooltipText: "Fix & Mount All NTFS Partitions"
+                    foreground: root.urgent
+                    hoverColor: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: root.runNtfsFix("")
+                  }
 
-                PanelActionButton {
-                  iconText: Model.GLYPH_REFRESH
-                  tooltipText: "Rescan"
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  enabled: !drives.refreshing
-                  onClicked: root.rescanAll()
-                }
+                  PanelActionButton {
+                    visible: drives.ejectableDevices.length > 1
+                    iconText: Model.GLYPH_EJECT
+                    tooltipText: "Eject every removable drive"
+                    foreground: root.foreground
+                    hoverColor: root.urgent
+                    fontFamily: root.fontFamily
+                    enabled: !drives.busy
+                    onClicked: drives.ejectAll()
+                  }
 
-                PanelActionButton {
-                  iconText: Model.GLYPH_SEARCH
-                  tooltipText: root.searchOpen ? "Hide search filter (/)" : "Search & filter drives and partitions (/)"
-                  foreground: (root.searchOpen || root.filterQuery !== "") ? (bar && "activeColor" in bar ? bar.activeColor : root.foreground) : root.dim
-                  hoverColor: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: {
-                    root.searchOpen = !root.searchOpen
-                    if (!root.searchOpen) root.filterQuery = ""
+                  PanelActionButton {
+                    iconText: drives.showSystemDrives ? Model.GLYPH_DISK : Model.GLYPH_SD
+                    tooltipText: drives.showSystemDrives ? "Hide internal storage (removable only)" : "Show all storage drives (including OS & Swap)"
+                    foreground: drives.showSystemDrives ? root.foreground : root.dim
+                    fontFamily: root.fontFamily
+                    onClicked: drives.setShowSystemDrives(!drives.showSystemDrives)
+                  }
+
+                  PanelActionButton {
+                    iconText: Model.GLYPH_REFRESH
+                    tooltipText: "Rescan"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    enabled: !drives.refreshing
+                    onClicked: root.rescanAll()
+                  }
+
+                  // Pause or resume every cloud sync: running ones stop at once,
+                  // and nothing syncs until resumed (cloud-sync.py pause).
+                  PanelActionButton {
+                    visible: root.activeTab === "cloud" && (drives.cloudAccountCount > 0 || drives.cloudPaused)
+                    iconText: drives.cloudPaused ? Model.GLYPH_PLAY : Model.GLYPH_PAUSE
+                    tooltipText: drives.cloudPaused ? "Resume cloud sync" : "Pause all cloud sync until you resume it"
+                    foreground: drives.cloudPaused ? root.warnColor : root.foreground
+                    hoverColor: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: drives.setCloudPaused(!drives.cloudPaused)
+                  }
+                  PanelActionButton {
+                    iconText: Model.GLYPH_SEARCH
+                    tooltipText: root.searchOpen ? "Hide search filter (/)" : "Search & filter drives and partitions (/)"
+                    foreground: (root.searchOpen || root.filterQuery !== "") ? (bar && "activeColor" in bar ? bar.activeColor : root.foreground) : root.dim
+                    hoverColor: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: {
+                      root.searchOpen = !root.searchOpen
+                      if (!root.searchOpen) root.filterQuery = ""
+                    }
                   }
                 }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: String(root.activeTab === "network" ? Model.networkOverview(drives.networkCount)
+                  : root.activeTab === "cloud" ? Model.cloudTabOverview(drives.cloudAccounts, drives.cloudStatuses, drives.cloudConflicts, drives.cloudPaused)
+                  : root.statusLine).toUpperCase()
+                visible: text !== ""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.2
+                wrapMode: Text.WordWrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
               }
             }
           }
@@ -1108,7 +1164,51 @@ Panel {
                 }
               }
 
-              // Tab 2: Network & Cloud Storage
+              // Tab 2: Cloud drives (rclone)
+              Rectangle {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                radius: Style.space(6)
+                color: root.activeTab === "cloud"
+                  ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+                  : (cloudTabHover.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.05) : "transparent")
+                border.width: root.activeTab === "cloud" ? 1 : 0
+                border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.2)
+
+                RowLayout {
+                  anchors.centerIn: parent
+                  spacing: Style.space(6)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: Model.GLYPH_CLOUD
+                    color: root.activeTab === "cloud" ? root.foreground : root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    Layout.alignment: Qt.AlignVCenter
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "Cloud (" + drives.cloudAccountCount + ")"
+                    color: root.activeTab === "cloud" ? root.foreground : root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: root.activeTab === "cloud"
+                    Layout.alignment: Qt.AlignVCenter
+                  }
+                }
+
+                MouseArea {
+                  id: cloudTabHover
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.activeTab = "cloud"
+                }
+              }
+
+              // Tab 3: Network shares (mounted SMB, NFS, SSHFS…)
               Rectangle {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
@@ -1134,7 +1234,7 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: "Network & Cloud (" + (drives.networkCount + drives.cloudAccountCount) + ")"
+                    text: "Network (" + drives.networkCount + ")"
                     color: root.activeTab === "network" ? root.foreground : root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -1155,6 +1255,50 @@ Panel {
           }
 
           // ------------------------------------------------------------ Global Alerts
+          // Cloud sync paused: on every tab, so it is not forgotten.
+          Rectangle {
+            visible: drives.cloudPaused
+            width: parent.width
+            implicitHeight: pausedRow.implicitHeight + Style.space(12)
+            radius: Style.space(6)
+            color: Qt.rgba(root.warnColor.r, root.warnColor.g, root.warnColor.b, 0.08)
+            border.width: 1
+            border.color: Qt.rgba(root.warnColor.r, root.warnColor.g, root.warnColor.b, 0.3)
+
+            RowLayout {
+              id: pausedRow
+              anchors.fill: parent
+              anchors.margins: Style.space(6)
+              anchors.leftMargin: Style.space(10)
+              spacing: Style.space(8)
+
+              Text {
+                textFormat: Text.PlainText
+                text: Model.GLYPH_PAUSE
+                color: root.warnColor
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: "Cloud sync paused · nothing syncs until you resume"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+
+              ActionChip {
+                label: "Resume"
+                iconText: Model.GLYPH_PLAY
+                tooltipText: "Resume cloud sync, and sync each account once to catch up"
+                onClicked: drives.setCloudPaused(false)
+              }
+            }
+          }
+
           // NTFS Alert Banner
           Rectangle {
             visible: root.activeTab === "local" && root.hasUnmountedNtfs
@@ -1477,7 +1621,7 @@ Panel {
 
           // rclone Missing Warning Banner
           Rectangle {
-            visible: root.activeTab === "network" && !drives.rcloneInstalled
+            visible: root.activeTab === "cloud" && !drives.rcloneInstalled
             width: parent.width
             radius: Style.space(8)
             color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.08)
@@ -1572,7 +1716,7 @@ Panel {
           // CASE A: Cloud Drive Detail View (when an account is selected)
           // ====================================================================
           Column {
-            visible: root.activeTab === "network" && drives.selectedCloudRemote !== ""
+            visible: root.activeTab === "cloud" && drives.selectedCloudRemote !== ""
             width: parent.width
             spacing: Style.space(12)
 
@@ -1806,8 +1950,11 @@ Panel {
                   wrapMode: Text.WordWrap
                 }
 
-                // Live Transfer Activity Card
+                // Live Transfer Activity Card: what the sync is doing, why it
+                // started, and the files in flight or still to do.
                 Rectangle {
+                  id: liveCardSD
+                  readonly property var feed: Model.cloudSyncFeed(drives.selectedCloudStatus, 6)
                   visible: drives.selectedCloudStatus.syncing
                   Layout.fillWidth: true
                   radius: Style.space(6)
@@ -1840,9 +1987,7 @@ Panel {
                         Text {
                           textFormat: Text.PlainText
                           Layout.fillWidth: true
-                          text: (drives.selectedCloudStatus.activeTransfers && drives.selectedCloudStatus.activeTransfers.length > 0)
-                            ? drives.selectedCloudStatus.activeTransfers[0].name
-                            : "Syncing in progress…"
+                          text: drives.selectedCloudStatus.phaseText || "Syncing…"
                           color: root.foreground
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.caption
@@ -1856,6 +2001,8 @@ Panel {
                           text: {
                             var ts = drives.selectedCloudStatus.transferStats || {}
                             var parts = []
+                            if (drives.selectedCloudStatus.syncReasonText) parts.push(drives.selectedCloudStatus.syncReasonText)
+                            if (liveCardSD.feed.summary) parts.push(liveCardSD.feed.summary)
                             if (ts.speed) parts.push(Model.formatBytes(ts.speed) + "/s")
                             if (ts.transfers !== undefined && ts.totalTransfers !== undefined && ts.totalTransfers > 0) {
                               parts.push(ts.transfers + " of " + ts.totalTransfers + " files")
@@ -1863,7 +2010,7 @@ Panel {
                             if (ts.bytes && ts.totalBytes) {
                               parts.push(Model.formatBytes(ts.bytes) + " of " + Model.formatBytes(ts.totalBytes))
                             }
-                            return parts.length > 0 ? parts.join(" • ") : "Syncing files with cloud…"
+                            return parts.length > 0 ? parts.join(" • ") : "Syncing with the cloud"
                           }
                           color: root.dim
                           font.family: root.fontFamily
@@ -1888,6 +2035,55 @@ Panel {
                         radius: height / 2
                         color: root.accent
                       }
+                    }
+
+                    // Each file: which way it goes (or that it is deleted),
+                    // its name, and how far along it is or what is still to happen.
+                    Repeater {
+                      model: liveCardSD.feed.rows
+
+                      RowLayout {
+                        id: feedRowSD
+                        required property var modelData
+                        Layout.fillWidth: true
+                        spacing: Style.space(6)
+
+                        Text {
+                          text: feedRowSD.modelData.icon === "down" ? Model.GLYPH_MOUNT
+                            : feedRowSD.modelData.icon === "delete" ? Model.GLYPH_TRASH
+                            : feedRowSD.modelData.icon === "conflict" ? Model.GLYPH_ALERT : Model.GLYPH_UNMOUNT
+                          color: feedRowSD.modelData.active ? root.accent : root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+
+                        Text {
+                          textFormat: Text.PlainText
+                          Layout.fillWidth: true
+                          text: feedRowSD.modelData.name
+                          elide: Text.ElideMiddle
+                          color: feedRowSD.modelData.active ? root.foreground : root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+
+                        Text {
+                          textFormat: Text.PlainText
+                          text: feedRowSD.modelData.verb
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.captionSmall || Style.space(9)
+                        }
+                      }
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      visible: liveCardSD.feed.more > 0
+                      text: "and " + liveCardSD.feed.more.toLocaleString() + " more"
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.captionSmall || Style.space(9)
                     }
                   }
                 }
@@ -2005,6 +2201,64 @@ Panel {
                   }
                 }
 
+                // Google Drive on rclone's shared client ID: rate-limited
+                // for every rclone user and being retired.
+                Rectangle {
+                  visible: drives.selectedCloudStatus.authenticated === true
+                    && drives.selectedCloudStatus.sharedClientId === true
+                  Layout.fillWidth: true
+                  radius: Style.space(6)
+                  color: Qt.rgba(root.warnColor.r, root.warnColor.g, root.warnColor.b, 0.08)
+                  border.width: 1
+                  border.color: Qt.rgba(root.warnColor.r, root.warnColor.g, root.warnColor.b, 0.3)
+                  implicitHeight: clientIdCol.implicitHeight + Style.space(16)
+
+                  ColumnLayout {
+                    id: clientIdCol
+                    anchors.fill: parent
+                    anchors.margins: Style.space(8)
+                    spacing: Style.space(4)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      Layout.fillWidth: true
+                      text: "Using rclone's shared Google client ID"
+                      color: root.warnColor
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      Layout.fillWidth: true
+                      wrapMode: Text.WordWrap
+                      text: "Google rate-limits it across every rclone user, so syncs are slow, and rclone is retiring it, so they will stop. Your own client ID is free and takes about ten minutes."
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Flow {
+                      Layout.fillWidth: true
+                      spacing: Style.space(6)
+
+                      ActionChip {
+                        label: "Set Up Client ID"
+                        iconText: Model.GLYPH_UNLOCKED
+                        tooltipText: "Opens a terminal with the steps, then signs this account in again with your own client ID"
+                        onClicked: drives.setupDriveClientId(drives.selectedCloudRemote)
+                      }
+
+                      ActionChip {
+                        label: "Guide"
+                        tooltipText: "rclone's step-by-step guide, in your browser"
+                        onClicked: Qt.openUrlExternally("https://rclone.org/drive/#making-your-own-client-id")
+                      }
+                    }
+                  }
+                }
+
                 // Info Pairs (Disk usage, Cloud storage, Sync folder, Browse mount, Last sync)
                 ColumnLayout {
                   Layout.fillWidth: true
@@ -2099,7 +2353,7 @@ Panel {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: drives.setCloudAutoSync(drives.selectedCloudRemote, !drives.selectedCloudStatus.timerEnabled, drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 10)
+                        onClicked: drives.setCloudAutoSync(drives.selectedCloudRemote, !drives.selectedCloudStatus.timerEnabled, drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 30)
                       }
 
                       Text {
@@ -2107,7 +2361,7 @@ Panel {
                         anchors.centerIn: parent
                         textFormat: Text.PlainText
                         text: drives.selectedCloudStatus.timerEnabled
-                          ? "Active (" + (drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 10) + "m)"
+                          ? "Active (" + (drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 30) + "m)"
                           : "Paused"
                         color: drives.selectedCloudStatus.timerEnabled ? root.foreground : root.urgent
                         font.family: root.fontFamily
@@ -2124,11 +2378,11 @@ Panel {
                   spacing: Style.space(6)
 
                   ActionChip {
-                    label: drives.selectedCloudStatus.syncing ? "Syncing…" : "Sync now"
+                    label: drives.selectedCloudStatus.syncing ? "Syncing…" : drives.cloudPaused ? "Paused" : "Sync now"
                     iconText: Model.GLYPH_REFRESH
                     active: drives.selectedCloudStatus.syncing
-                    tooltipText: "Run two-way sync with cloud remote"
-                    enabled: !drives.selectedCloudStatus.syncing && drives.selectedCloudStatus.authenticated
+                    tooltipText: drives.cloudPaused ? "Cloud sync is paused: resume it from the header" : "Run two-way sync with cloud remote"
+                    enabled: !drives.selectedCloudStatus.syncing && drives.selectedCloudStatus.authenticated && !drives.cloudPaused
                     opacity: enabled ? 1 : 0.5
                     onClicked: drives.syncCloudNow(drives.selectedCloudRemote, false)
                   }
@@ -2190,13 +2444,13 @@ Panel {
                         label: drives.selectedCloudStatus.timerEnabled ? "Pause Auto-sync" : "Resume Auto-sync"
                         iconText: drives.selectedCloudStatus.timerEnabled ? Model.GLYPH_HEALTHY : Model.GLYPH_REFRESH
                         active: drives.selectedCloudStatus.timerEnabled
-                        onClicked: drives.setCloudAutoSync(drives.selectedCloudRemote, !drives.selectedCloudStatus.timerEnabled, drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 10)
+                        onClicked: drives.setCloudAutoSync(drives.selectedCloudRemote, !drives.selectedCloudStatus.timerEnabled, drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 30)
                       }
                     }
 
                     Text {
                       textFormat: Text.PlainText
-                      text: "Auto-sync interval: " + (drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 10) + " minutes"
+                      text: "Auto-sync interval: " + (drives.selectedCloudAccount ? drives.selectedCloudAccount.syncIntervalMin : 30) + " minutes"
                       color: root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -2212,7 +2466,7 @@ Panel {
                         ActionChip {
                           required property int modelData
                           readonly property int current: drives.selectedCloudAccount
-                            ? (drives.selectedCloudAccount.syncIntervalMin || 10) : 10
+                            ? (drives.selectedCloudAccount.syncIntervalMin || 30) : 30
                           label: modelData < 60 ? modelData + " min" : (modelData / 60) + " h"
                           active: current === modelData
                           onClicked: drives.setCloudInterval(drives.selectedCloudRemote, modelData)
@@ -2305,7 +2559,7 @@ Panel {
                         label: "Resync"
                         iconText: Model.GLYPH_REFRESH
                         tooltipText: "Rebuild the sync baseline: merges both sides, newer file wins. Use after a failed or interrupted sync."
-                        enabled: !drives.selectedCloudStatus.syncing && drives.selectedCloudStatus.authenticated
+                        enabled: !drives.selectedCloudStatus.syncing && drives.selectedCloudStatus.authenticated && !drives.cloudPaused
                         opacity: enabled ? 1 : 0.5
                         onClicked: drives.syncCloudNow(drives.selectedCloudRemote, true)
                       }
@@ -2824,15 +3078,16 @@ Panel {
           }
 
           // ====================================================================
-          // CASE B: Main Network & Cloud Overview (when no account is opened in detail)
+          // CASE B: the Cloud tab's overview (no account opened) and the Network tab
           // ====================================================================
           Column {
-            visible: root.activeTab === "network" && drives.selectedCloudRemote === ""
+            visible: root.activeTab === "network" || (root.activeTab === "cloud" && drives.selectedCloudRemote === "")
             width: parent.width
             spacing: Style.space(12)
 
             // Section 1: Cloud Storage (rclone)
             Column {
+              visible: root.activeTab === "cloud"
               width: parent.width
               spacing: Style.space(8)
 
@@ -3219,6 +3474,7 @@ Panel {
 
             // Section 2: Mounted Network Shares
             Column {
+              visible: root.activeTab === "network"
               width: parent.width
               spacing: Style.space(8)
 
@@ -3618,7 +3874,7 @@ Panel {
                                               : "Signed out of rclone — open to sign in again"
             }
             if (tile.st.lastResult === "error" && tile.st.lastError) return tile.st.lastError
-            if (tile.st.syncing) return "Syncing now…"
+            if (tile.st.syncing) return Model.cloudSyncLine(tile.st)
             var parts = [Model.cloudSummary(tile.st)]
             if (tile.st.lastFinishedTs > 0) parts.push("synced " + Model.relativeTime(tile.st.lastFinishedTs).toLowerCase())
             if (tile.st.browseMounted) parts.push("browsing")
@@ -3637,12 +3893,12 @@ Panel {
 
           PanelActionButton {
             iconText: Model.GLYPH_REFRESH
-            tooltipText: tile.st.syncing ? "Syncing…" : "Sync now"
+            tooltipText: tile.st.syncing ? "Syncing…" : drives.cloudPaused ? "Cloud sync is paused" : "Sync now"
             foreground: tile.st.syncing ? tile.toneColor : root.foreground
             fontFamily: root.fontFamily
             fontSize: Style.font.caption
             size: Style.space(24)
-            enabled: !tile.st.syncing && tile.st.authenticated
+            enabled: !tile.st.syncing && tile.st.authenticated && !drives.cloudPaused
             onClicked: drives.syncCloudNow(tile.remote, false)
           }
 

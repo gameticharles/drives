@@ -100,6 +100,11 @@ Item {
   property bool rcloneFuse: false
   property var availableRemotes: []
   property var cloudStatuses: ({})
+  // Every cloud sync paused (cloud-sync.py pause), for all accounts at once.
+  // Read back from each status; set at once when the header button is
+  // pressed, and not overwritten by a status read that started before it.
+  property bool cloudPaused: false
+  property bool _pauseBusy: false
 
   property string selectedCloudRemote: ""
   // Another account (or none): back to its top folders.
@@ -1015,6 +1020,14 @@ Item {
     launchRcloneTerminal("less +G " + quote(path))
   }
 
+  // A Google Drive account on rclone's shared client ID: the helper walks
+  // through creating one's own in a terminal, signs in again with it, and
+  // puts the account back as it was if that is cancelled or fails.
+  function setupDriveClientId(remoteName) {
+    if (!remoteName) return
+    launchRcloneTerminal("python3 " + quote(cloudHelperPath) + " client-id --remote " + quote(remoteName))
+  }
+
   function addCloudAccount(account) {
     if (!account || !account.remoteName) return "Enter the rclone remote name"
     var check = Model.validateCloudAccount(cloudAccounts, account, homePath, "")
@@ -1192,8 +1205,24 @@ Item {
     })
   }
 
+  function setCloudPaused(paused) {
+    var on = paused === true
+    cloudPaused = on
+    _pauseBusy = true
+    noteCloud(on ? "Cloud sync paused" : "Resuming cloud sync…")
+    runCloudControl(["python3", cloudHelperPath, "pause", on ? "--on" : "--off"], function() {
+      _pauseBusy = false
+      refreshCloudStatuses()
+      if (!on) cloudSyncPoll.restart()
+    })
+  }
+
   function syncCloudNow(remoteName, resync) {
     if (cloudBusy || !remoteName) return
+    if (cloudPaused) {
+      noteCloud("Cloud sync is paused. Resume it to sync.")
+      return
+    }
     var acc = null
     for (var i = 0; i < cloudAccounts.length; i++) {
       if (cloudAccounts[i].remoteName === remoteName) { acc = cloudAccounts[i]; break }
@@ -1217,7 +1246,7 @@ Item {
     }
     var folderP = acc ? expandHome(acc.folderPath || "~/Cloud") : expandHome("~/Cloud")
     var mountP = acc ? expandHome(acc.browseMountPath || "~/Cloud-Browse") : expandHome("~/Cloud-Browse")
-    var interval = intervalMin || (acc ? acc.syncIntervalMin : 10) || 10
+    var interval = intervalMin || (acc ? acc.syncIntervalMin : 30) || 30
     noteCloud(enabled ? "Enabling automatic sync…" : "Pausing automatic sync…")
     var args = ["python3", cloudHelperPath, "timer", "--remote", remoteName, "--folder", folderP, "--mount", mountP, enabled ? "--enable" : "--disable"]
     if (enabled) args = args.concat(["--interval", String(interval)])
@@ -2936,6 +2965,7 @@ Item {
       Qt.callLater(root.nextCloudStatus)
       if (!targetRemote || targetRemote === "") return
       var parsed = Model.parseCloudStatus(String(cloudStatusStdout.text || ""), targetRemote)
+      if (typeof parsed.paused === "boolean" && !root._pauseBusy) root.cloudPaused = parsed.paused
       var copy = Object.assign({}, root.cloudStatuses)
       copy[targetRemote] = parsed
       root.cloudStatuses = copy
